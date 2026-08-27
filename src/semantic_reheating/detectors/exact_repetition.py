@@ -21,7 +21,10 @@ def detect_exact_repetition(trace: Any, policy: Any) -> dict[str, Any]:
             if identity is not None:
                 calls[event.event_id] = identity
             continue
-        if event.kind is not TraceKind.TOOL_RESULT or event.parent_event_id not in calls:
+        if (
+            event.kind is not TraceKind.TOOL_RESULT
+            or event.parent_event_id not in calls
+        ):
             continue
         result_identity = _identity(event)
         if result_identity is None:
@@ -34,4 +37,6 @@ def detect_exact_repetition(trace: Any, policy: Any) -> dict[str, Any]:
             return _finding("exact_repetition", window, parsed_policy, support, True)
         if first is None:
             first_pairs[pair] = current
-    return _finding("exact_repetition", window, parsed_policy, [window[-1].event_id], False)
+    return _finding(
+        "exact_repetition", window, parsed_policy, [window[-1].event_id], False
+    )

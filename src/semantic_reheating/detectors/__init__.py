@@ -23,7 +23,9 @@ def _fail(code: str) -> None:
     raise DetectorInputError(code) from None
 
 
-def _validated_inputs(trace: Any, policy: Any) -> tuple[tuple[TraceEvent, ...], RunPolicy]:
+def _validated_inputs(
+    trace: Any, policy: Any
+) -> tuple[tuple[TraceEvent, ...], RunPolicy]:
     if type(trace) not in (list, tuple):
         _fail("invalid_trace_window")
     if not trace:
@@ -36,6 +38,8 @@ def _validated_inputs(trace: Any, policy: Any) -> tuple[tuple[TraceEvent, ...], 
                 trace_failure = "invalid_trace_event"
                 break
             parsed.append(TraceEvent.from_dict(event.to_dict()))
+    except MemoryError:
+        raise
     except Exception:  # noqa: BLE001
         trace_failure = "invalid_trace_event"
     if trace_failure is not None:
@@ -47,13 +51,18 @@ def _validated_inputs(trace: Any, policy: Any) -> tuple[tuple[TraceEvent, ...], 
         event_ids.add(event.event_id)
     if any(current.run_id != parsed[0].run_id for current in parsed[1:]):
         _fail("run_id_mismatch")
-    if any(current.sequence != previous.sequence + 1 for previous, current in pairwise(parsed)):
+    if any(
+        current.sequence != previous.sequence + 1
+        for previous, current in pairwise(parsed)
+    ):
         _fail("sequence_gap")
     if type(policy) is not RunPolicy:
         _fail("invalid_run_policy")
     policy_failure = False
     try:
         parsed_policy = RunPolicy.from_dict(policy.to_dict())
+    except MemoryError:
+        raise
     except Exception:  # noqa: BLE001
         policy_failure = True
         parsed_policy = None
@@ -77,6 +86,8 @@ def _identity(event: TraceEvent) -> tuple[str, str] | None:
             identity = ("declared_digest", digest)
         elif "payload" in source:
             identity = ("payload", action_fingerprint(source["payload"]).digest)
+    except MemoryError:
+        raise
     except Exception:  # noqa: BLE001 - sanitize all hostile sources.
         failed = True
     if failed:
@@ -122,6 +133,8 @@ def _finding(
     finding_invalid = False
     try:
         validate_public_artifact("detector_finding", finding)
+    except MemoryError:
+        raise
     except Exception:  # noqa: BLE001
         finding_invalid = True
     if finding_invalid:

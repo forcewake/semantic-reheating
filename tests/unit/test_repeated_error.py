@@ -20,7 +20,11 @@ def _policy(*, window: int = 20) -> Any:
 
 
 def _event(
-    sequence: int, *, kind: str = "message", payload: object | None = None, **fields: object
+    sequence: int,
+    *,
+    kind: str = "message",
+    payload: object | None = None,
+    **fields: object,
 ) -> Any:
     from semantic_reheating.models import TraceEvent
 
@@ -64,9 +68,17 @@ def test_changed_input_or_error_does_not_repeat_and_prose_does_not_reset() -> No
     from semantic_reheating.detectors import detect_repeated_error
 
     changed_input = (
-        _event(4, kind="tool_call", payload={"tool": "lookup", "hypothesis_test_input": {"q": "one"}}),
+        _event(
+            4,
+            kind="tool_call",
+            payload={"tool": "lookup", "hypothesis_test_input": {"q": "one"}},
+        ),
         _event(5, kind="error", error_fingerprint="error-timeout"),
-        _event(6, kind="tool_call", payload={"tool": "lookup", "hypothesis_test_input": {"q": "two"}}),
+        _event(
+            6,
+            kind="tool_call",
+            payload={"tool": "lookup", "hypothesis_test_input": {"q": "two"}},
+        ),
         _event(7, kind="error", error_fingerprint="error-timeout"),
     )
     changed_error = (
@@ -84,7 +96,10 @@ def test_changed_input_or_error_does_not_repeat_and_prose_does_not_reset() -> No
 
     assert detect_repeated_error(changed_input, _policy())["matched"] is False
     assert detect_repeated_error(changed_error, _policy())["matched"] is False
-    assert detect_repeated_error(prose_only, _policy())["event_ids"] == ["event-005", "event-008"]
+    assert detect_repeated_error(prose_only, _policy())["event_ids"] == [
+        "event-005",
+        "event-008",
+    ]
 
 
 def test_no_call_context_and_window_cut_are_explicit() -> None:
@@ -101,7 +116,10 @@ def test_no_call_context_and_window_cut_are_explicit() -> None:
         _event(6, kind="error", error_fingerprint="error-a"),
     )
 
-    assert detect_repeated_error(no_call, _policy())["event_ids"] == ["event-004", "event-005"]
+    assert detect_repeated_error(no_call, _policy())["event_ids"] == [
+        "event-004",
+        "event-005",
+    ]
     finding = detect_repeated_error(cut, _policy(window=3))
     assert finding["matched"] is False
     assert finding["event_ids"] == ["event-006"]

@@ -80,12 +80,23 @@ def test_equivalent_tool_call_result_pairs_match_with_trace_ordered_support() ->
     from semantic_reheating.detectors import detect_exact_repetition
 
     trace = (
-        _event(4, kind="tool_call", payload={"tool": "lookup", "query": {"a": 1, "b": 2}}),
-        _event(5, kind="tool_result", parent_event_id="event-004", payload={"items": ["one"]}),
+        _event(
+            4, kind="tool_call", payload={"tool": "lookup", "query": {"a": 1, "b": 2}}
+        ),
+        _event(
+            5,
+            kind="tool_result",
+            parent_event_id="event-004",
+            payload={"items": ["one"]},
+        ),
         _event(
             6,
             kind="tool_call",
-            payload={"query": {"b": 2, "a": 1}, "request_id": "volatile", "tool": "lookup"},
+            payload={
+                "query": {"b": 2, "a": 1},
+                "request_id": "volatile",
+                "tool": "lookup",
+            },
         ),
         _event(
             7,
@@ -100,7 +111,10 @@ def test_equivalent_tool_call_result_pairs_match_with_trace_ordered_support() ->
     assert finding["matched"] is True
     assert finding["score"] == 1.0
     assert finding["event_ids"] == ["event-004", "event-005", "event-006", "event-007"]
-    assert finding["explanation"] == "Equivalent repetition evidence was detected in the evaluated window."
+    assert (
+        finding["explanation"]
+        == "Equivalent repetition evidence was detected in the evaluated window."
+    )
 
 
 @pytest.mark.parametrize(
@@ -108,25 +122,42 @@ def test_equivalent_tool_call_result_pairs_match_with_trace_ordered_support() ->
     [
         (
             _event(4, kind="tool_call", payload={"tool": "lookup", "q": "one"}),
-            _event(5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}),
+            _event(
+                5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}
+            ),
             _event(6, kind="tool_call", payload={"tool": "lookup", "q": "two"}),
-            _event(7, kind="tool_result", parent_event_id="event-006", payload={"value": 1}),
+            _event(
+                7, kind="tool_result", parent_event_id="event-006", payload={"value": 1}
+            ),
         ),
         (
             _event(4, kind="tool_call", payload={"tool": "lookup", "q": "one"}),
-            _event(5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}),
+            _event(
+                5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}
+            ),
             _event(6, kind="tool_call", payload={"tool": "lookup", "q": "one"}),
-            _event(7, kind="tool_result", parent_event_id="event-006", payload={"value": 2}),
+            _event(
+                7, kind="tool_result", parent_event_id="event-006", payload={"value": 2}
+            ),
         ),
         (
             _event(4, kind="tool_call", payload={"tool": "lookup", "q": "one"}),
-            _event(5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}),
+            _event(
+                5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}
+            ),
             _event(6, kind="tool_call", payload={"tool": "lookup", "q": "one"}),
-            _event(7, kind="tool_result", parent_event_id="event-missing", payload={"value": 1}),
+            _event(
+                7,
+                kind="tool_result",
+                parent_event_id="event-missing",
+                payload={"value": 1},
+            ),
         ),
     ],
 )
-def test_changed_material_identity_or_wrong_parent_does_not_match(trace: tuple[Any, ...]) -> None:
+def test_changed_material_identity_or_wrong_parent_does_not_match(
+    trace: tuple[Any, ...],
+) -> None:
     from semantic_reheating.detectors import detect_exact_repetition
 
     finding = detect_exact_repetition(trace, _policy(threshold=0.0))
@@ -178,9 +209,13 @@ def test_window_cut_finding_id_is_deterministic_and_sources_are_not_retained() -
     mutable_payload = {"tool": "lookup", "q": "one"}
     trace = (
         _event(3, kind="tool_call", payload=mutable_payload),
-        _event(4, kind="tool_result", parent_event_id="event-003", payload={"ok": True}),
+        _event(
+            4, kind="tool_result", parent_event_id="event-003", payload={"ok": True}
+        ),
         _event(5, kind="tool_call", payload={"tool": "other"}),
-        _event(6, kind="tool_result", parent_event_id="event-005", payload={"ok": True}),
+        _event(
+            6, kind="tool_result", parent_event_id="event-005", payload={"ok": True}
+        ),
     )
     first = detect_exact_repetition(trace, _policy(window=3))
     second = detect_exact_repetition(trace, _policy(window=3))
@@ -197,8 +232,12 @@ def test_two_results_for_one_call_do_not_form_a_repeated_pair() -> None:
 
     trace = (
         _event(4, kind="tool_call", payload={"tool": "lookup", "q": "one"}),
-        _event(5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}),
-        _event(6, kind="tool_result", parent_event_id="event-004", payload={"value": 1}),
+        _event(
+            5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}
+        ),
+        _event(
+            6, kind="tool_result", parent_event_id="event-004", payload={"value": 1}
+        ),
     )
 
     finding = detect_exact_repetition(trace, _policy())
@@ -224,9 +263,13 @@ def test_distinct_calls_with_shared_declared_digest_match_their_results() -> Non
 
     trace = (
         declared_call(4, "first"),
-        _event(5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}),
+        _event(
+            5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}
+        ),
         declared_call(6, "second"),
-        _event(7, kind="tool_result", parent_event_id="event-006", payload={"value": 1}),
+        _event(
+            7, kind="tool_result", parent_event_id="event-006", payload={"value": 1}
+        ),
     )
 
     finding = detect_exact_repetition(trace, _policy())
@@ -291,14 +334,21 @@ def test_detector_boundary_rejects_hostile_or_forged_inputs_without_leaks() -> N
         assert "SECRET" not in repr(raised.value)
 
 
-@pytest.mark.parametrize("detector_name", ["detect_exact_repetition", "detect_repeated_error"])
+@pytest.mark.parametrize(
+    "detector_name", ["detect_exact_repetition", "detect_repeated_error"]
+)
 @pytest.mark.parametrize(
     ("trace", "code"),
     [
         (
             (
                 _event(4, kind="tool_call", payload={"tool": "lookup"}),
-                _event(5, kind="error", run_id="other-run", error_fingerprint="error-boundary"),
+                _event(
+                    5,
+                    kind="error",
+                    run_id="other-run",
+                    error_fingerprint="error-boundary",
+                ),
             ),
             "run_id_mismatch",
         ),
@@ -326,7 +376,9 @@ def test_detectors_require_single_contiguous_run_with_stable_codes(
     assert raised.value.__context__ is None
 
 
-@pytest.mark.parametrize("detector_name", ["detect_exact_repetition", "detect_repeated_error"])
+@pytest.mark.parametrize(
+    "detector_name", ["detect_exact_repetition", "detect_repeated_error"]
+)
 def test_detectors_reject_duplicate_event_ids_with_sanitized_boundary_error(
     detector_name: str,
 ) -> None:
@@ -388,7 +440,116 @@ def test_finding_validation_failure_does_not_retain_internal_exception(
         assert raised.value.args == ("Invalid detector input",)
         assert raised.value.__cause__ is None
         assert raised.value.__context__ is None
-        assert all("FINDING_SECRET" not in repr(error) for error in exception_graph(raised.value))
+        assert all(
+            "FINDING_SECRET" not in repr(error)
+            for error in exception_graph(raised.value)
+        )
+
+
+@pytest.mark.parametrize(
+    "detector_name", ["detect_exact_repetition", "detect_repeated_error"]
+)
+@pytest.mark.parametrize("resource_exception", [MemoryError, SystemExit])
+def test_event_revalidation_preserves_resource_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+    detector_name: str,
+    resource_exception: type[BaseException],
+) -> None:
+    import semantic_reheating.detectors as detector_module
+    from semantic_reheating.models import TraceEvent
+
+    expected = resource_exception("RESOURCE_SECRET")
+
+    def fail_revalidation(self: TraceEvent) -> dict[str, object]:
+        raise expected
+
+    trace = (_event(4, kind="tool_call", payload={"tool": "lookup"}),)
+    monkeypatch.setattr(TraceEvent, "to_dict", fail_revalidation)
+
+    with pytest.raises(resource_exception) as raised:
+        getattr(detector_module, detector_name)(trace, _policy())
+
+    assert raised.value is expected
+    assert raised.value.args == ("RESOURCE_SECRET",)
+
+
+@pytest.mark.parametrize(
+    "detector_name", ["detect_exact_repetition", "detect_repeated_error"]
+)
+@pytest.mark.parametrize("resource_exception", [MemoryError, SystemExit])
+def test_policy_revalidation_preserves_resource_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+    detector_name: str,
+    resource_exception: type[BaseException],
+) -> None:
+    import semantic_reheating.detectors as detector_module
+    from semantic_reheating.models import RunPolicy
+
+    expected = resource_exception("RESOURCE_SECRET")
+
+    def fail_revalidation(self: RunPolicy) -> dict[str, object]:
+        raise expected
+
+    trace = (_event(4, kind="tool_call", payload={"tool": "lookup"}),)
+    monkeypatch.setattr(RunPolicy, "to_dict", fail_revalidation)
+
+    with pytest.raises(resource_exception) as raised:
+        getattr(detector_module, detector_name)(trace, _policy())
+
+    assert raised.value is expected
+    assert raised.value.args == ("RESOURCE_SECRET",)
+
+
+@pytest.mark.parametrize(
+    "detector_name", ["detect_exact_repetition", "detect_repeated_error"]
+)
+@pytest.mark.parametrize("resource_exception", [MemoryError, SystemExit])
+def test_payload_identity_preserves_resource_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+    detector_name: str,
+    resource_exception: type[BaseException],
+) -> None:
+    import semantic_reheating.detectors as detector_module
+
+    expected = resource_exception("RESOURCE_SECRET")
+
+    def fail_fingerprint(payload: object) -> object:
+        raise expected
+
+    trace = (_event(4, kind="tool_call", payload={"tool": "lookup"}),)
+    monkeypatch.setattr(detector_module, "action_fingerprint", fail_fingerprint)
+
+    with pytest.raises(resource_exception) as raised:
+        getattr(detector_module, detector_name)(trace, _policy())
+
+    assert raised.value is expected
+    assert raised.value.args == ("RESOURCE_SECRET",)
+
+
+@pytest.mark.parametrize(
+    "detector_name", ["detect_exact_repetition", "detect_repeated_error"]
+)
+@pytest.mark.parametrize("resource_exception", [MemoryError, SystemExit])
+def test_finding_validation_preserves_resource_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+    detector_name: str,
+    resource_exception: type[BaseException],
+) -> None:
+    import semantic_reheating.detectors as detector_module
+
+    expected = resource_exception("RESOURCE_SECRET")
+
+    def fail_validation(*args: object, **kwargs: object) -> None:
+        raise expected
+
+    trace = (_event(4, kind="tool_call", payload={"tool": "lookup"}),)
+    monkeypatch.setattr(detector_module, "validate_public_artifact", fail_validation)
+
+    with pytest.raises(resource_exception) as raised:
+        getattr(detector_module, detector_name)(trace, _policy())
+
+    assert raised.value is expected
+    assert raised.value.args == ("RESOURCE_SECRET",)
 
 
 def test_findings_are_fresh_plain_copies() -> None:
@@ -401,10 +562,15 @@ def test_findings_are_fresh_plain_copies() -> None:
     second = detect_exact_repetition(trace, _policy())
 
     assert second["event_ids"] == ["event-004"]
-    assert second["availability"]["notice"] == "Deterministic detector completed with redacted evidence only."
+    assert (
+        second["availability"]["notice"]
+        == "Deterministic detector completed with redacted evidence only."
+    )
 
 
-def test_detector_identity_work_is_linear_and_evidence_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_detector_identity_work_is_linear_and_evidence_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import semantic_reheating.detectors as detector_module
     from semantic_reheating.detectors import (
         detect_exact_repetition,
@@ -424,7 +590,9 @@ def test_detector_identity_work_is_linear_and_evidence_is_bounded(monkeypatch: p
         event
         for index in range(120)
         for event in (
-            _event(index * 2 + 1, kind="tool_call", payload={"tool": "lookup", "q": index}),
+            _event(
+                index * 2 + 1, kind="tool_call", payload={"tool": "lookup", "q": index}
+            ),
             _event(
                 index * 2 + 2,
                 kind="tool_result",
@@ -437,7 +605,9 @@ def test_detector_identity_work_is_linear_and_evidence_is_bounded(monkeypatch: p
         event
         for index in range(120)
         for event in (
-            _event(index * 2 + 1, kind="tool_call", payload={"tool": "lookup", "q": index}),
+            _event(
+                index * 2 + 1, kind="tool_call", payload={"tool": "lookup", "q": index}
+            ),
             _event(index * 2 + 2, kind="error", error_fingerprint=f"error-{index}"),
         )
     )
