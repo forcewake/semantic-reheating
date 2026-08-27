@@ -319,7 +319,7 @@ def _finding_cause(finding: Mapping[str, Any]) -> CauseClass | None:
     return None
 
 
-def _rejected_hypothesis_references(event: TraceEvent) -> tuple[str, ...]:
+def _rejected_hypothesis_references(event: TraceEvent) -> tuple[tuple[str, bytes], ...]:
     if event.kind is not TraceKind.PLAN:
         return ()
     payload = event.to_dict().get("payload")
@@ -332,13 +332,14 @@ def _rejected_hypothesis_references(event: TraceEvent) -> tuple[str, ...]:
         or any(type(item) is not str or not item for item in eliminated)
     ):
         return ()
-    references: list[str] = []
+    references: list[tuple[str, bytes]] = []
     invalid = False
     try:
         for source in eliminated:
             canonical_source = dumps(source, ensure_ascii=False)
-            digest = sha256(canonicalize_json(canonical_source)).hexdigest()[:24]
-            references.append(f"rejected-hypothesis-{digest}")
+            canonical_source_bytes = canonicalize_json(canonical_source)
+            digest = sha256(canonical_source_bytes).hexdigest()[:24]
+            references.append((f"rejected-hypothesis-{digest}", canonical_source_bytes))
     except (MemoryError, SystemExit):
         raise
     except Exception:  # noqa: BLE001 - source hypotheses are a sanitized boundary.
@@ -366,6 +367,8 @@ def diagnose(trace: Any, findings: Any) -> Diagnosis:
     seen_evidence: set[str] = set()
     rejected_hypotheses: list[str] = []
     seen_rejected_hypotheses: set[str] = set()
+    rejected_hypothesis_sources: dict[str, bytes] = {}
+    rejected_hypothesis_collision = False
 
     def support_evidence(event_ids: tuple[str, ...]) -> None:
         for event_id in event_ids:
@@ -386,12 +389,21 @@ def diagnose(trace: Any, findings: Any) -> Diagnosis:
         references = _rejected_hypothesis_references(event)
         if references:
             support_evidence((event.event_id,))
-            for reference in references:
+            for reference, canonical_source_bytes in references:
                 if reference not in seen_rejected_hypotheses:
                     seen_rejected_hypotheses.add(reference)
+                    rejected_hypothesis_sources[reference] = canonical_source_bytes
                     rejected_hypotheses.append(reference)
                     if len(rejected_hypotheses) > _MAX_REJECTED_HYPOTHESES:
                         _fail("diagnosis_rejected_hypothesis_limit")
+                elif rejected_hypothesis_sources[reference] != canonical_source_bytes:
+                    rejected_hypothesis_collision = True
+                    break
+        if rejected_hypothesis_collision:
+            break
+    if rejected_hypothesis_collision:
+        del trace, parsed_trace, event, references
+        _fail("rejected_hypothesis_collision")
     for finding in parsed_findings:
         cause = _finding_cause(finding)
         if cause is not None:

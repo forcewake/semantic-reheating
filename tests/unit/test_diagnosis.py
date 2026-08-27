@@ -376,6 +376,143 @@ def test_plan_rejected_hypotheses_are_redacted_deduplicated_and_causally_preserv
         assert raw not in serialized
 
 
+def test_rejected_hypothesis_reference_collisions_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import semantic_reheating.diagnosis as diagnosis_module
+
+    source_one = "hypothesis-A"
+    source_two = "hypothesis-B"
+
+    class ConstantDigest:
+        def hexdigest(self) -> str:
+            return "0" * 64
+
+    def colliding_sha256(data: bytes) -> ConstantDigest:
+        assert type(data) is bytes
+        return ConstantDigest()
+
+    monkeypatch.setattr(diagnosis_module, "sha256", colliding_sha256)
+
+    with pytest.raises(diagnosis_module.DiagnosisError) as raised:
+        diagnosis_module.diagnose(
+            [
+                _event(
+                    1,
+                    kind="plan",
+                    payload={"eliminated_hypotheses": [source_one, source_two]},
+                )
+            ],
+            [],
+        )
+
+    assert raised.value.code == "rejected_hypothesis_collision"
+    assert raised.value.args == ("Invalid diagnosis input",)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert source_one not in repr(raised.value)
+    assert source_two not in repr(raised.value)
+    assert source_one not in raised.value.args
+    assert source_two not in raised.value.args
+
+
+def test_exact_duplicate_rejected_hypothesis_deduplicates_under_colliding_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import semantic_reheating.diagnosis as diagnosis_module
+
+    class ConstantDigest:
+        def hexdigest(self) -> str:
+            return "1" * 64
+
+    monkeypatch.setattr(diagnosis_module, "sha256", lambda data: ConstantDigest())
+
+    diagnosis = diagnosis_module.diagnose(
+        [
+            _event(
+                1,
+                kind="plan",
+                payload={"eliminated_hypotheses": ["hypothesis-A", "hypothesis-A"]},
+            )
+        ],
+        [],
+    )
+
+    assert diagnosis.rejected_hypothesis_refs == ("rejected-hypothesis-" + "1" * 24,)
+    assert diagnosis.evidence_event_ids == ("event-001",)
+
+
+def test_rejected_hypothesis_reference_evidence_deduplicates_across_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import semantic_reheating.diagnosis as diagnosis_module
+
+    class ConstantDigest:
+        def hexdigest(self) -> str:
+            return "2" * 64
+
+    monkeypatch.setattr(diagnosis_module, "sha256", lambda data: ConstantDigest())
+
+    diagnosis = diagnosis_module.diagnose(
+        [
+            _event(1, kind="plan", payload={"eliminated_hypotheses": ["hypothesis-A"]}),
+            _event(2, kind="plan", payload={"eliminated_hypotheses": ["hypothesis-A"]}),
+        ],
+        [],
+    )
+
+    assert diagnosis.rejected_hypothesis_refs == ("rejected-hypothesis-" + "2" * 24,)
+    assert diagnosis.evidence_event_ids == ("event-001", "event-002")
+
+    with pytest.raises(diagnosis_module.DiagnosisError) as raised:
+        diagnosis_module.diagnose(
+            [
+                _event(
+                    1, kind="plan", payload={"eliminated_hypotheses": ["hypothesis-A"]}
+                ),
+                _event(
+                    2, kind="plan", payload={"eliminated_hypotheses": ["hypothesis-B"]}
+                ),
+            ],
+            [],
+        )
+    assert raised.value.code == "rejected_hypothesis_collision"
+    assert raised.value.args == ("Invalid diagnosis input",)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_rejected_hypothesis_unicode_uses_exact_canonical_bytes() -> None:
+    from hashlib import sha256
+
+    from semantic_reheating.canonical import canonicalize_json
+    from semantic_reheating.diagnosis import diagnose
+
+    composed = "caf\u00e9"
+    decomposed = "cafe\u0301"
+    assert canonicalize_json(json.dumps(composed)) != canonicalize_json(
+        json.dumps(decomposed)
+    )
+
+    diagnosis = diagnose(
+        [
+            _event(
+                1,
+                kind="plan",
+                payload={"eliminated_hypotheses": [composed, decomposed, composed]},
+            )
+        ],
+        [],
+    )
+
+    assert diagnosis.rejected_hypothesis_refs == tuple(
+        "rejected-hypothesis-"
+        + sha256(canonicalize_json(json.dumps(source))).hexdigest()[:24]
+        for source in (composed, decomposed)
+    )
+    assert diagnosis.evidence_event_ids == ("event-001",)
+
+
 def test_rejected_hypothesis_refs_fail_closed_at_the_bounded_limit() -> None:
     from semantic_reheating.diagnosis import DiagnosisError, diagnose
 
