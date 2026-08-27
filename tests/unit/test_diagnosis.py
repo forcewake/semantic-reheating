@@ -308,6 +308,105 @@ def test_rejected_hypothesis_refs_are_validated_in_direct_object_state() -> None
         pickle.dumps(diagnosis)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("run_id", "unsafe run id"), ("evidence_event_ids", ("unsafe evidence id",))),
+)
+def test_direct_diagnosis_state_requires_safe_run_and_evidence_ids(
+    field: str, value: object
+) -> None:
+    from semantic_reheating.diagnosis import DiagnosisError, diagnose
+
+    diagnosis = diagnose(
+        [_event(1, kind="error", payload={"diagnostic_cause": "runtime_defect"})], []
+    )
+    object.__setattr__(diagnosis, field, value)
+
+    with pytest.raises(DiagnosisError) as serialized:
+        diagnosis.to_dict()
+    assert serialized.value.code == "invalid_diagnosis"
+    with pytest.raises(DiagnosisError) as reduced:
+        diagnosis.__reduce__()
+    assert reduced.value.code == "invalid_diagnosis"
+
+
+@pytest.mark.parametrize(
+    ("run_id", "evidence_event_ids"),
+    (("unsafe run id", ()), ("run-diagnosis", ("unsafe evidence id",))),
+)
+def test_direct_diagnosis_rejects_unsafe_run_and_evidence_ids(
+    run_id: str, evidence_event_ids: tuple[str, ...]
+) -> None:
+    from semantic_reheating.diagnosis import Diagnosis, DiagnosisError
+
+    with pytest.raises(DiagnosisError) as raised:
+        Diagnosis(run_id, (), (), evidence_event_ids)
+
+    assert raised.value.code == "invalid_diagnosis"
+
+
+@pytest.mark.parametrize(
+    ("cause", "high_risk"),
+    (
+        ("missing_authority", False),
+        ("unsafe_side_effect", False),
+        ("exhausted_budget", False),
+        ("runtime_defect", True),
+    ),
+)
+def test_uncertainty_high_risk_exactly_matches_protected_causes(
+    cause: str, high_risk: bool
+) -> None:
+    from semantic_reheating.diagnosis import (
+        CauseClass,
+        DiagnosisError,
+        UncertaintyDisposition,
+        UncertaintyItem,
+    )
+
+    with pytest.raises(DiagnosisError) as raised:
+        UncertaintyItem(
+            f"uncertainty-{cause}",
+            CauseClass(cause),
+            UncertaintyDisposition.VERIFY,
+            high_risk,
+        )
+
+    assert raised.value.code == "invalid_uncertainty_item"
+
+
+def test_direct_diagnosis_rejected_hypothesis_refs_require_exact_digest_shape() -> None:
+    from semantic_reheating.diagnosis import Diagnosis, DiagnosisError
+
+    for reference in ("rejected-hypothesis-short", "ordinary-safe-ref"):
+        with pytest.raises(DiagnosisError) as raised:
+            Diagnosis("run-diagnosis", (), (), (), (reference,))
+        assert raised.value.code == "invalid_diagnosis"
+
+
+@pytest.mark.parametrize("digest", (None, "a" * 63, "A" * 64, "g" * 64))
+def test_rejected_hypothesis_digest_must_be_lowercase_full_sha256(
+    monkeypatch: pytest.MonkeyPatch, digest: object
+) -> None:
+    import semantic_reheating.diagnosis as diagnosis_module
+
+    class InvalidDigest:
+        def hexdigest(self) -> object:
+            return digest
+
+    monkeypatch.setattr(diagnosis_module, "sha256", lambda source: InvalidDigest())
+    with pytest.raises(diagnosis_module.DiagnosisError) as raised:
+        diagnosis_module.diagnose(
+            [_event(1, kind="plan", payload={"eliminated_hypotheses": ["SECRET"]})],
+            [],
+        )
+
+    assert raised.value.code == "invalid_rejected_hypothesis_digest"
+    assert "SECRET" not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_plan_rejected_hypotheses_are_redacted_deduplicated_and_causally_preserved() -> (
     None
 ):
@@ -532,6 +631,51 @@ def test_rejected_hypothesis_refs_fail_closed_at_the_bounded_limit() -> None:
     assert raised.value.code == "diagnosis_rejected_hypothesis_limit"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+def test_rejected_hypothesis_limit_bounds_canonicalization_and_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import semantic_reheating.diagnosis as diagnosis_module
+
+    canonical_calls = 0
+    hash_calls = 0
+    original_canonicalize = diagnosis_module.canonicalize_json
+    original_sha256 = diagnosis_module.sha256
+
+    def counted_canonicalize(source: object) -> bytes:
+        nonlocal canonical_calls
+        canonical_calls += 1
+        return original_canonicalize(source)
+
+    def counted_sha256(source: bytes) -> Any:
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_sha256(source)
+
+    monkeypatch.setattr(diagnosis_module, "canonicalize_json", counted_canonicalize)
+    monkeypatch.setattr(diagnosis_module, "sha256", counted_sha256)
+
+    with pytest.raises(diagnosis_module.DiagnosisError) as raised:
+        diagnosis_module.diagnose(
+            [
+                _event(
+                    1,
+                    kind="plan",
+                    payload={
+                        "eliminated_hypotheses": [
+                            f"unique-rejected-hypothesis-{index}"
+                            for index in range(1_000)
+                        ]
+                    },
+                )
+            ],
+            [],
+        )
+
+    assert raised.value.code == "diagnosis_rejected_hypothesis_limit"
+    assert canonical_calls <= 101
+    assert hash_calls <= 100
 
 
 @pytest.mark.parametrize("resource_exception", (MemoryError, SystemExit))

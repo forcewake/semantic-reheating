@@ -331,6 +331,48 @@ def _copy_json(value: Any) -> Any:
     return value
 
 
+def _validate_reheat_selection(
+    selection: PolicySelection, diagnosis: Diagnosis, policy: RunPolicy
+) -> None:
+    """Require a direct REHEAT record to match the selector's clean gate."""
+    invalid = False
+    try:
+        ladder = policy.recovery_ladder
+        expected_reasons = (
+            "signals_agree",
+            "repetition_detected",
+            "no_progress_detected",
+        ) + (("host_action_required",) if ladder.reheat.requires_host_action else ())
+        invalid = (
+            any(
+                cause
+                in {
+                    CauseClass.MISSING_AUTHORITY,
+                    CauseClass.UNSAFE_SIDE_EFFECT,
+                    CauseClass.EXHAUSTED_BUDGET,
+                }
+                for cause in diagnosis.cause_classes
+            )
+            or ladder.nudge.permitted
+            or ladder.diagnose.permitted
+            or not policy.allows_reheat(
+                (FindingClass.REPETITION, FindingClass.NO_PROGRESS)
+            )
+            or selection.recovery_policy
+            is not _recovery_policy(Decision.REHEAT, diagnosis.cause_classes)
+            or selection.requires_host_action is not ladder.reheat.requires_host_action
+            or selection.reason_codes != expected_reasons
+            or selection.evidence_event_ids[: len(diagnosis.evidence_event_ids)]
+            != diagnosis.evidence_event_ids
+        )
+    except (MemoryError, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - direct records are an integrity boundary.
+        invalid = True
+    if invalid:
+        _fail("invalid_reheat_selection")
+
+
 def construct_recovery_instruction(
     selection: Any, diagnosis: Any, policy: Any
 ) -> dict[str, Any] | None:
@@ -340,13 +382,7 @@ def construct_recovery_instruction(
     fresh_policy = _validated_policy(policy)
     if fresh_selection.decision is not Decision.REHEAT:
         return None
-    if (
-        fresh_selection.recovery_policy is None
-        or "signals_agree" not in fresh_selection.reason_codes
-        or fresh_selection.evidence_event_ids[: len(fresh_diagnosis.evidence_event_ids)]
-        != fresh_diagnosis.evidence_event_ids
-    ):
-        _fail("invalid_reheat_selection")
+    _validate_reheat_selection(fresh_selection, fresh_diagnosis, fresh_policy)
 
     failure = False
     try:
@@ -650,13 +686,19 @@ def _validated_candidates(candidates: Any) -> tuple[BranchCandidate, ...]:
     if len(candidates) > _MAX_CANDIDATES:
         _fail("cooling_item_limit")
     validated: list[BranchCandidate] = []
+    seen_branch_ids: set[str] = set()
     invalid = False
+    duplicate = False
     try:
         for candidate in candidates:
             if type(candidate) is not BranchCandidate:
                 invalid = True
                 break
             candidate.to_dict()
+            if candidate.branch_id in seen_branch_ids:
+                duplicate = True
+                break
+            seen_branch_ids.add(candidate.branch_id)
             validated.append(candidate)
     except (MemoryError, SystemExit):
         raise
@@ -664,6 +706,8 @@ def _validated_candidates(candidates: Any) -> tuple[BranchCandidate, ...]:
         invalid = True
     if invalid:
         _fail("invalid_branch_candidate")
+    if duplicate:
+        _fail("duplicate_branch_id")
     return tuple(validated)
 
 

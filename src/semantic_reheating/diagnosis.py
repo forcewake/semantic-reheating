@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
@@ -70,6 +70,8 @@ _DISPOSITIONS = {
     CauseClass.EXHAUSTED_BUDGET: UncertaintyDisposition.BLOCK,
 }
 _SAFE_ID = re_compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+_REJECTED_HYPOTHESIS_REF = re_compile(r"^rejected-hypothesis-[0-9a-f]{24}$")
+_SHA256_HEXDIGEST = re_compile(r"^[0-9a-f]{64}$")
 _MAX_ITEMS = 10_000
 _MAX_EVIDENCE = 1_000
 _MAX_REJECTED_HYPOTHESES = 100
@@ -103,10 +105,8 @@ class UncertaintyItem:
             or type(self.high_risk) is not bool
             or self.uncertainty_id != f"uncertainty-{self.cause_class.value}"
             or not _safe_identifier(self.uncertainty_id)
-            or (
-                self.disposition is UncertaintyDisposition.ASSUME
-                and (self.high_risk or self.cause_class in _HIGH_RISK_CAUSES)
-            )
+            or self.high_risk is not (self.cause_class in _HIGH_RISK_CAUSES)
+            or (self.disposition is UncertaintyDisposition.ASSUME and self.high_risk)
         ):
             _fail("invalid_uncertainty_item")
 
@@ -155,6 +155,7 @@ class Diagnosis:
     def __post_init__(self) -> None:
         if (
             type(self.run_id) is not str
+            or not _safe_identifier(self.run_id)
             or type(self.cause_classes) is not tuple
             or type(self.uncertainty_map) is not tuple
             or type(self.evidence_event_ids) is not tuple
@@ -171,10 +172,16 @@ class Diagnosis:
                     self.cause_classes, self.uncertainty_map, strict=True
                 )
             )
-            or any(type(event_id) is not str for event_id in self.evidence_event_ids)
+            or any(
+                type(event_id) is not str or not _safe_identifier(event_id)
+                for event_id in self.evidence_event_ids
+            )
             or len(set(self.evidence_event_ids)) != len(self.evidence_event_ids)
             or len(self.evidence_event_ids) > _MAX_EVIDENCE
-            or any(not _safe_identifier(ref) for ref in self.rejected_hypothesis_refs)
+            or any(
+                type(ref) is not str or _REJECTED_HYPOTHESIS_REF.fullmatch(ref) is None
+                for ref in self.rejected_hypothesis_refs
+            )
             or len(set(self.rejected_hypothesis_refs))
             != len(self.rejected_hypothesis_refs)
             or len(self.rejected_hypothesis_refs) > _MAX_REJECTED_HYPOTHESES
@@ -319,34 +326,18 @@ def _finding_cause(finding: Mapping[str, Any]) -> CauseClass | None:
     return None
 
 
-def _rejected_hypothesis_references(event: TraceEvent) -> tuple[tuple[str, bytes], ...]:
+def _rejected_hypothesis_sources(event: TraceEvent) -> Iterator[str]:
     if event.kind is not TraceKind.PLAN:
-        return ()
+        return
     payload = event.to_dict().get("payload")
     if type(payload) is not dict:
-        return ()
+        return
     eliminated = payload.get("eliminated_hypotheses")
-    if (
-        type(eliminated) is not list
-        or not eliminated
-        or any(type(item) is not str or not item for item in eliminated)
-    ):
-        return ()
-    references: list[tuple[str, bytes]] = []
-    invalid = False
-    try:
-        for source in eliminated:
-            canonical_source = dumps(source, ensure_ascii=False)
-            canonical_source_bytes = canonicalize_json(canonical_source)
-            digest = sha256(canonical_source_bytes).hexdigest()[:24]
-            references.append((f"rejected-hypothesis-{digest}", canonical_source_bytes))
-    except (MemoryError, SystemExit):
-        raise
-    except Exception:  # noqa: BLE001 - source hypotheses are a sanitized boundary.
-        invalid = True
-    if invalid:
-        _fail("invalid_trace_event")
-    return tuple(references)
+    if type(eliminated) is not list or not eliminated:
+        return
+    for source in eliminated:
+        if type(source) is str and source:
+            yield source
 
 
 def diagnose(trace: Any, findings: Any) -> Diagnosis:
@@ -368,6 +359,7 @@ def diagnose(trace: Any, findings: Any) -> Diagnosis:
     rejected_hypotheses: list[str] = []
     seen_rejected_hypotheses: set[str] = set()
     rejected_hypothesis_sources: dict[str, bytes] = {}
+    seen_canonical_sources: set[bytes] = set()
     rejected_hypothesis_collision = False
 
     def support_evidence(event_ids: tuple[str, ...]) -> None:
@@ -386,23 +378,50 @@ def diagnose(trace: Any, findings: Any) -> Diagnosis:
         marker = _event_marker(event)
         if marker is not None:
             support(marker, (event.event_id,))
-        references = _rejected_hypothesis_references(event)
-        if references:
+        for source in _rejected_hypothesis_sources(event):
+            canonical_source_bytes = b""
+            canonical_invalid = False
+            try:
+                canonical_source = dumps(source, ensure_ascii=False)
+                canonical_source_bytes = canonicalize_json(canonical_source)
+            except (MemoryError, SystemExit):
+                raise
+            except Exception:  # noqa: BLE001 - source hypotheses are sanitized.
+                canonical_invalid = True
+            if canonical_invalid:
+                _fail("invalid_trace_event")
+            if canonical_source_bytes in seen_canonical_sources:
+                support_evidence((event.event_id,))
+                continue
+            if len(seen_canonical_sources) >= _MAX_REJECTED_HYPOTHESES:
+                _fail("diagnosis_rejected_hypothesis_limit")
+            digest: object = ""
+            digest_invalid = False
+            try:
+                digest = sha256(canonical_source_bytes).hexdigest()
+            except (MemoryError, SystemExit):
+                raise
+            except Exception:  # noqa: BLE001 - digest is a sanitized boundary.
+                digest_invalid = True
+            if (
+                digest_invalid
+                or type(digest) is not str
+                or _SHA256_HEXDIGEST.fullmatch(digest) is None
+            ):
+                _fail("invalid_rejected_hypothesis_digest")
+            reference = f"rejected-hypothesis-{digest[:24]}"
+            seen_canonical_sources.add(canonical_source_bytes)
             support_evidence((event.event_id,))
-            for reference, canonical_source_bytes in references:
-                if reference not in seen_rejected_hypotheses:
-                    seen_rejected_hypotheses.add(reference)
-                    rejected_hypothesis_sources[reference] = canonical_source_bytes
-                    rejected_hypotheses.append(reference)
-                    if len(rejected_hypotheses) > _MAX_REJECTED_HYPOTHESES:
-                        _fail("diagnosis_rejected_hypothesis_limit")
-                elif rejected_hypothesis_sources[reference] != canonical_source_bytes:
-                    rejected_hypothesis_collision = True
-                    break
+            if reference not in seen_rejected_hypotheses:
+                seen_rejected_hypotheses.add(reference)
+                rejected_hypothesis_sources[reference] = canonical_source_bytes
+                rejected_hypotheses.append(reference)
+            elif rejected_hypothesis_sources[reference] != canonical_source_bytes:
+                rejected_hypothesis_collision = True
+                break
         if rejected_hypothesis_collision:
             break
     if rejected_hypothesis_collision:
-        del trace, parsed_trace, event, references
         _fail("rejected_hypothesis_collision")
     for finding in parsed_findings:
         cause = _finding_cause(finding)

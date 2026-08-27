@@ -346,6 +346,26 @@ def test_cooling_selects_only_a_unique_best_safe_evidence_branch() -> None:
 
 
 @pytest.mark.parametrize(
+    "candidates",
+    (
+        [_candidate("duplicate", ("e1",)), _candidate("duplicate", ("e1", "e2"))],
+        [_candidate("duplicate", ("e1",)), _candidate("duplicate", ("e1",))],
+    ),
+)
+def test_cooling_rejects_duplicate_branch_ids(
+    candidates: list[Any],
+) -> None:
+    from semantic_reheating.policies import PolicySelectionError, select_cooling_branch
+
+    with pytest.raises(PolicySelectionError) as raised:
+        select_cooling_branch(candidates, _policy())
+
+    assert raised.value.code == "duplicate_branch_id"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
     "candidate",
     (
         _candidate("unknown", effect="unknown"),
@@ -553,7 +573,7 @@ def test_construct_recovery_instruction_preserves_prefix_and_later_evidence() ->
     selection = PolicySelection(
         Decision.REHEAT,
         RecoveryPolicy.RESEARCH,
-        ("signals_agree",),
+        ("signals_agree", "repetition_detected", "no_progress_detected"),
         (*diagnosis.evidence_event_ids, "later-matched-finding"),
         False,
     )
@@ -811,42 +831,24 @@ def test_recovery_instruction_rejected_hypothesis_refs_are_safe_unique_and_bound
                 ),
             ],
         ),
-        (
-            ("missing_authority", "unsafe_side_effect", "exhausted_budget"),
-            [
-                (
-                    "risk_blocker",
-                    "Recovery is blocked by a safety or authority constraint.",
-                ),
-                (
-                    "risk_blocker",
-                    "Recovery is blocked by a safety or authority constraint.",
-                ),
-                (
-                    "risk_blocker",
-                    "Recovery is blocked by a safety or authority constraint.",
-                ),
-            ],
-        ),
     ),
 )
 def test_construct_recovery_instruction_maps_causes_in_design_order_without_prose(
     causes: tuple[str, ...], expected_gaps: list[tuple[str, str]]
 ) -> None:
-    from semantic_reheating.models import Decision
     from semantic_reheating.policies import (
-        PolicySelection,
-        RecoveryPolicy,
         construct_recovery_instruction,
+        select_recovery_policy,
     )
 
     diagnosis = _diagnosis(*causes)
-    selection = PolicySelection(
-        Decision.REHEAT,
-        RecoveryPolicy.BRANCH,
-        ("signals_agree",),
-        diagnosis.evidence_event_ids,
-        False,
+    selection = select_recovery_policy(
+        diagnosis,
+        [
+            _finding("rep", finding_class="repetition"),
+            _finding("progress", finding_class="no_progress"),
+        ],
+        _policy(nudge=True, diagnose=True),
     )
     instruction = construct_recovery_instruction(
         selection, diagnosis, _policy(nudge=True, diagnose=True)
@@ -1006,7 +1008,8 @@ def test_construct_recovery_instruction_fails_closed_and_preserves_resources(
     from semantic_reheating.diagnosis import Diagnosis
     from semantic_reheating.policies import RecoveryPolicy
 
-    unsafe_run = Diagnosis("unsafe run id", (), (), ())
+    unsafe_run = Diagnosis("run-policy", (), (), ())
+    object.__setattr__(unsafe_run, "run_id", "unsafe run id")
     unsafe_selection = policies.PolicySelection(
         Decision.REHEAT, RecoveryPolicy.BRANCH, ("signals_agree",), (), False
     )
@@ -1014,7 +1017,7 @@ def test_construct_recovery_instruction_fails_closed_and_preserves_resources(
         policies.construct_recovery_instruction(
             unsafe_selection, unsafe_run, _policy(nudge=True, diagnose=True)
         )
-    assert run_error.value.code == "invalid_recovery_instruction"
+    assert run_error.value.code == "invalid_diagnosis"
     assert run_error.value.__cause__ is None
     assert run_error.value.__context__ is None
 
@@ -1026,3 +1029,117 @@ def test_construct_recovery_instruction_fails_closed_and_preserves_resources(
         policies.construct_recovery_instruction(
             selection, diagnosis, _policy(nudge=True, diagnose=True)
         )
+
+
+def test_construct_recovery_instruction_revalidates_reheat_feasibility() -> None:
+    from semantic_reheating.models import Decision
+    from semantic_reheating.policies import (
+        PolicySelection,
+        PolicySelectionError,
+        RecoveryPolicy,
+        construct_recovery_instruction,
+    )
+
+    diagnosis = _diagnosis("missing_authority")
+    selection = PolicySelection(
+        Decision.REHEAT,
+        RecoveryPolicy.RESEARCH,
+        ("signals_agree", "repetition_detected", "no_progress_detected"),
+        diagnosis.evidence_event_ids,
+        False,
+    )
+
+    with pytest.raises(PolicySelectionError) as raised:
+        construct_recovery_instruction(
+            selection, diagnosis, _policy(nudge=True, diagnose=True, reheat=True)
+        )
+
+    assert raised.value.code == "invalid_reheat_selection"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "unsafe_side_effect",
+        "exhausted_budget",
+        "lower_stage",
+        "recovery_policy",
+        "host_action",
+        "incomplete_reasons",
+        "extra_reasons",
+    ),
+)
+def test_construct_recovery_instruction_rejects_inconsistent_direct_reheat(
+    mutation: str,
+) -> None:
+    from semantic_reheating.models import Decision, RunPolicy
+    from semantic_reheating.policies import (
+        PolicySelection,
+        PolicySelectionError,
+        RecoveryPolicy,
+        construct_recovery_instruction,
+        select_recovery_policy,
+    )
+
+    diagnosis = _diagnosis(
+        mutation
+        if mutation in {"unsafe_side_effect", "exhausted_budget"}
+        else "runtime_defect"
+    )
+    reheat_policy = _policy(nudge=True, diagnose=True)
+    selection = select_recovery_policy(
+        diagnosis,
+        [
+            _finding("rep", finding_class="repetition"),
+            _finding("progress", finding_class="no_progress"),
+        ],
+        reheat_policy,
+    )
+    policy = reheat_policy
+    if mutation in {"unsafe_side_effect", "exhausted_budget"}:
+        selection = PolicySelection(
+            Decision.REHEAT,
+            RecoveryPolicy.BRANCH,
+            ("signals_agree", "repetition_detected", "no_progress_detected"),
+            selection.evidence_event_ids,
+            False,
+        )
+    if mutation == "lower_stage":
+        policy = _policy()
+    elif mutation == "recovery_policy":
+        selection = PolicySelection(
+            Decision.REHEAT,
+            RecoveryPolicy.RESEARCH,
+            selection.reason_codes,
+            selection.evidence_event_ids,
+            selection.requires_host_action,
+        )
+    elif mutation == "host_action":
+        source = _policy_source()
+        source["recovery_ladder"]["nudge"]["permitted"] = False
+        source["recovery_ladder"]["diagnose"]["permitted"] = False
+        source["recovery_ladder"]["reheat"]["requires_host_action"] = True
+        policy = RunPolicy.from_dict(source)
+    elif mutation == "incomplete_reasons":
+        selection = PolicySelection(
+            Decision.REHEAT,
+            selection.recovery_policy,
+            ("signals_agree", "repetition_detected"),
+            selection.evidence_event_ids,
+            selection.requires_host_action,
+        )
+    elif mutation == "extra_reasons":
+        selection = PolicySelection(
+            Decision.REHEAT,
+            selection.recovery_policy,
+            (*selection.reason_codes, "risk_detected"),
+            selection.evidence_event_ids,
+            selection.requires_host_action,
+        )
+
+    with pytest.raises(PolicySelectionError) as raised:
+        construct_recovery_instruction(selection, diagnosis, policy)
+
+    assert raised.value.code == "invalid_reheat_selection"
