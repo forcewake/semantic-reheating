@@ -170,6 +170,93 @@ def fixture(name: str) -> dict[str, object]:
     )
 
 
+def _unique_128_char_event_ids(count: int) -> list[str]:
+    """Return deterministic, schema-valid unique public event identifiers."""
+    return [f"event-{index:0122d}" for index in range(count)]
+
+
+def _json_string_and_key_chars(value: Any) -> int:
+    """Measure the direct-value character budget enforced by the public seam."""
+    if type(value) is str:
+        return len(value)
+    if type(value) is list:
+        return sum(_json_string_and_key_chars(item) for item in value)
+    if type(value) is dict:
+        return sum(
+            len(key) + _json_string_and_key_chars(item)
+            for key, item in value.items()
+        )
+    return 0
+
+
+@pytest.mark.parametrize(
+    ("kind", "fixture_name", "field"),
+    [
+        ("detector_finding", "minimal-detector-finding.json", "event_ids"),
+        (
+            "decision_envelope",
+            "minimal-decision-envelope.json",
+            "evidence_event_ids",
+        ),
+    ],
+)
+def test_event_id_schema_boundary_validates_via_direct_and_raw_public_apis(
+    kind: str, fixture_name: str, field: str
+) -> None:
+    from semantic_reheating.validation import (
+        MAX_JSON_AGGREGATE_CHARS,
+        MAX_JSON_INPUT_BYTES,
+        MAX_JSON_INPUT_CHARS,
+        validate_public_artifact,
+    )
+
+    data = fixture(fixture_name)
+    event_ids = _unique_128_char_event_ids(1_000)
+    assert len(event_ids) == 1_000
+    assert len(set(event_ids)) == 1_000
+    assert all(
+        len(event_id) == 128
+        and event_id[0].isalnum()
+        and all(character.isalnum() or character in "._:-" for character in event_id)
+        for event_id in event_ids
+    )
+    data[field] = event_ids
+    raw = json.dumps(data, separators=(",", ":"))
+    assert len(raw) < MAX_JSON_INPUT_CHARS
+    assert len(raw.encode("utf-8")) < MAX_JSON_INPUT_BYTES
+    assert _json_string_and_key_chars(data) < MAX_JSON_AGGREGATE_CHARS
+    assert validate_public_artifact(kind, data) == data
+    assert validate_public_artifact(kind, raw) == data
+
+
+@pytest.mark.parametrize(
+    ("kind", "fixture_name", "field"),
+    [
+        ("detector_finding", "minimal-detector-finding.json", "event_ids"),
+        (
+            "decision_envelope",
+            "minimal-decision-envelope.json",
+            "evidence_event_ids",
+        ),
+    ],
+)
+def test_event_id_schema_limit_one_over_is_rejected_by_direct_and_raw_public_apis(
+    kind: str, fixture_name: str, field: str
+) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    data = fixture(fixture_name)
+    data[field] = _unique_128_char_event_ids(1_001)
+    raw = json.dumps(data, separators=(",", ":"))
+    for public_input in (data, raw):
+        with pytest.raises(ContractValidationError) as caught:
+            validate_public_artifact(kind, public_input)
+        assert caught.value.code == "schema_validation_error"
+
+
 # Keep the schema/fixture registry explicit: the public validator deliberately
 # excludes trace_event, and these tests must not infer coverage from filenames.
 ADVERSARIAL_ARTIFACTS = (

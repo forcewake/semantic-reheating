@@ -68,7 +68,7 @@
         "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
       },
       "minItems": 1,
-      "maxItems": 10000,
+      "maxItems": 1000,
       "uniqueItems": true,
       "description": "Exact event identifiers evaluated for this finding."
     },
