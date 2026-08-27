@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from enum import Enum
 from importlib import resources
 from pathlib import Path
@@ -67,6 +67,7 @@ class ModelValidationError(ValueError):
 
 _TRACE_SCHEMA_PATH = "contracts/v1/trace-event.schema.json"
 _TRACE_VALIDATOR: Draft202012Validator | None = None
+_VALIDATED_MODEL_CONSTRUCTION = object()
 
 
 def _freeze(value: Any) -> Any:
@@ -187,6 +188,14 @@ class TraceEvent:
     budget_counters: BudgetCounters | None = None
     expected_state_change: bool | None = None
     _source: Any = field(repr=False, compare=False, hash=False, default=None)
+    _validation_token: InitVar[object | None] = None
+
+    def __post_init__(self, _validation_token: object | None) -> None:
+        if (
+            _validation_token is not _VALIDATED_MODEL_CONSTRUCTION
+            or type(self._source) is not MappingProxyType
+        ):
+            raise ModelValidationError("validated_construction_required")
 
     @classmethod
     def from_dict(cls, data: Any) -> TraceEvent:
@@ -211,6 +220,7 @@ class TraceEvent:
             budget_counters=BudgetCounters.from_dict(counters) if counters is not None else None,
             expected_state_change=value.get("expected_state_change"),
             _source=_freeze(value),
+            _validation_token=_VALIDATED_MODEL_CONSTRUCTION,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -346,6 +356,14 @@ class RunPolicy:
     side_effect_rules: SideEffectRules
     cooling_conditions: CoolingConditions
     _source: Any = field(repr=False, compare=False, hash=False, default=None)
+    _validation_token: InitVar[object | None] = None
+
+    def __post_init__(self, _validation_token: object | None) -> None:
+        if (
+            _validation_token is not _VALIDATED_MODEL_CONSTRUCTION
+            or type(self._source) is not MappingProxyType
+        ):
+            raise ModelValidationError("validated_construction_required")
 
     @classmethod
     def from_dict(cls, data: Any) -> RunPolicy:
@@ -388,6 +406,7 @@ class RunPolicy:
             ),
             cooling_conditions=CoolingConditions(**cooling),
             _source=_freeze(value),
+            _validation_token=_VALIDATED_MODEL_CONSTRUCTION,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -432,6 +451,14 @@ class DecisionEnvelope:
     requires_host_action: bool
     human_summary: str
     _source: Any = field(repr=False, compare=False, hash=False, default=None)
+    _validation_token: InitVar[object | None] = None
+
+    def __post_init__(self, _validation_token: object | None) -> None:
+        if (
+            _validation_token is not _VALIDATED_MODEL_CONSTRUCTION
+            or type(self._source) is not MappingProxyType
+        ):
+            raise ModelValidationError("validated_construction_required")
 
     @classmethod
     def from_dict(cls, data: Any) -> DecisionEnvelope:
@@ -471,6 +498,7 @@ class DecisionEnvelope:
             requires_host_action=value["requires_host_action"],
             human_summary=value["human_summary"],
             _source=_freeze(value),
+            _validation_token=_VALIDATED_MODEL_CONSTRUCTION,
         )
 
     def to_dict(self) -> dict[str, Any]:
