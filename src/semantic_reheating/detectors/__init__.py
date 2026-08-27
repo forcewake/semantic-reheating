@@ -187,10 +187,14 @@ from .exact_repetition import (
 from .repeated_error import (
     detect_repeated_error,  # noqa: E402, RUF100 - shared helpers must exist before public submodule imports.
 )
+from .unchanged_state import (
+    detect_unchanged_state,  # noqa: E402, RUF100 - shared helpers must exist before public submodule imports.
+)
 
 __all__ = [
     "DetectorInputError",
     "detect_cycle",
     "detect_exact_repetition",
     "detect_repeated_error",
+    "detect_unchanged_state",
 ]
