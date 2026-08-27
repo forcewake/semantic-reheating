@@ -192,7 +192,7 @@ def test_window_cut_finding_id_is_deterministic_and_sources_are_not_retained() -
     assert "secret" not in repr(first)
 
 
-def test_shared_call_support_is_unique_when_multiple_results_reuse_it() -> None:
+def test_two_results_for_one_call_do_not_form_a_repeated_pair() -> None:
     from semantic_reheating.detectors import detect_exact_repetition
 
     trace = (
@@ -203,8 +203,37 @@ def test_shared_call_support_is_unique_when_multiple_results_reuse_it() -> None:
 
     finding = detect_exact_repetition(trace, _policy())
 
+    assert finding["matched"] is False
+    assert finding["score"] == 0.0
+    assert finding["event_ids"] == ["event-006"]
+
+
+def test_distinct_calls_with_shared_declared_digest_match_their_results() -> None:
+    from semantic_reheating.detectors import detect_exact_repetition
+    from semantic_reheating.models import TraceEvent
+
+    def declared_call(sequence: int, attempt: str) -> Any:
+        source = _event(
+            sequence,
+            kind="tool_call",
+            payload={"tool": "lookup", "attempt": attempt},
+        ).to_dict()
+        source.pop("payload")
+        source["payload_digest"] = "shared-declared-call"
+        return TraceEvent.from_dict(source)
+
+    trace = (
+        declared_call(4, "first"),
+        _event(5, kind="tool_result", parent_event_id="event-004", payload={"value": 1}),
+        declared_call(6, "second"),
+        _event(7, kind="tool_result", parent_event_id="event-006", payload={"value": 1}),
+    )
+
+    finding = detect_exact_repetition(trace, _policy())
+
     assert finding["matched"] is True
-    assert finding["event_ids"] == ["event-004", "event-005", "event-006"]
+    assert finding["score"] == 1.0
+    assert finding["event_ids"] == ["event-004", "event-005", "event-006", "event-007"]
 
 
 def test_detector_boundary_rejects_hostile_or_forged_inputs_without_leaks() -> None:

@@ -129,7 +129,11 @@ def _finding(
     return {**finding, "event_ids": list(event_ids), "availability": dict(availability)}
 
 
-from .exact_repetition import detect_exact_repetition
-from .repeated_error import detect_repeated_error
+from .exact_repetition import (
+    detect_exact_repetition,  # noqa: E402, RUF100 - shared helpers must exist before public submodule imports.
+)
+from .repeated_error import (
+    detect_repeated_error,  # noqa: E402, RUF100 - shared helpers must exist before public submodule imports.
+)
 
 __all__ = ["DetectorInputError", "detect_exact_repetition", "detect_repeated_error"]

@@ -29,8 +29,9 @@ def detect_exact_repetition(trace: Any, policy: Any) -> dict[str, Any]:
         pair = (calls[event.parent_event_id], result_identity)
         current = (event.parent_event_id, event.event_id)
         first = first_pairs.get(pair)
-        if first is not None:
+        if first is not None and current[0] != first[0]:
             support = sorted((*first, *current), key=positions.__getitem__)
             return _finding("exact_repetition", window, parsed_policy, support, True)
-        first_pairs[pair] = current
+        if first is None:
+            first_pairs[pair] = current
     return _finding("exact_repetition", window, parsed_policy, [window[-1].event_id], False)
