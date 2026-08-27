@@ -1,11 +1,12 @@
 # Semantic Reheating Reference Kit — Design Specification
 
-- **Status:** Approved design, pending implementation plan
+- **Status:** Approved design; detailed implementation plan ready for execution approval
 - **Date:** 2026-08-27
 - **Repository:** `forcewake/semantic-reheating`
 - **Primary audience:** engineers building production agent runtimes and frameworks
 - **License:** MIT
 - **Source cutoff for the first article:** 2026-08-27
+- **Clarification (2026-08-27):** Section 7.1 is aligned with the approved default in §6.2: `reheat` requires repetition-class plus independent no-progress-class evidence; a budget finding cannot replace repetition and hard limits still stop directly.
 
 ## 1. Executive summary
 
@@ -58,7 +59,7 @@ Existing runtimes already implement important parts of the proposed pattern: Mag
 1. Provide a stable, language-neutral contract for agent traces and recovery decisions.
 2. Detect common stagnation patterns without requiring an LLM call.
 3. Combine repetition signals with explicit progress signals to reduce false interventions.
-4. Emit explainable, evidence-linked decisions: `continue`, `nudge`, `diagnose`, `reheat`, `restart`, or `stop`.
+4. Emit explainable, evidence-linked decisions: `continue`, `nudge`, `diagnose`, `reheat`, `restart`, `escalate`, or `stop`.
 5. Bound all recovery work by turns, tool calls, tokens, time, cost when available, and side-effect policy.
 6. Provide reusable prompts and an Agent Skill whose behavior is pressure-tested through RED–GREEN–REFACTOR.
 7. Demonstrate integration without binding the core to one agent framework.
@@ -277,7 +278,7 @@ The host can append an outcome record containing the trigger, chosen policy, act
 5. **Acceptance stall:** host-provided acceptance checks show no delta.
 6. **Budget burn:** turns, tool calls, tokens, elapsed time, or cost rise without evidence gain.
 
-A detector cannot independently trigger `reheat`. The controller requires agreement between at least one repetition/budget signal and one no-progress signal. Hard safety or budget limits may trigger `stop` directly.
+A detector cannot independently trigger `reheat`. The controller requires agreement between at least one repetition-class signal and one independent no-progress-class signal. A `budget` finding may strengthen the diagnosis or trigger a hard-limit `stop`, but it cannot replace the repetition-class side of the default `reheat` gate. Hard safety or budget limits may trigger `stop` directly.
 
 ### 7.2 Optional semantic detector
 
