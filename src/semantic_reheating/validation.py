@@ -291,10 +291,30 @@ def _has_named_structural_safety_failure(data: Any) -> bool:
             ):
                 return True
     side_effect_rules = data.get("side_effect_rules")
-    return (
-        type(side_effect_rules) is dict
-        and side_effect_rules.get("automatic_unconfirmed_non_idempotent_repeat") is True
-    )
+    if type(side_effect_rules) is dict and (
+        side_effect_rules.get("automatic_unconfirmed_non_idempotent_repeat") is True
+        or side_effect_rules.get("unknown_treated_as_repeatable") is True
+    ):
+        return True
+    ladder = data.get("recovery_ladder")
+    if type(ladder) is dict:
+        restart = ladder.get("restart")
+        stop = ladder.get("stop")
+        escalate = ladder.get("escalate")
+        if (
+            type(restart) is dict
+            and restart.get("requires_host_action") is False
+        ) or (type(stop) is dict and stop.get("permitted") is False) or (
+            type(escalate) is dict
+            and (
+                escalate.get("permitted") is False
+                or escalate.get("requires_host_action") is False
+            )
+        ):
+            return True
+    detectors = data.get("detectors")
+    semantic = detectors.get("semantic_detector") if type(detectors) is dict else None
+    return type(semantic) is dict and semantic.get("can_relax_hard_stops") is True
 
 
 def _run_policy_is_safe(policy: dict[str, Any]) -> bool:

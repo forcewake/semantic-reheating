@@ -7,6 +7,7 @@ import pickle
 from copy import deepcopy
 from itertools import product
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -18,6 +19,15 @@ def _policy() -> dict[str, Any]:
     return json.loads(
         (PROJECT_ROOT / "tests" / "fixtures" / "contracts" / "minimal-run-policy.json").read_text()
     )
+
+
+def _freeze_json(value: Any) -> Any:
+    """Recursively freeze an otherwise JSON-shaped policy source for tamper tests."""
+    if type(value) is dict:
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if type(value) is list:
+        return tuple(_freeze_json(item) for item in value)
+    return value
 
 
 def test_complete_default_policy_validates_through_safety_seam() -> None:
@@ -100,6 +110,7 @@ def test_run_policy_model_preserves_ordinary_validation_codes_without_exception_
 def test_structurally_unsafe_policies_are_schema_rejected_and_sanitized_by_safety_seam(
     mutation: Any,
 ) -> None:
+    from semantic_reheating.models import ModelValidationError, RunPolicy
     from semantic_reheating.validation import (
         ContractValidationError,
         validate_public_artifact,
@@ -115,6 +126,19 @@ def test_structurally_unsafe_policies_are_schema_rejected_and_sanitized_by_safet
     with pytest.raises(ContractValidationError) as safety_error:
         validate_run_policy(source)
     assert safety_error.value.code == "unsafe_policy"
+    with pytest.raises(ModelValidationError) as model_error:
+        RunPolicy.from_dict(source)
+    assert model_error.value.code == "unsafe_policy"
+    assert model_error.value.__cause__ is None
+    assert model_error.value.__context__ is None
+
+    forged = object.__new__(RunPolicy)
+    object.__setattr__(forged, "_source", _freeze_json(source))
+    with pytest.raises(ModelValidationError) as forged_error:
+        forged.to_dict()
+    assert forged_error.value.code == "unsafe_policy"
+    assert forged_error.value.__cause__ is None
+    assert forged_error.value.__context__ is None
 
 
 @pytest.mark.parametrize("dimension", ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost"))
@@ -147,9 +171,9 @@ def test_equal_mixed_numeric_budget_caps_are_safe() -> None:
 @pytest.mark.parametrize(
     ("path", "value", "schema_rejects"),
     [
-        (("recovery_ladder", "restart", "requires_host_action"), False, False),
-        (("recovery_ladder", "stop", "permitted"), False, False),
-        (("recovery_ladder", "escalate", "permitted"), False, False),
+        (("recovery_ladder", "restart", "requires_host_action"), False, True),
+        (("recovery_ladder", "stop", "permitted"), False, True),
+        (("recovery_ladder", "escalate", "permitted"), False, True),
         (("recovery_ladder", "escalate", "requires_host_action"), False, True),
         (("side_effect_rules", "unknown_treated_as_repeatable"), True, True),
         (("detectors", "semantic_detector", "can_relax_hard_stops"), True, True),
@@ -178,9 +202,7 @@ def test_authority_and_hard_stop_invariants_fail_closed(
         assert validate_public_artifact("run_policy", deepcopy(source)) == source
     with pytest.raises(ContractValidationError) as caught:
         validate_run_policy(source)
-    assert caught.value.code == (
-        "schema_validation_error" if schema_rejects else "unsafe_policy"
-    )
+    assert caught.value.code == "unsafe_policy"
 
 
 @pytest.mark.parametrize(

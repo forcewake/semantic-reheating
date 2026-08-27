@@ -210,13 +210,13 @@
             "$ref": "#/$defs/recovery_stage_permission"
           },
           "restart": {
-            "$ref": "#/$defs/recovery_stage_permission"
+            "$ref": "#/$defs/restart_stage_permission"
           },
           "escalate": {
             "$ref": "#/$defs/escalation_stage_permission"
           },
           "stop": {
-            "$ref": "#/$defs/recovery_stage_permission"
+            "$ref": "#/$defs/stop_stage_permission"
           }
         },
         "required": [
@@ -435,6 +435,36 @@
       ],
       "description": "Closed permission record for one recovery stage."
     },
+    "restart_stage_permission": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/recovery_stage_permission"
+        },
+        {
+          "properties": {
+            "requires_host_action": {
+              "const": true
+            }
+          }
+        }
+      ],
+      "description": "Closed restart permission requiring host action."
+    },
+    "stop_stage_permission": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/recovery_stage_permission"
+        },
+        {
+          "properties": {
+            "permitted": {
+              "const": true
+            }
+          }
+        }
+      ],
+      "description": "Closed stop permission that is always permitted."
+    },
     "escalation_stage_permission": {
       "allOf": [
         {
@@ -442,6 +472,9 @@
         },
         {
           "properties": {
+            "permitted": {
+              "const": true
+            },
             "requires_host_action": {
               "const": true
             }

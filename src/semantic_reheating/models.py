@@ -344,28 +344,17 @@ def _validated_public(kind: str, data: Any) -> dict[str, Any]:
 
 
 def _validated_run_policy(data: Any) -> dict[str, Any]:
-    failure_code: str | None = None
     try:
-        value = validate_public_artifact("run_policy", data)
+        value = validate_run_policy(data)
     except ContractValidationError as error:
         failure_code = error.code
-        value = None
     except Exception:  # noqa: BLE001 - public/model boundary must not leak native errors
         failure_code = "unsafe_policy"
-        value = None
-    if failure_code is not None or type(value) is not dict:
-        raise ModelValidationError(failure_code or "unsafe_policy")
-    try:
-        value = validate_run_policy(value)
-    except ContractValidationError as error:
-        failure_code = error.code
-        value = None
-    except Exception:  # noqa: BLE001 - public/model boundary must not leak native errors
+    else:
+        if type(value) is dict:
+            return value
         failure_code = "unsafe_policy"
-        value = None
-    if failure_code is not None or type(value) is not dict:
-        raise ModelValidationError(failure_code or "unsafe_policy")
-    return value
+    raise ModelValidationError(failure_code)
 
 
 @dataclass(frozen=True, slots=True)
