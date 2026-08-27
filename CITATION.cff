@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Semantic Reheating Reference Kit"
+type: software
+version: 0.1.0
+date-released: 2026-08-27
+license: MIT
+authors:
+  - name: "Semantic Reheating contributors"

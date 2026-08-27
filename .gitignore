@@ -1,0 +1,24 @@
+# Hermes and local configuration
+.hermes/
+.env*
+
+# Private and live-run material
+*.transcript.jsonl
+benchmark/live/private/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local environments
+.venv/
+venv/
+env/
+ENV/
