@@ -209,6 +209,43 @@ def _invalid_enum_or_const(value: Any, path: _JSON_PATH) -> Any:
     return "__invalid_enum_or_const__"
 
 
+_RUN_POLICY_UNSAFE_PARITY_PATHS = {
+    "required": frozenset(
+        {
+            "$.budgets.whole_run",
+            *(
+                f"$.budgets.{budget_scope}.{dimension}"
+                for budget_scope in ("per_intervention", "whole_run")
+                for dimension in ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost")
+            ),
+        }
+    ),
+    "enum_const": frozenset(
+        {
+            "$.detectors.semantic_detector.can_relax_hard_stops",
+            "$.side_effect_rules.automatic_unconfirmed_non_idempotent_repeat",
+            "$.side_effect_rules.unknown_treated_as_repeatable",
+            "$.recovery_ladder.restart.requires_host_action",
+            "$.recovery_ladder.stop.permitted",
+            "$.recovery_ladder.escalate.permitted",
+            "$.recovery_ladder.escalate.requires_host_action",
+        }
+    ),
+}
+
+
+def _parity_expected_code(model_name: str, category: str, path: _JSON_PATH) -> str:
+    """Return the public code expected for one schema-derived invalid mutation."""
+    if category == "enum_const" and path == ("contract_version",):
+        return "unknown_contract_major"
+    if (
+        model_name == "RunPolicy"
+        and _json_path(path) in _RUN_POLICY_UNSAFE_PARITY_PATHS.get(category, ())
+    ):
+        return "unsafe_policy"
+    return "schema_validation_error"
+
+
 def _parity_cases(
     model_name: str, schema_name: str, fixture_name: str, category: str
 ) -> list[tuple[str, Any, str]]:
@@ -225,7 +262,7 @@ def _parity_cases(
                             (
                                 f"{model_name}|required|{_json_path((*path, name))}",
                                 _replace_at_path(source, path, {**value, name: None}),
-                                "schema_validation_error",
+                                _parity_expected_code(model_name, category, (*path, name)),
                             )
                         )
                         del _at_path(cases[-1][1], path)[name]
@@ -244,12 +281,11 @@ def _parity_cases(
     elif category == "enum_const":
         for path, value, schema in nodes:
             if "enum" in schema or "const" in schema:
-                expected = "unknown_contract_major" if path == ("contract_version",) else "schema_validation_error"
                 cases.append(
                     (
                         f"{model_name}|enum_const|{_json_path(path)}",
                         _replace_at_path(source, path, _invalid_enum_or_const(value, path)),
-                        expected,
+                        _parity_expected_code(model_name, category, path),
                     )
                 )
     elif category == "wrong_type":
