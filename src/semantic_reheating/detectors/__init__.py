@@ -181,6 +181,9 @@ def _finding(
 from .acceptance_stall import (
     detect_acceptance_stall,  # noqa: E402, RUF100 - shared helpers must exist before public submodule imports.
 )
+from .budget_burn import (
+    detect_budget_burn,  # noqa: E402, RUF100 - shared helpers must exist before public submodule imports.
+)
 from .cycle import (
     detect_cycle,  # noqa: E402, RUF100 - shared helpers must exist before public submodule imports.
 )
@@ -197,6 +200,7 @@ from .unchanged_state import (
 __all__ = [
     "DetectorInputError",
     "detect_acceptance_stall",
+    "detect_budget_burn",
     "detect_cycle",
     "detect_exact_repetition",
     "detect_repeated_error",
