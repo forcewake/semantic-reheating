@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import InitVar, dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from enum import Enum
 from importlib import resources
 from pathlib import Path
@@ -67,7 +67,6 @@ class ModelValidationError(ValueError):
 
 _TRACE_SCHEMA_PATH = "contracts/v1/trace-event.schema.json"
 _TRACE_VALIDATOR: Draft202012Validator | None = None
-_VALIDATED_MODEL_CONSTRUCTION = object()
 
 
 def _freeze(value: Any) -> Any:
@@ -83,6 +82,32 @@ def _thaw(value: Any) -> Any:
         return {key: _thaw(item) for key, item in value.items()}
     if type(value) is tuple:
         return [_thaw(item) for item in value]
+    return value
+
+
+def _allocate_model(cls: type[Any], /, **field_values: Any) -> Any:
+    """Allocate a core model only after its public source has been validated."""
+    model = object.__new__(cls)
+    for descriptor in fields(cls):
+        if descriptor.name in field_values:
+            value = field_values[descriptor.name]
+        elif descriptor.default is not MISSING:
+            value = descriptor.default
+        elif descriptor.default_factory is not MISSING:
+            value = descriptor.default_factory()
+        else:
+            raise RuntimeError(f"Missing internal model field: {descriptor.name}")
+        object.__setattr__(model, descriptor.name, value)
+    return model
+
+
+def _thaw_model_source(source: Any) -> dict[str, Any]:
+    try:
+        value = _thaw(source)
+    except Exception as error:
+        raise ModelValidationError("invalid_model_state") from error
+    if type(value) is not dict:
+        raise ModelValidationError("invalid_model_state")
     return value
 
 
@@ -168,7 +193,7 @@ class BudgetCounters:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class TraceEvent:
     contract_version: str
     run_id: str
@@ -188,20 +213,16 @@ class TraceEvent:
     budget_counters: BudgetCounters | None = None
     expected_state_change: bool | None = None
     _source: Any = field(repr=False, compare=False, hash=False, default=None)
-    _validation_token: InitVar[object | None] = None
 
-    def __post_init__(self, _validation_token: object | None) -> None:
-        if (
-            _validation_token is not _VALIDATED_MODEL_CONSTRUCTION
-            or type(self._source) is not MappingProxyType
-        ):
-            raise ModelValidationError("validated_construction_required")
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise ModelValidationError("validated_construction_required")
 
     @classmethod
     def from_dict(cls, data: Any) -> TraceEvent:
         value = _validate_trace(data)
         counters = value.get("budget_counters")
-        return cls(
+        return _allocate_model(
+            cls,
             contract_version=value["contract_version"],
             run_id=value["run_id"],
             event_id=value["event_id"],
@@ -220,21 +241,34 @@ class TraceEvent:
             budget_counters=BudgetCounters.from_dict(counters) if counters is not None else None,
             expected_state_change=value.get("expected_state_change"),
             _source=_freeze(value),
-            _validation_token=_VALIDATED_MODEL_CONSTRUCTION,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return _thaw(self._source)
+        try:
+            source = self._source
+        except Exception as error:
+            raise ModelValidationError("invalid_model_state") from error
+        if type(source) is not MappingProxyType:
+            raise ModelValidationError("invalid_model_state")
+        return _thaw_model_source(source)
 
 
 def parse_trace(events: Any) -> tuple[TraceEvent, ...]:
     """Parse one contiguous public trace without changing event order."""
     if type(events) not in (list, tuple):
         raise ModelValidationError("non_json_data")
-    parsed = tuple(
-        event if type(event) is TraceEvent else TraceEvent.from_dict(event)
-        for event in events
-    )
+    parsed_items: list[TraceEvent] = []
+    for event in events:
+        if type(event) is TraceEvent:
+            try:
+                parsed_items.append(TraceEvent.from_dict(event.to_dict()))
+            except ModelValidationError:
+                raise
+            except Exception as error:
+                raise ModelValidationError("invalid_model_state") from error
+        else:
+            parsed_items.append(TraceEvent.from_dict(event))
+    parsed = tuple(parsed_items)
     for expected, event in enumerate(parsed, start=1):
         if event.sequence != expected:
             raise ModelValidationError("sequence_gap")
@@ -343,7 +377,7 @@ def _stage(data: Mapping[str, Any]) -> RecoveryStagePermission:
     return RecoveryStagePermission(data["permitted"], data["requires_host_action"])
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class RunPolicy:
     contract_version: str
     policy_id: str
@@ -356,14 +390,9 @@ class RunPolicy:
     side_effect_rules: SideEffectRules
     cooling_conditions: CoolingConditions
     _source: Any = field(repr=False, compare=False, hash=False, default=None)
-    _validation_token: InitVar[object | None] = None
 
-    def __post_init__(self, _validation_token: object | None) -> None:
-        if (
-            _validation_token is not _VALIDATED_MODEL_CONSTRUCTION
-            or type(self._source) is not MappingProxyType
-        ):
-            raise ModelValidationError("validated_construction_required")
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise ModelValidationError("validated_construction_required")
 
     @classmethod
     def from_dict(cls, data: Any) -> RunPolicy:
@@ -384,7 +413,8 @@ class RunPolicy:
         budgets = value["budgets"]
         rules = value["side_effect_rules"]
         cooling = value["cooling_conditions"]
-        return cls(
+        return _allocate_model(
+            cls,
             contract_version=value["contract_version"],
             policy_id=value["policy_id"],
             detectors=detectors,
@@ -406,11 +436,16 @@ class RunPolicy:
             ),
             cooling_conditions=CoolingConditions(**cooling),
             _source=_freeze(value),
-            _validation_token=_VALIDATED_MODEL_CONSTRUCTION,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return _thaw(self._source)
+        try:
+            source = self._source
+        except Exception as error:
+            raise ModelValidationError("invalid_model_state") from error
+        if type(source) is not MappingProxyType:
+            raise ModelValidationError("invalid_model_state")
+        return _thaw_model_source(source)
 
 
 @dataclass(frozen=True)
@@ -435,7 +470,7 @@ class DecisionConfidence:
     contributing_findings: tuple[ContributingFinding, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class DecisionEnvelope:
     contract_version: str
     run_id: str
@@ -451,21 +486,17 @@ class DecisionEnvelope:
     requires_host_action: bool
     human_summary: str
     _source: Any = field(repr=False, compare=False, hash=False, default=None)
-    _validation_token: InitVar[object | None] = None
 
-    def __post_init__(self, _validation_token: object | None) -> None:
-        if (
-            _validation_token is not _VALIDATED_MODEL_CONSTRUCTION
-            or type(self._source) is not MappingProxyType
-        ):
-            raise ModelValidationError("validated_construction_required")
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise ModelValidationError("validated_construction_required")
 
     @classmethod
     def from_dict(cls, data: Any) -> DecisionEnvelope:
         value = _validated_public("decision_envelope", data)
         constraints = value["constraints"]
         confidence = value["confidence"]
-        return cls(
+        return _allocate_model(
+            cls,
             contract_version=value["contract_version"],
             run_id=value["run_id"],
             decision_id=value["decision_id"],
@@ -498,8 +529,13 @@ class DecisionEnvelope:
             requires_host_action=value["requires_host_action"],
             human_summary=value["human_summary"],
             _source=_freeze(value),
-            _validation_token=_VALIDATED_MODEL_CONSTRUCTION,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return _thaw(self._source)
+        try:
+            source = self._source
+        except Exception as error:
+            raise ModelValidationError("invalid_model_state") from error
+        if type(source) is not MappingProxyType:
+            raise ModelValidationError("invalid_model_state")
+        return _thaw_model_source(source)

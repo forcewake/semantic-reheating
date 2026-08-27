@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable, Iterator
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Never
 
 import pytest
 
@@ -394,8 +394,29 @@ def test_core_models_reject_replace_alterations_without_validated_construction()
         ),
     ):
         with pytest.raises(ModelValidationError) as caught:
-            replace(model, **changes)
+            replace(model, **changes)  # type: ignore[arg-type]
         assert caught.value.code == "validated_construction_required"
+
+
+def test_parse_trace_does_not_return_a_forged_exact_model() -> None:
+    from dataclasses import fields
+    from types import MappingProxyType
+
+    import semantic_reheating.models as models
+    from semantic_reheating.models import TraceEvent, parse_trace
+
+    assert not hasattr(models, "_VALIDATED_MODEL_CONSTRUCTION")
+    assert "_validation_token" not in {item.name for item in fields(TraceEvent)}
+
+    source = _fixture("minimal-trace-event.json")
+    forged = object.__new__(TraceEvent)
+    object.__setattr__(forged, "actor", "forged-actor")
+    object.__setattr__(forged, "_source", MappingProxyType(source))
+
+    parsed = parse_trace([forged])
+
+    assert parsed[0] is not forged
+    assert parsed[0].actor == source["actor"]
 
 
 def test_trace_event_repr_excludes_raw_payload_but_keeps_public_identifiers() -> None:
@@ -482,6 +503,91 @@ def test_parse_trace_rejects_hostile_class_attribute_without_leaking_it() -> Non
 
     assert caught.value.code == "non_json_data"
     assert sentinel not in str(caught.value)
+
+
+def test_core_model_constructors_reject_every_public_argument_shape() -> None:
+    import pytest
+
+    from semantic_reheating.models import (
+        DecisionEnvelope,
+        ModelValidationError,
+        RunPolicy,
+        TraceEvent,
+    )
+
+    for model_class in (TraceEvent, RunPolicy, DecisionEnvelope):
+        for arguments, keywords in (((), {}), ((object(),), {}), ((), {"_validation_token": object()})):
+            with pytest.raises(ModelValidationError) as caught:
+                model_class(*arguments, **keywords)
+            assert caught.value.code == "validated_construction_required"
+
+
+def test_core_model_to_dict_rejects_non_internal_source_state() -> None:
+    import pytest
+
+    from semantic_reheating.models import (
+        DecisionEnvelope,
+        ModelValidationError,
+        RunPolicy,
+        TraceEvent,
+    )
+
+    for model_class in (TraceEvent, RunPolicy, DecisionEnvelope):
+        forged: Any = object.__new__(model_class)
+        sources: tuple[Any, ...] = (None, {})
+        for source in sources:
+            object.__setattr__(forged, "_source", source)
+            with pytest.raises(ModelValidationError) as caught:
+                forged.to_dict()
+            assert caught.value.code == "invalid_model_state"
+
+
+def test_parse_trace_sanitizes_forged_missing_wrong_and_hostile_sources() -> None:
+    from types import MappingProxyType
+
+    import pytest
+
+    from semantic_reheating.models import ModelValidationError, TraceEvent, parse_trace
+
+    sentinel = "__hostile-model-source__"
+
+    class HostileDict(dict[str, object]):
+        def items(self) -> Never:
+            raise RuntimeError(sentinel)
+
+    forged_missing = object.__new__(TraceEvent)
+    forged_wrong = object.__new__(TraceEvent)
+    object.__setattr__(forged_wrong, "_source", {})
+    forged_hostile = object.__new__(TraceEvent)
+    object.__setattr__(forged_hostile, "_source", MappingProxyType(HostileDict()))
+
+    for forged in (forged_missing, forged_wrong, forged_hostile):
+        with pytest.raises(ModelValidationError) as caught:
+            parse_trace([forged])
+        assert caught.value.code == "invalid_model_state"
+        assert sentinel not in str(caught.value)
+
+
+def test_parse_trace_revalidates_source_instead_of_tampered_typed_fields() -> None:
+    from types import MappingProxyType
+
+    import pytest
+
+    from semantic_reheating.models import ModelValidationError, TraceEvent, parse_trace
+
+    source = _fixture("minimal-trace-event.json")
+    model = TraceEvent.from_dict(source)
+    object.__setattr__(model, "actor", "tampered-actor")
+
+    parsed = parse_trace([model])
+
+    assert parsed[0] is not model
+    assert parsed[0].actor == source["actor"]
+
+    object.__setattr__(model, "_source", MappingProxyType({"actor": "invalid"}))
+    with pytest.raises(ModelValidationError) as caught:
+        parse_trace([model])
+    assert caught.value.code == "schema_validation_error"
 
 
 def test_run_policy_minimal_fixture_is_frozen_typed_and_exact() -> None:
@@ -588,7 +694,7 @@ def test_model_parsers_reject_hostile_raw_inputs_without_native_leaks() -> None:
             raise RuntimeError(sentinel)
 
     class RawDict(dict[str, object]):
-        def items(self) -> object:
+        def items(self) -> Never:
             raise RuntimeError(sentinel)
 
     inputs = (object(), HostileClass(), RawDict())
