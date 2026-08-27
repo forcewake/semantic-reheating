@@ -27,15 +27,52 @@ class CanonicalizationError(ValueError):
         super().__init__("Invalid canonical JSON input")
 
 
-@dataclass(frozen=True, slots=True)
+def _is_non_root_json_pointer(path: str) -> bool:
+    """Return whether an exact string is a non-root RFC-6901 pointer."""
+    if not path or not path.startswith("/"):
+        return False
+    for raw_part in path[1:].split("/"):
+        index = 0
+        while index < len(raw_part):
+            if raw_part[index] == "~":
+                if index + 1 == len(raw_part) or raw_part[index + 1] not in "01":
+                    return False
+                index += 2
+            else:
+                index += 1
+    return True
+
+
+def _validate_fingerprint_record(digest: Any, excluded_fields: Any) -> None:
+    if type(digest) is not str or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise CanonicalizationError("invalid_fingerprint_record")
+    if type(excluded_fields) is not tuple or any(type(path) is not str for path in excluded_fields):
+        raise CanonicalizationError("invalid_fingerprint_record")
+    if any(not _is_non_root_json_pointer(path) for path in excluded_fields):
+        raise CanonicalizationError("invalid_fingerprint_record")
+    if excluded_fields != tuple(sorted(excluded_fields)) or len(excluded_fields) != len(set(excluded_fields)):
+        raise CanonicalizationError("invalid_fingerprint_record")
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class FingerprintRecord:
     """Debug-safe action fingerprint metadata, with no source values."""
 
     digest: str
     excluded_fields: tuple[str, ...]
 
+    def __init__(self, digest: str, excluded_fields: tuple[str, ...]) -> None:
+        _validate_fingerprint_record(digest, excluded_fields)
+        object.__setattr__(self, "digest", digest)
+        object.__setattr__(self, "excluded_fields", excluded_fields)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        _validate_fingerprint_record(self.digest, self.excluded_fields)
+
     def to_dict(self) -> dict[str, str | tuple[str, ...]]:
         """Return the deliberately redacted public debug representation."""
+        self.__post_init__()
         return {"digest": self.digest, "excluded_fields": self.excluded_fields}
 
 
@@ -53,17 +90,21 @@ def _ensure_safe_integers(data: Any) -> None:
 
 
 def _json_input(data: Any) -> Any:
+    code: str | None = None
     try:
         value = load_public_json(data) if type(data) in (str, bytes, bytearray) else data
         _ensure_json_value(value)
         _ensure_safe_integers(value)
         return value
-    except CanonicalizationError:
-        raise
+    except CanonicalizationError as error:
+        if error.__cause__ is None and error.__context__ is None:
+            raise
+        code = error.code
     except ContractValidationError as error:
-        raise CanonicalizationError(error.code) from error
-    except Exception as error:
-        raise CanonicalizationError("invalid_json_data") from error
+        code = error.code
+    except Exception:  # noqa: BLE001 - public boundary must sanitize native failures.
+        code = "invalid_json_data"
+    raise CanonicalizationError(code)
 
 
 def _copy_json_tree(data: Any) -> Any:
@@ -82,16 +123,20 @@ def canonicalize_json(data: Any) -> bytes:
     rejected. Direct values must be exact built-in JSON types and every integer
     must be inside ``[-(2**53 - 1), 2**53 - 1]``.
     """
+    code: str | None = None
     try:
         return rfc8785.dumps(_json_input(data))
-    except CanonicalizationError:
-        raise
-    except Exception as error:
-        raise CanonicalizationError("invalid_json_data") from error
+    except CanonicalizationError as error:
+        if error.__cause__ is None and error.__context__ is None:
+            raise
+        code = error.code
+    except Exception:  # noqa: BLE001 - public boundary must sanitize native failures.
+        code = "invalid_json_data"
+    raise CanonicalizationError(code)
 
 
 def _pointer_parts(path: str) -> tuple[str, ...]:
-    if not path or not path.startswith("/"):
+    if not _is_non_root_json_pointer(path):
         raise CanonicalizationError("invalid_exclusion_path")
     parts: list[str] = []
     for raw_part in path[1:].split("/"):
@@ -152,6 +197,7 @@ def action_fingerprint(
     parent and child paths have deterministic removal behavior. The input is
     parsed/validated then deeply copied; it is never modified.
     """
+    code: str | None = None
     try:
         copied = _copy_json_tree(_json_input(data))
         removed = [
@@ -163,7 +209,10 @@ def action_fingerprint(
             digest=sha256(canonicalize_json(copied)).hexdigest(),
             excluded_fields=tuple(sorted(removed)),
         )
-    except CanonicalizationError:
-        raise
-    except Exception as error:
-        raise CanonicalizationError("invalid_json_data") from error
+    except CanonicalizationError as error:
+        if error.__cause__ is None and error.__context__ is None:
+            raise
+        code = error.code
+    except Exception:  # noqa: BLE001 - public boundary must sanitize native failures.
+        code = "invalid_json_data"
+    raise CanonicalizationError(code)

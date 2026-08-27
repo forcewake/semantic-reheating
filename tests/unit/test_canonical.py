@@ -4,6 +4,46 @@ from __future__ import annotations
 
 import pytest
 
+_SECRET_TEXT = "SECRET-CHAIN-SENTINEL-MUST-NOT-LEAK"
+_SECRET_BYTES = _SECRET_TEXT.encode()
+
+
+class _HostileInput:
+    def __repr__(self) -> str:
+        raise RuntimeError(_SECRET_TEXT)
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _TupleSubclass(tuple[str, ...]):
+    pass
+
+
+def _assert_clean_public_error(error: BaseException) -> None:
+    """Require a public canonical error graph to contain no caller secret."""
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        assert _SECRET_TEXT not in str(current)
+        assert _SECRET_TEXT not in repr(current)
+        assert _SECRET_TEXT not in repr(current.args)
+        for attribute in ("object", "reason", "doc", "msg"):
+            value = getattr(current, attribute, None)
+            if type(value) is str:
+                assert _SECRET_TEXT not in value
+            elif isinstance(value, (bytes, bytearray)):
+                assert _SECRET_BYTES not in bytes(value)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+
 
 def test_canonicalize_json_sorts_object_keys() -> None:
     from semantic_reheating.canonical import canonicalize_json
@@ -171,6 +211,34 @@ def test_canonicalize_json_rejects_invalid_utf8_bytes_and_bytearray(raw: bytes |
     assert caught.value.code == "invalid_json_encoding"
 
 
+@pytest.mark.parametrize("public_api", ["canonicalize_json", "action_fingerprint"])
+@pytest.mark.parametrize(
+    "data",
+    [
+        b'{"value":"SECRET-CHAIN-SENTINEL-MUST-NOT-LEAK"}\xff',
+        bytearray(b'{"value":"SECRET-CHAIN-SENTINEL-MUST-NOT-LEAK"}\xff'),
+        '{"value":"safe","value":"SECRET-CHAIN-SENTINEL-MUST-NOT-LEAK"}',
+        '{"value":"\ud800SECRET-CHAIN-SENTINEL-MUST-NOT-LEAK"}',
+        _HostileInput(),
+    ],
+)
+def test_public_canonical_errors_do_not_retain_input_exception_chains(public_api: str, data: object) -> None:
+    from semantic_reheating.canonical import (
+        CanonicalizationError,
+        action_fingerprint,
+        canonicalize_json,
+    )
+
+    public_call = canonicalize_json if public_api == "canonicalize_json" else action_fingerprint
+
+    with pytest.raises(CanonicalizationError) as caught:
+        public_call(data)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    _assert_clean_public_error(caught.value)
+
+
 @pytest.mark.parametrize(
     ("value", "code"),
     [
@@ -264,6 +332,60 @@ def test_action_fingerprint_deduplicates_default_and_missing_excluded_paths() ->
     )
 
     assert record.excluded_fields == ("/event_id",)
+
+
+@pytest.mark.parametrize(
+    ("digest", "excluded_fields"),
+    [
+        ("d", ["/initial"]),
+        (b"d" * 64, ("/initial",)),
+        ("d" * 63, ("/initial",)),
+        ("D" * 64, ("/initial",)),
+        ("g" * 64, ("/initial",)),
+        (_StringSubclass("d" * 64), ("/initial",)),
+        ("d" * 64, ["/initial"]),
+        ("d" * 64, _TupleSubclass(("/initial",))),
+        ("d" * 64, (_StringSubclass("/initial"),)),
+        ("d" * 64, ("",)),
+        ("d" * 64, ("initial",)),
+        ("d" * 64, ("/bad~2escape",)),
+        ("d" * 64, ("/z", "/a")),
+        ("d" * 64, ("/initial", "/initial")),
+    ],
+)
+def test_fingerprint_record_rejects_noncanonical_runtime_state(digest: object, excluded_fields: object) -> None:
+    from semantic_reheating.canonical import CanonicalizationError, FingerprintRecord
+
+    with pytest.raises(CanonicalizationError) as caught:
+        FingerprintRecord(digest, excluded_fields)  # type: ignore[arg-type]
+
+    assert caught.value.code == "invalid_fingerprint_record"
+    assert str(caught.value) == "Invalid canonical JSON input"
+
+
+def test_fingerprint_record_revalidates_tampered_frozen_state_without_leaking_values() -> None:
+    from semantic_reheating.canonical import (
+        CanonicalizationError,
+        FingerprintRecord,
+        action_fingerprint,
+    )
+
+    generated = action_fingerprint({"tool": "fetch", "authorization": _SECRET_TEXT}, excluded_paths=("/authorization",))
+    record = FingerprintRecord(generated.digest, generated.excluded_fields)
+    first = record.to_dict()
+    second = record.to_dict()
+
+    assert first == second == {"digest": generated.digest, "excluded_fields": ("/authorization",)}
+    assert first is not second
+    assert first["excluded_fields"] is record.excluded_fields
+    object.__setattr__(record, "excluded_fields", [_SECRET_TEXT])
+
+    with pytest.raises(CanonicalizationError) as caught:
+        record.to_dict()
+
+    assert caught.value.code == "invalid_fingerprint_record"
+    assert _SECRET_TEXT not in str(caught.value)
+    _assert_clean_public_error(caught.value)
 
 
 def test_canonicalization_preserves_unicode_code_points_without_normalization() -> None:
