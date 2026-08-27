@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 from itertools import pairwise
-from typing import Any, cast
+from typing import Any, Literal, NoReturn, cast
 
 from semantic_reheating.canonical import action_fingerprint
 from semantic_reheating.models import RunPolicy, TraceEvent
@@ -19,12 +19,15 @@ class DetectorInputError(ValueError):
         super().__init__("Invalid detector input")
 
 
-def _fail(code: str) -> None:
+def _fail(code: str) -> NoReturn:
     raise DetectorInputError(code) from None
 
 
 def _validated_inputs(
-    trace: Any, policy: Any
+    trace: Any,
+    policy: Any,
+    *,
+    window_policy: Literal["repetition", "no_progress"] = "repetition",
 ) -> tuple[tuple[TraceEvent, ...], RunPolicy]:
     if type(trace) not in (list, tuple):
         _fail("invalid_trace_window")
@@ -69,8 +72,14 @@ def _validated_inputs(
     if policy_failure or type(parsed_policy) is not RunPolicy:
         _fail("invalid_run_policy")
     parsed_policy = cast(RunPolicy, parsed_policy)
+    window_sizes = {
+        "repetition": parsed_policy.detectors.windows.repetition_events,
+        "no_progress": parsed_policy.detectors.windows.no_progress_events,
+    }
+    if window_policy not in window_sizes:
+        _fail("invalid_detector_window_policy")
     return (
-        tuple(parsed[-parsed_policy.detectors.windows.repetition_events :]),
+        tuple(parsed[-window_sizes[window_policy] :]),
         parsed_policy,
     )
 
@@ -95,18 +104,49 @@ def _identity(event: TraceEvent) -> tuple[str, str] | None:
     return identity
 
 
+_FINDING_CLASSES = {
+    "repetition": (
+        "repetition_score",
+        "repetition_detected",
+        "Equivalent repetition evidence was detected in the evaluated window.",
+        "Repetition evidence was not detected in the evaluated window.",
+    ),
+    "no_progress": (
+        "no_progress_score",
+        "no_progress_detected",
+        "No-progress evidence was detected in the evaluated window.",
+        "No-progress evidence was not detected in the evaluated window.",
+    ),
+    "budget": (
+        "budget_score",
+        "budget_limit_reached",
+        "Budget-limit evidence was detected in the evaluated window.",
+        "Budget-limit evidence was not detected in the evaluated window.",
+    ),
+}
+
+
 def _finding(
     detector_name: str,
     trace: tuple[TraceEvent, ...],
     policy: RunPolicy,
     event_ids: list[str],
     candidate: bool,
+    *,
+    finding_class: Literal["repetition", "no_progress", "budget"] = "repetition",
 ) -> dict[str, Any]:
     event_ids = list(dict.fromkeys(event_ids))[:1000]
     if not event_ids:
         _fail("invalid_detector_support")
+    finding_details = _FINDING_CLASSES.get(finding_class)
+    if finding_details is None:
+        _fail("invalid_detector_finding_class")
+    threshold_name, reason_code, matched_explanation, unmatched_explanation = (
+        finding_details
+    )
     score = 1.0 if candidate else 0.0
-    matched = candidate and score >= policy.detectors.thresholds.repetition_score
+    threshold = getattr(policy.detectors.thresholds, threshold_name)
+    matched = candidate and score >= threshold
     digest_input = "\x1f".join((detector_name, "1.0", trace[0].run_id, *event_ids))
     availability = {
         "status": "available",
@@ -120,14 +160,10 @@ def _finding(
         "detector_version": "1.0",
         "matched": matched,
         "score": score,
-        "finding_class": "repetition",
+        "finding_class": finding_class,
         "event_ids": event_ids,
-        "reason_code": "repetition_detected",
-        "explanation": (
-            "Equivalent repetition evidence was detected in the evaluated window."
-            if candidate
-            else "Repetition evidence was not detected in the evaluated window."
-        ),
+        "reason_code": reason_code,
+        "explanation": matched_explanation if candidate else unmatched_explanation,
         "availability": availability,
     }
     finding_invalid = False
@@ -142,6 +178,9 @@ def _finding(
     return {**finding, "event_ids": list(event_ids), "availability": dict(availability)}
 
 
+from .cycle import (
+    detect_cycle,  # noqa: E402, RUF100 - shared helpers must exist before public submodule imports.
+)
 from .exact_repetition import (
     detect_exact_repetition,  # noqa: E402, RUF100 - shared helpers must exist before public submodule imports.
 )
@@ -149,4 +188,9 @@ from .repeated_error import (
     detect_repeated_error,  # noqa: E402, RUF100 - shared helpers must exist before public submodule imports.
 )
 
-__all__ = ["DetectorInputError", "detect_exact_repetition", "detect_repeated_error"]
+__all__ = [
+    "DetectorInputError",
+    "detect_cycle",
+    "detect_exact_repetition",
+    "detect_repeated_error",
+]
