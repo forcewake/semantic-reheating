@@ -374,12 +374,17 @@ def _validate_reheat_selection(
 
 
 def construct_recovery_instruction(
-    selection: Any, diagnosis: Any, policy: Any
+    selection: Any, diagnosis: Any, findings: Any, policy: Any
 ) -> dict[str, Any] | None:
     """Construct a deterministic, bounded advisory instruction for exact REHEAT."""
     fresh_selection = _validated_recovery_selection(selection)
     fresh_diagnosis = _validated_recovery_diagnosis(diagnosis)
     fresh_policy = _validated_policy(policy)
+    authoritative_selection = select_recovery_policy(
+        fresh_diagnosis, findings, fresh_policy
+    )
+    if fresh_selection != authoritative_selection:
+        _fail("policy_selection_mismatch")
     if fresh_selection.decision is not Decision.REHEAT:
         return None
     _validate_reheat_selection(fresh_selection, fresh_diagnosis, fresh_policy)
