@@ -1,0 +1,12 @@
+{
+  "contract_version": "1.0",
+  "run_id": "run-example",
+  "event_id": "event-001",
+  "sequence": 1,
+  "kind": "message",
+  "actor": "host",
+  "effect_class": "read_only",
+  "payload": {
+    "message": "public example"
+  }
+}

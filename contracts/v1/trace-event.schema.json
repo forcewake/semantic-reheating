@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/contracts/v1/trace-event.schema.json",
+  "title": "TraceEvent",
+  "description": "Public, redacted trace event contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "run_id",
+    "event_id",
+    "sequence",
+    "kind",
+    "actor",
+    "effect_class"
+  ],
+  "oneOf": [
+    { "required": ["payload"] },
+    { "required": ["payload_ref"] },
+    { "required": ["payload_digest"] }
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "1.0",
+      "description": "Pinned public contract version."
+    },
+    "run_id": { "type": "string", "description": "Public run identifier." },
+    "event_id": { "type": "string", "description": "Public event identifier." },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Event order within the run."
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "message",
+        "plan",
+        "tool_call",
+        "tool_result",
+        "state_observation",
+        "acceptance_check",
+        "handoff",
+        "error",
+        "budget"
+      ],
+      "description": "Public event category."
+    },
+    "actor": { "type": "string", "description": "Actor label." },
+    "effect_class": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "idempotent_write",
+        "non_idempotent_write",
+        "unknown"
+      ],
+      "description": "Declared effect class."
+    },
+    "payload": {
+      "description": "Intentionally opaque public JSON value boundary."
+    },
+    "payload_ref": {
+      "type": "string",
+      "description": "Public reference to an external payload."
+    },
+    "payload_digest": {
+      "type": "string",
+      "description": "Public digest of an external payload."
+    },
+    "parent_event_id": {
+      "type": "string",
+      "description": "Public parent event identifier."
+    },
+    "state_fingerprint": {
+      "type": "string",
+      "description": "Public state fingerprint."
+    },
+    "error_fingerprint": {
+      "type": "string",
+      "description": "Public error fingerprint."
+    },
+    "acceptance_delta": {
+      "type": "string",
+      "description": "Public redacted acceptance summary."
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Public evidence references."
+    },
+    "budget_counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turns",
+        "tool_calls",
+        "tokens",
+        "elapsed_seconds",
+        "cost"
+      ],
+      "properties": {
+        "turns": { "type": "integer", "minimum": 0 },
+        "tool_calls": { "type": "integer", "minimum": 0 },
+        "tokens": { "type": "integer", "minimum": 0 },
+        "elapsed_seconds": { "type": "number", "minimum": 0 },
+        "cost": { "type": "number", "minimum": 0 }
+      },
+      "description": "Observed nonnegative public resource counters."
+    },
+    "expected_state_change": {
+      "type": "boolean",
+      "description": "Whether the host expects observable state to change."
+    }
+  }
+}
