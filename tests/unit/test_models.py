@@ -319,6 +319,26 @@ def test_trace_event_minimal_fixture_has_typed_fields_and_exact_roundtrip() -> N
     assert model.to_dict() == source
 
 
+def test_trace_event_subclass_factory_cannot_control_from_dict_allocation() -> None:
+    from dataclasses import dataclass, field
+
+    from semantic_reheating.models import TraceEvent
+
+    sentinel = "__hostile-trace-factory__"
+
+    def hostile_factory() -> Never:
+        raise RuntimeError(sentinel)
+
+    @dataclass(frozen=True)
+    class HostileTraceEvent(TraceEvent):
+        hostile: str = field(default_factory=hostile_factory)
+
+    model = HostileTraceEvent.from_dict(_fixture("minimal-trace-event.json"))
+
+    assert type(model) is TraceEvent
+    assert sentinel not in repr(model)
+
+
 def test_budget_counters_have_only_the_five_public_dimensions() -> None:
     from dataclasses import fields
 
@@ -331,6 +351,120 @@ def test_budget_counters_have_only_the_five_public_dimensions() -> None:
         "elapsed_seconds",
         "cost",
     )
+
+
+def test_budget_counters_reject_invalid_direct_values_without_leaks() -> None:
+    import math
+
+    import pytest
+
+    from semantic_reheating.models import BudgetCounters, ModelValidationError
+
+    sentinel = "__invalid-budget-value__"
+    for name, invalid in (
+        ("turns", -1),
+        ("tool_calls", True),
+        ("tokens", sentinel),
+        ("elapsed_seconds", math.nan),
+        ("elapsed_seconds", math.inf),
+        ("cost", object()),
+    ):
+        values: dict[str, object] = {
+            "turns": 1,
+            "tool_calls": 2,
+            "tokens": 3,
+            "elapsed_seconds": 4.5,
+            "cost": 6.0,
+        }
+        values[name] = invalid
+        with pytest.raises(ModelValidationError) as caught:
+            BudgetCounters(**values)  # type: ignore[arg-type]
+        assert caught.value.code == "invalid_budget_counters"
+        assert sentinel not in str(caught.value)
+
+
+def test_budget_counters_from_dict_rejects_hostile_raw_boundaries_without_leaks() -> None:
+    import pytest
+
+    from semantic_reheating.models import BudgetCounters, ModelValidationError
+
+    sentinel = "__hostile-budget-input__"
+
+    class HostileDict(dict[str, object]):
+        def __getitem__(self, key: str) -> Never:
+            raise RuntimeError(sentinel)
+
+    for hostile in (HostileDict(), object()):
+        with pytest.raises(ModelValidationError) as caught:
+            BudgetCounters.from_dict(hostile)
+        assert caught.value.code == "non_json_data"
+        assert sentinel not in str(caught.value)
+
+
+def test_budget_counters_from_dict_requires_exact_public_shape_and_roundtrips() -> None:
+    import pytest
+
+    from semantic_reheating.models import BudgetCounters, ModelValidationError
+
+    valid = {
+        "turns": 1,
+        "tool_calls": 2,
+        "tokens": 3,
+        "elapsed_seconds": 4.5,
+        "cost": 6,
+    }
+    for invalid in (
+        {key: value for key, value in valid.items() if key != "cost"},
+        {**valid, "extra": 1},
+        {**valid, "turns": True},
+        {**valid, "cost": "wrong"},
+    ):
+        with pytest.raises(ModelValidationError) as caught:
+            BudgetCounters.from_dict(invalid)
+        assert caught.value.code == "invalid_budget_counters"
+
+    assert BudgetCounters.from_dict(valid).to_dict() == valid
+
+
+def test_budget_counters_to_dict_revalidates_tampered_state() -> None:
+    import pytest
+
+    from semantic_reheating.models import BudgetCounters, ModelValidationError
+
+    counters = BudgetCounters(1, 2, 3, 4.5, 6)
+    object.__setattr__(counters, "turns", -1)
+
+    with pytest.raises(ModelValidationError) as caught:
+        counters.to_dict()
+    assert caught.value.code == "invalid_budget_counters"
+
+
+def test_trace_event_with_payload_is_hashable() -> None:
+    from semantic_reheating.models import TraceEvent
+
+    assert isinstance(hash(TraceEvent.from_dict(_fixture("minimal-trace-event.json"))), int)
+
+
+def test_all_valid_core_and_nested_models_have_no_public_dict() -> None:
+    from dataclasses import fields, is_dataclass
+
+    from semantic_reheating.models import DecisionEnvelope, RunPolicy, TraceEvent
+
+    def assert_slots(value: object) -> None:
+        if is_dataclass(value):
+            assert not hasattr(value, "__dict__"), type(value).__name__
+            for descriptor in fields(value):
+                assert_slots(getattr(value, descriptor.name))
+        elif type(value) is tuple:
+            for item in value:
+                assert_slots(item)
+
+    for model in (
+        TraceEvent.from_dict(_fixture("minimal-trace-event.json")),
+        RunPolicy.from_dict(_fixture("minimal-run-policy.json")),
+        DecisionEnvelope.from_dict(_fixture("minimal-decision-envelope.json")),
+    ):
+        assert_slots(model)
 
 
 def test_trace_event_is_deeply_immutable_and_to_dict_is_fresh() -> None:
@@ -542,6 +676,60 @@ def test_core_model_to_dict_rejects_non_internal_source_state() -> None:
             assert caught.value.code == "invalid_model_state"
 
 
+def test_decision_envelope_to_dict_revalidates_mutable_proxy_backing() -> None:
+    from types import MappingProxyType
+
+    import pytest
+
+    from semantic_reheating.models import DecisionEnvelope, ModelValidationError
+
+    backing = _fixture("minimal-decision-envelope.json")
+    forged = object.__new__(DecisionEnvelope)
+    object.__setattr__(forged, "_source", MappingProxyType(backing))
+    backing["contract_version"] = "2.0"
+
+    with pytest.raises(ModelValidationError) as caught:
+        forged.to_dict()
+
+    assert caught.value.code == "unknown_contract_major"
+
+
+def test_run_policy_to_dict_revalidates_mutable_proxy_backing() -> None:
+    from types import MappingProxyType
+
+    import pytest
+
+    from semantic_reheating.models import ModelValidationError, RunPolicy
+
+    backing = _fixture("minimal-run-policy.json")
+    forged = object.__new__(RunPolicy)
+    object.__setattr__(forged, "_source", MappingProxyType(backing))
+    backing["contract_version"] = "2.0"
+
+    with pytest.raises(ModelValidationError) as caught:
+        forged.to_dict()
+
+    assert caught.value.code == "unknown_contract_major"
+
+
+def test_trace_event_to_dict_revalidates_mutable_proxy_backing() -> None:
+    from types import MappingProxyType
+
+    import pytest
+
+    from semantic_reheating.models import ModelValidationError, TraceEvent
+
+    backing = _fixture("minimal-trace-event.json")
+    forged = object.__new__(TraceEvent)
+    object.__setattr__(forged, "_source", MappingProxyType(backing))
+    backing["contract_version"] = "2.0"
+
+    with pytest.raises(ModelValidationError) as caught:
+        forged.to_dict()
+
+    assert caught.value.code == "unknown_contract_major"
+
+
 def test_parse_trace_sanitizes_forged_missing_wrong_and_hostile_sources() -> None:
     from types import MappingProxyType
 
@@ -611,6 +799,26 @@ def test_run_policy_minimal_fixture_is_frozen_typed_and_exact() -> None:
     assert model.to_dict() == _fixture("minimal-run-policy.json")
 
 
+def test_run_policy_subclass_factory_cannot_control_from_dict_allocation() -> None:
+    from dataclasses import dataclass, field
+
+    from semantic_reheating.models import RunPolicy
+
+    sentinel = "__hostile-policy-factory__"
+
+    def hostile_factory() -> Never:
+        raise RuntimeError(sentinel)
+
+    @dataclass(frozen=True)
+    class HostileRunPolicy(RunPolicy):
+        hostile: str = field(default_factory=hostile_factory)
+
+    model = HostileRunPolicy.from_dict(_fixture("minimal-run-policy.json"))
+
+    assert type(model) is RunPolicy
+    assert sentinel not in repr(model)
+
+
 def test_run_policy_schema_rejections_remain_typed() -> None:
     import pytest
 
@@ -646,6 +854,26 @@ def test_decision_envelope_escalation_fixture_is_frozen_typed_and_exact() -> Non
     source["confidence"]["contributing_findings"][0]["score"] = 0  # type: ignore[index]
     assert model.to_dict()["confidence"]["contributing_findings"][0]["score"] == 0.9  # type: ignore[index]
     assert model.to_dict() == _fixture("minimal-decision-envelope.json")
+
+
+def test_decision_envelope_subclass_factory_cannot_control_from_dict_allocation() -> None:
+    from dataclasses import dataclass, field
+
+    from semantic_reheating.models import DecisionEnvelope
+
+    sentinel = "__hostile-decision-factory__"
+
+    def hostile_factory() -> Never:
+        raise RuntimeError(sentinel)
+
+    @dataclass(frozen=True)
+    class HostileDecisionEnvelope(DecisionEnvelope):
+        hostile: str = field(default_factory=hostile_factory)
+
+    model = HostileDecisionEnvelope.from_dict(_fixture("minimal-decision-envelope.json"))
+
+    assert type(model) is DecisionEnvelope
+    assert sentinel not in repr(model)
 
 
 def test_decision_envelope_schema_rejections_remain_typed() -> None:

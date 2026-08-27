@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from importlib import resources
 from pathlib import Path
@@ -86,19 +87,20 @@ def _thaw(value: Any) -> Any:
 
 
 def _allocate_model(cls: type[Any], /, **field_values: Any) -> Any:
-    """Allocate a core model only after its public source has been validated."""
-    model = object.__new__(cls)
-    for descriptor in fields(cls):
-        if descriptor.name in field_values:
-            value = field_values[descriptor.name]
-        elif descriptor.default is not MISSING:
-            value = descriptor.default
-        elif descriptor.default_factory is not MISSING:
-            value = descriptor.default_factory()
-        else:
-            raise RuntimeError(f"Missing internal model field: {descriptor.name}")
-        object.__setattr__(model, descriptor.name, value)
-    return model
+    """Allocate an exact core model only after validating its public source."""
+    if cls not in (TraceEvent, RunPolicy, DecisionEnvelope):
+        raise ModelValidationError("invalid_model_state")
+    try:
+        model = object.__new__(cls)
+        for descriptor in fields(cls):
+            if descriptor.name not in field_values:
+                raise ModelValidationError("invalid_model_state")
+            object.__setattr__(model, descriptor.name, field_values[descriptor.name])
+        return model
+    except ModelValidationError:
+        raise
+    except Exception as error:
+        raise ModelValidationError("invalid_model_state") from error
 
 
 def _thaw_model_source(source: Any) -> dict[str, Any]:
@@ -163,7 +165,7 @@ def _validate_trace(data: Any) -> dict[str, Any]:
     return value
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BudgetCounters:
     """The five public counters, inclusive of all execution modalities."""
 
@@ -173,17 +175,64 @@ class BudgetCounters:
     elapsed_seconds: int | float
     cost: int | float
 
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> BudgetCounters:
-        return cls(
-            turns=data["turns"],
-            tool_calls=data["tool_calls"],
-            tokens=data["tokens"],
-            elapsed_seconds=data["elapsed_seconds"],
-            cost=data["cost"],
+    def __post_init__(self) -> None:
+        self._validate_values(
+            self.turns,
+            self.tool_calls,
+            self.tokens,
+            self.elapsed_seconds,
+            self.cost,
         )
 
+    @staticmethod
+    def _validate_values(
+        turns: Any,
+        tool_calls: Any,
+        tokens: Any,
+        elapsed_seconds: Any,
+        cost: Any,
+    ) -> None:
+        if any(type(value) is not int or value < 0 for value in (turns, tool_calls, tokens)):
+            raise ModelValidationError("invalid_budget_counters")
+        if any(
+            type(value) not in (int, float) or not math.isfinite(value) or value < 0
+            for value in (elapsed_seconds, cost)
+        ):
+            raise ModelValidationError("invalid_budget_counters")
+
+    @staticmethod
+    def from_dict(data: Any) -> BudgetCounters:
+        try:
+            _ensure_json_value(data)
+        except ContractValidationError as error:
+            raise ModelValidationError(error.code) from error
+        except Exception as error:
+            raise ModelValidationError("non_json_data") from error
+        if type(data) is not dict:
+            raise ModelValidationError("non_json_data")
+        if set(data) != {"turns", "tool_calls", "tokens", "elapsed_seconds", "cost"}:
+            raise ModelValidationError("invalid_budget_counters")
+        try:
+            return BudgetCounters(
+                turns=data["turns"],
+                tool_calls=data["tool_calls"],
+                tokens=data["tokens"],
+                elapsed_seconds=data["elapsed_seconds"],
+                cost=data["cost"],
+            )
+        except ModelValidationError:
+            raise
+        except Exception as error:
+            raise ModelValidationError("invalid_budget_counters") from error
+
     def to_dict(self) -> dict[str, int | float]:
+        BudgetCounters(
+            turns=self.turns,
+            tool_calls=self.tool_calls,
+            tokens=self.tokens,
+            elapsed_seconds=self.elapsed_seconds,
+            cost=self.cost,
+        )
         return {
             "turns": self.turns,
             "tool_calls": self.tool_calls,
@@ -193,7 +242,7 @@ class BudgetCounters:
         }
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, slots=True, init=False)
 class TraceEvent:
     contract_version: str
     run_id: str
@@ -202,7 +251,7 @@ class TraceEvent:
     kind: TraceKind
     actor: str
     effect_class: EffectClass
-    payload: Any | None = field(default=None, repr=False)
+    payload: Any | None = field(default=None, repr=False, hash=False)
     payload_ref: str | None = None
     payload_digest: str | None = None
     parent_event_id: str | None = None
@@ -217,12 +266,12 @@ class TraceEvent:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise ModelValidationError("validated_construction_required")
 
-    @classmethod
-    def from_dict(cls, data: Any) -> TraceEvent:
+    @staticmethod
+    def from_dict(data: Any) -> TraceEvent:
         value = _validate_trace(data)
         counters = value.get("budget_counters")
         return _allocate_model(
-            cls,
+            TraceEvent,
             contract_version=value["contract_version"],
             run_id=value["run_id"],
             event_id=value["event_id"],
@@ -250,7 +299,7 @@ class TraceEvent:
             raise ModelValidationError("invalid_model_state") from error
         if type(source) is not MappingProxyType:
             raise ModelValidationError("invalid_model_state")
-        return _thaw_model_source(source)
+        return _validate_trace(_thaw_model_source(source))
 
 
 def parse_trace(events: Any) -> tuple[TraceEvent, ...]:
@@ -287,13 +336,13 @@ def _validated_public(kind: str, data: Any) -> dict[str, Any]:
     return value
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DetectorWindows:
     repetition_events: int
     no_progress_events: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DetectorThresholds:
     repetition_score: int | float
     no_progress_score: int | float
@@ -301,7 +350,7 @@ class DetectorThresholds:
     budget_score: int | float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DetectorWeights:
     repetition: int | float
     no_progress: int | float
@@ -309,7 +358,7 @@ class DetectorWeights:
     budget: int | float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SemanticDetector:
     enabled: bool
     metered: bool
@@ -318,7 +367,7 @@ class SemanticDetector:
     can_relax_hard_stops: bool
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Detectors:
     windows: DetectorWindows
     thresholds: DetectorThresholds
@@ -326,20 +375,20 @@ class Detectors:
     semantic_detector: SemanticDetector | None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AgreeingSignals:
     required_classes: tuple[FindingClass, ...]
     minimum_count: int
     budget_can_substitute: bool
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RecoveryStagePermission:
     permitted: bool
     requires_host_action: bool
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RecoveryLadder:
     nudge: RecoveryStagePermission
     diagnose: RecoveryStagePermission
@@ -349,20 +398,20 @@ class RecoveryLadder:
     stop: RecoveryStagePermission
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PolicyBudgets:
     per_intervention: BudgetCounters
     whole_run: BudgetCounters
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SideEffectRules:
     automatic_repeat_allowed_effect_classes: tuple[EffectClass, ...]
     automatic_unconfirmed_non_idempotent_repeat: bool
     unknown_treated_as_repeatable: bool
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CoolingConditions:
     minimum_elapsed_seconds: int | float
     require_new_evidence: bool
@@ -377,7 +426,7 @@ def _stage(data: Mapping[str, Any]) -> RecoveryStagePermission:
     return RecoveryStagePermission(data["permitted"], data["requires_host_action"])
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, slots=True, init=False)
 class RunPolicy:
     contract_version: str
     policy_id: str
@@ -394,8 +443,8 @@ class RunPolicy:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise ModelValidationError("validated_construction_required")
 
-    @classmethod
-    def from_dict(cls, data: Any) -> RunPolicy:
+    @staticmethod
+    def from_dict(data: Any) -> RunPolicy:
         value = _validated_public("run_policy", data)
         detector_data = value["detectors"]
         windows = detector_data["windows"]
@@ -414,7 +463,7 @@ class RunPolicy:
         rules = value["side_effect_rules"]
         cooling = value["cooling_conditions"]
         return _allocate_model(
-            cls,
+            RunPolicy,
             contract_version=value["contract_version"],
             policy_id=value["policy_id"],
             detectors=detectors,
@@ -445,10 +494,10 @@ class RunPolicy:
             raise ModelValidationError("invalid_model_state") from error
         if type(source) is not MappingProxyType:
             raise ModelValidationError("invalid_model_state")
-        return _thaw_model_source(source)
+        return _validated_public("run_policy", _thaw_model_source(source))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DecisionConstraints:
     must_preserve_evidence: bool
     no_non_idempotent_repeat: bool
@@ -456,7 +505,7 @@ class DecisionConstraints:
     allowed_effect_classes: tuple[EffectClass, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ContributingFinding:
     finding_id: str
     finding_class: FindingClass
@@ -464,13 +513,13 @@ class ContributingFinding:
     score: int | float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DecisionConfidence:
     score: int | float
     contributing_findings: tuple[ContributingFinding, ...]
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, slots=True, init=False)
 class DecisionEnvelope:
     contract_version: str
     run_id: str
@@ -490,13 +539,13 @@ class DecisionEnvelope:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise ModelValidationError("validated_construction_required")
 
-    @classmethod
-    def from_dict(cls, data: Any) -> DecisionEnvelope:
+    @staticmethod
+    def from_dict(data: Any) -> DecisionEnvelope:
         value = _validated_public("decision_envelope", data)
         constraints = value["constraints"]
         confidence = value["confidence"]
         return _allocate_model(
-            cls,
+            DecisionEnvelope,
             contract_version=value["contract_version"],
             run_id=value["run_id"],
             decision_id=value["decision_id"],
@@ -538,4 +587,4 @@ class DecisionEnvelope:
             raise ModelValidationError("invalid_model_state") from error
         if type(source) is not MappingProxyType:
             raise ModelValidationError("invalid_model_state")
-        return _thaw_model_source(source)
+        return _validated_public("decision_envelope", _thaw_model_source(source))
