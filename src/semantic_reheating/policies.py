@@ -308,7 +308,11 @@ def _validated_recovery_diagnosis(diagnosis: Any) -> Diagnosis:
                 for item in data["uncertainty_map"]
             )
             fresh = Diagnosis(
-                data["run_id"], causes, uncertainties, tuple(data["evidence_event_ids"])
+                data["run_id"],
+                causes,
+                uncertainties,
+                tuple(data["evidence_event_ids"]),
+                tuple(data["rejected_hypothesis_refs"]),
             )
     except (MemoryError, SystemExit):
         raise
@@ -339,6 +343,8 @@ def construct_recovery_instruction(
     if (
         fresh_selection.recovery_policy is None
         or "signals_agree" not in fresh_selection.reason_codes
+        or fresh_selection.evidence_event_ids[: len(fresh_diagnosis.evidence_event_ids)]
+        != fresh_diagnosis.evidence_event_ids
     ):
         _fail("invalid_reheat_selection")
 
@@ -385,6 +391,7 @@ def construct_recovery_instruction(
                 "non_idempotent_repeat",
             ],
             "evidence_refs": list(fresh_selection.evidence_event_ids),
+            "rejected_hypothesis_refs": list(fresh_diagnosis.rejected_hypothesis_refs),
             "expected_output": {
                 "kind": "plan",
                 "required_sections": [

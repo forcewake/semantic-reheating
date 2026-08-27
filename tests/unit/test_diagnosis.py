@@ -1,5 +1,6 @@
 """Deterministic diagnosis and closed uncertainty-map behavior."""
 
+import json
 import pickle
 from copy import deepcopy
 from typing import Any
@@ -73,6 +74,7 @@ def test_unknown_or_prose_event_produces_empty_diagnosis() -> None:
         "cause_classes": [],
         "uncertainty_map": [],
         "evidence_event_ids": [],
+        "rejected_hypothesis_refs": [],
     }
 
 
@@ -265,6 +267,7 @@ def test_diagnosis_objects_are_immutable_fresh_and_roundtrip_without_source_secr
     first["cause_classes"].append("unsafe_side_effect")
     first["uncertainty_map"][0]["high_risk"] = True
     first["evidence_event_ids"].append("other")
+    first["rejected_hypothesis_refs"].append("other")
 
     assert diagnosis.cause_classes == (CauseClass.RUNTIME_DEFECT,)
     assert diagnosis.to_dict() == {
@@ -279,12 +282,166 @@ def test_diagnosis_objects_are_immutable_fresh_and_roundtrip_without_source_secr
             }
         ],
         "evidence_event_ids": ["event-001"],
+        "rejected_hypothesis_refs": [],
     }
     with pytest.raises(AttributeError):
         diagnosis.run_id = "other"  # type: ignore[misc]
     assert deepcopy(diagnosis).to_dict() == diagnosis.to_dict()
     assert pickle.loads(pickle.dumps(diagnosis)).to_dict() == diagnosis.to_dict()
     assert "NO_LEAK" not in repr(diagnosis)
+
+
+def test_rejected_hypothesis_refs_are_validated_in_direct_object_state() -> None:
+    from semantic_reheating.diagnosis import DiagnosisError, diagnose
+
+    diagnosis = diagnose(
+        [_event(1, kind="plan", payload={"eliminated_hypotheses": ["source"]})], []
+    )
+    object.__setattr__(diagnosis, "rejected_hypothesis_refs", ("unsafe ref",))
+
+    with pytest.raises(DiagnosisError) as serialized:
+        diagnosis.to_dict()
+    assert serialized.value.code == "invalid_diagnosis"
+    assert serialized.value.__cause__ is None
+    assert serialized.value.__context__ is None
+    with pytest.raises(DiagnosisError):
+        pickle.dumps(diagnosis)
+
+
+def test_plan_rejected_hypotheses_are_redacted_deduplicated_and_causally_preserved() -> (
+    None
+):
+    from hashlib import sha256
+
+    from semantic_reheating.canonical import canonicalize_json
+    from semantic_reheating.diagnosis import diagnose
+
+    secret_one = "SECRET-REJECTED-HYPOTHESIS-ONE"
+    secret_two = "SECRET-REJECTED-HYPOTHESIS-TWO"
+    diagnosis = diagnose(
+        [
+            _event(
+                1,
+                kind="plan",
+                payload={"eliminated_hypotheses": [secret_one, secret_one]},
+            ),
+            _event(
+                2,
+                kind="message",
+                payload={"eliminated_hypotheses": ["MESSAGE-MUST-NOT-APPEAR"]},
+            ),
+            _event(
+                3,
+                kind="plan",
+                payload={
+                    "nested": {"eliminated_hypotheses": ["NESTED-MUST-NOT-APPEAR"]}
+                },
+            ),
+            _event(
+                4,
+                kind="plan",
+                payload={"eliminated_hypotheses": ["", 1]},
+            ),
+            _event(
+                5,
+                kind="plan",
+                payload={"eliminated_hypotheses": [secret_one, secret_two]},
+            ),
+            _event(
+                6,
+                kind="error",
+                payload={"eliminated_hypotheses": ["ERROR-MUST-NOT-APPEAR"]},
+            ),
+        ],
+        [],
+    )
+
+    expected = tuple(
+        "rejected-hypothesis-"
+        + sha256(canonicalize_json(json.dumps(source))).hexdigest()[:24]
+        for source in (secret_one, secret_two)
+    )
+    serialized = repr(diagnosis) + repr(diagnosis.to_dict())
+
+    assert diagnosis.rejected_hypothesis_refs == expected
+    assert diagnosis.evidence_event_ids == ("event-001", "event-005")
+    assert diagnosis.to_dict()["rejected_hypothesis_refs"] == list(expected)
+    for raw in (
+        secret_one,
+        secret_two,
+        "MESSAGE-MUST-NOT-APPEAR",
+        "NESTED-MUST-NOT-APPEAR",
+        "ERROR-MUST-NOT-APPEAR",
+    ):
+        assert raw not in serialized
+
+
+def test_rejected_hypothesis_refs_fail_closed_at_the_bounded_limit() -> None:
+    from semantic_reheating.diagnosis import DiagnosisError, diagnose
+
+    with pytest.raises(DiagnosisError) as raised:
+        diagnose(
+            [
+                _event(
+                    index + 1,
+                    kind="plan",
+                    payload={"eliminated_hypotheses": [f"rejected-{index}"]},
+                )
+                for index in range(101)
+            ],
+            [],
+        )
+
+    assert raised.value.code == "diagnosis_rejected_hypothesis_limit"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize("resource_exception", (MemoryError, SystemExit))
+def test_rejected_hypothesis_canonicalization_resources_propagate(
+    monkeypatch: pytest.MonkeyPatch, resource_exception: type[BaseException]
+) -> None:
+    import semantic_reheating.diagnosis as diagnosis_module
+
+    def raise_resource(*args: object, **kwargs: object) -> bytes:
+        raise resource_exception()
+
+    monkeypatch.setattr(
+        diagnosis_module, "canonicalize_json", raise_resource, raising=False
+    )
+    with pytest.raises(resource_exception):
+        diagnosis_module.diagnose(
+            [_event(1, kind="plan", payload={"eliminated_hypotheses": ["secret"]})],
+            [],
+        )
+
+
+def test_rejected_hypothesis_canonicalization_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import semantic_reheating.diagnosis as diagnosis_module
+
+    def invalid_canonical(*args: object, **kwargs: object) -> bytes:
+        raise ValueError("SECRET-CANONICALIZATION-ERROR")
+
+    monkeypatch.setattr(
+        diagnosis_module, "canonicalize_json", invalid_canonical, raising=False
+    )
+    with pytest.raises(diagnosis_module.DiagnosisError) as raised:
+        diagnosis_module.diagnose(
+            [
+                _event(
+                    1,
+                    kind="plan",
+                    payload={"eliminated_hypotheses": ["secret"]},
+                )
+            ],
+            [],
+        )
+    assert raised.value.code == "invalid_trace_event"
+    assert "SECRET-CANONICALIZATION-ERROR" not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_diagnosis_cause_order_is_fixed_while_evidence_keeps_input_order() -> None:

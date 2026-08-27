@@ -78,6 +78,9 @@
       "enum": [
         "policy-standard",
         "policy-conservative",
+        "research",
+        "branch",
+        "model_switch",
         null
       ],
       "description": "Closed recovery policy identifier or null."

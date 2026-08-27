@@ -188,6 +188,20 @@
       "uniqueItems": true,
       "description": "Public evidence references."
     },
+    "rejected_hypothesis_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Redacted rejected-hypothesis reference.",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+      },
+      "minItems": 0,
+      "maxItems": 100,
+      "uniqueItems": true,
+      "description": "Closed redacted rejected-hypothesis references."
+    },
     "expected_output": {
       "type": "object",
       "additionalProperties": false,
@@ -334,6 +348,7 @@
     "allowed_tools",
     "forbidden_actions",
     "evidence_refs",
+    "rejected_hypothesis_refs",
     "expected_output",
     "cooling_conditions",
     "stop_conditions",

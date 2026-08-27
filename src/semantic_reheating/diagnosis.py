@@ -5,10 +5,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from hashlib import sha256
 from itertools import pairwise
+from json import dumps
 from re import compile as re_compile
 from typing import Any, NoReturn
 
+from .canonical import canonicalize_json
 from .models import TraceEvent, TraceKind
 from .validation import validate_public_artifact
 
@@ -69,6 +72,7 @@ _DISPOSITIONS = {
 _SAFE_ID = re_compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _MAX_ITEMS = 10_000
 _MAX_EVIDENCE = 1_000
+_MAX_REJECTED_HYPOTHESES = 100
 
 
 def _fail(code: str) -> NoReturn:
@@ -146,6 +150,7 @@ class Diagnosis:
     cause_classes: tuple[CauseClass, ...]
     uncertainty_map: tuple[UncertaintyItem, ...]
     evidence_event_ids: tuple[str, ...]
+    rejected_hypothesis_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -153,6 +158,7 @@ class Diagnosis:
             or type(self.cause_classes) is not tuple
             or type(self.uncertainty_map) is not tuple
             or type(self.evidence_event_ids) is not tuple
+            or type(self.rejected_hypothesis_refs) is not tuple
             or any(type(cause) is not CauseClass for cause in self.cause_classes)
             or tuple(sorted(self.cause_classes, key=_CAUSE_ORDER.index))
             != self.cause_classes
@@ -168,6 +174,10 @@ class Diagnosis:
             or any(type(event_id) is not str for event_id in self.evidence_event_ids)
             or len(set(self.evidence_event_ids)) != len(self.evidence_event_ids)
             or len(self.evidence_event_ids) > _MAX_EVIDENCE
+            or any(not _safe_identifier(ref) for ref in self.rejected_hypothesis_refs)
+            or len(set(self.rejected_hypothesis_refs))
+            != len(self.rejected_hypothesis_refs)
+            or len(self.rejected_hypothesis_refs) > _MAX_REJECTED_HYPOTHESES
         ):
             _fail("invalid_diagnosis")
         for item in self.uncertainty_map:
@@ -180,6 +190,7 @@ class Diagnosis:
             "cause_classes": [cause.value for cause in self.cause_classes],
             "uncertainty_map": [item.to_dict() for item in self.uncertainty_map],
             "evidence_event_ids": list(self.evidence_event_ids),
+            "rejected_hypothesis_refs": list(self.rejected_hypothesis_refs),
         }
 
     def _validate_state(self) -> None:
@@ -200,7 +211,11 @@ class Diagnosis:
     ) -> tuple[
         Any,
         tuple[
-            str, tuple[CauseClass, ...], tuple[UncertaintyItem, ...], tuple[str, ...]
+            str,
+            tuple[CauseClass, ...],
+            tuple[UncertaintyItem, ...],
+            tuple[str, ...],
+            tuple[str, ...],
         ],
     ]:
         self._validate_state()
@@ -211,6 +226,7 @@ class Diagnosis:
                 self.cause_classes,
                 self.uncertainty_map,
                 self.evidence_event_ids,
+                self.rejected_hypothesis_refs,
             ),
         )
 
@@ -303,6 +319,35 @@ def _finding_cause(finding: Mapping[str, Any]) -> CauseClass | None:
     return None
 
 
+def _rejected_hypothesis_references(event: TraceEvent) -> tuple[str, ...]:
+    if event.kind is not TraceKind.PLAN:
+        return ()
+    payload = event.to_dict().get("payload")
+    if type(payload) is not dict:
+        return ()
+    eliminated = payload.get("eliminated_hypotheses")
+    if (
+        type(eliminated) is not list
+        or not eliminated
+        or any(type(item) is not str or not item for item in eliminated)
+    ):
+        return ()
+    references: list[str] = []
+    invalid = False
+    try:
+        for source in eliminated:
+            canonical_source = dumps(source, ensure_ascii=False)
+            digest = sha256(canonicalize_json(canonical_source)).hexdigest()[:24]
+            references.append(f"rejected-hypothesis-{digest}")
+    except (MemoryError, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - source hypotheses are a sanitized boundary.
+        invalid = True
+    if invalid:
+        _fail("invalid_trace_event")
+    return tuple(references)
+
+
 def diagnose(trace: Any, findings: Any) -> Diagnosis:
     """Map exact validated marker and finding facts to closed uncertainty items."""
     parsed_trace = _validated_trace(trace)
@@ -319,9 +364,10 @@ def diagnose(trace: Any, findings: Any) -> Diagnosis:
     observed: set[CauseClass] = set()
     evidence: list[str] = []
     seen_evidence: set[str] = set()
+    rejected_hypotheses: list[str] = []
+    seen_rejected_hypotheses: set[str] = set()
 
-    def support(cause: CauseClass, event_ids: tuple[str, ...]) -> None:
-        observed.add(cause)
+    def support_evidence(event_ids: tuple[str, ...]) -> None:
         for event_id in event_ids:
             if event_id not in seen_evidence:
                 seen_evidence.add(event_id)
@@ -329,10 +375,23 @@ def diagnose(trace: Any, findings: Any) -> Diagnosis:
                 if len(evidence) > _MAX_EVIDENCE:
                     _fail("diagnosis_evidence_limit")
 
+    def support(cause: CauseClass, event_ids: tuple[str, ...]) -> None:
+        observed.add(cause)
+        support_evidence(event_ids)
+
     for event in parsed_trace:
         marker = _event_marker(event)
         if marker is not None:
             support(marker, (event.event_id,))
+        references = _rejected_hypothesis_references(event)
+        if references:
+            support_evidence((event.event_id,))
+            for reference in references:
+                if reference not in seen_rejected_hypotheses:
+                    seen_rejected_hypotheses.add(reference)
+                    rejected_hypotheses.append(reference)
+                    if len(rejected_hypotheses) > _MAX_REJECTED_HYPOTHESES:
+                        _fail("diagnosis_rejected_hypothesis_limit")
     for finding in parsed_findings:
         cause = _finding_cause(finding)
         if cause is not None:
@@ -348,4 +407,10 @@ def diagnose(trace: Any, findings: Any) -> Diagnosis:
         )
         for cause in causes
     )
-    return Diagnosis(run_id, causes, uncertainty_map, tuple(evidence))
+    return Diagnosis(
+        run_id,
+        causes,
+        uncertainty_map,
+        tuple(evidence),
+        tuple(rejected_hypotheses),
+    )

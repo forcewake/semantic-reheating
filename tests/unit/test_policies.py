@@ -33,6 +33,45 @@ def _policy(**disabled: bool) -> Any:
     return RunPolicy.from_dict(source)
 
 
+@pytest.mark.parametrize("recovery_policy", ("research", "branch", "model_switch"))
+def test_recovery_policy_values_roundtrip_through_public_decision_envelope(
+    recovery_policy: str,
+) -> None:
+    from semantic_reheating.models import DecisionEnvelope
+    from semantic_reheating.validation import validate_public_artifact
+
+    source = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "minimal-decision-envelope.json"
+        ).read_text(encoding="utf-8")
+    )
+    source.update(
+        {
+            "decision": "reheat",
+            "reason_codes": ["signals_agree"],
+            "recovery_policy": recovery_policy,
+            "requires_host_action": False,
+        }
+    )
+    source["constraints"]["require_host_confirmation"] = False
+
+    envelope = DecisionEnvelope.from_dict(source)
+
+    assert envelope.to_dict() == source
+    assert validate_public_artifact("decision_envelope", envelope.to_dict()) == source
+
+
+@pytest.mark.parametrize("value", ("research", "branch", "model_switch"))
+def test_recovery_policy_values_remain_invalid_controller_decisions(value: str) -> None:
+    from semantic_reheating.models import Decision
+
+    with pytest.raises(ValueError):
+        Decision(value)
+
+
 def _event(sequence: int, cause: str, *, run_id: str = "run-policy") -> Any:
     from semantic_reheating.models import TraceEvent
 
@@ -474,15 +513,75 @@ def test_construct_recovery_instruction_returns_none_except_for_reheat() -> None
         assert construct_recovery_instruction(selection, diagnosis, _policy()) is None
 
 
+def test_construct_recovery_instruction_rejects_unbound_reheat_evidence() -> None:
+    from semantic_reheating.models import Decision
+    from semantic_reheating.policies import (
+        PolicySelection,
+        PolicySelectionError,
+        RecoveryPolicy,
+        construct_recovery_instruction,
+    )
+
+    diagnosis = _diagnosis("missing_knowledge")
+    selection = PolicySelection(
+        Decision.REHEAT,
+        RecoveryPolicy.RESEARCH,
+        ("signals_agree",),
+        ("unrelated-event",),
+        False,
+    )
+
+    with pytest.raises(PolicySelectionError) as raised:
+        construct_recovery_instruction(
+            selection, diagnosis, _policy(nudge=True, diagnose=True)
+        )
+
+    assert raised.value.code == "invalid_reheat_selection"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_construct_recovery_instruction_preserves_prefix_and_later_evidence() -> None:
+    from semantic_reheating.models import Decision
+    from semantic_reheating.policies import (
+        PolicySelection,
+        RecoveryPolicy,
+        construct_recovery_instruction,
+    )
+
+    diagnosis = _diagnosis("missing_knowledge")
+    selection = PolicySelection(
+        Decision.REHEAT,
+        RecoveryPolicy.RESEARCH,
+        ("signals_agree",),
+        (*diagnosis.evidence_event_ids, "later-matched-finding"),
+        False,
+    )
+
+    instruction = construct_recovery_instruction(
+        selection, diagnosis, _policy(nudge=True, diagnose=True)
+    )
+
+    assert instruction is not None
+    assert instruction["evidence_refs"] == [
+        *diagnosis.evidence_event_ids,
+        "later-matched-finding",
+    ]
+
+
 def test_construct_recovery_instruction_builds_exact_valid_reheat_contract() -> None:
     from hashlib import sha256
 
     from semantic_reheating.canonical import canonicalize_json
-    from semantic_reheating.policies import construct_recovery_instruction
+    from semantic_reheating.policies import (
+        construct_recovery_instruction,
+        select_recovery_policy,
+    )
     from semantic_reheating.validation import validate_public_artifact
 
     diagnosis = _diagnosis("missing_knowledge", "incorrect_plan", "runtime_defect")
-    selection = _selected(
+    selection = select_recovery_policy(
+        diagnosis,
         [
             _finding("rep", finding_class="repetition"),
             _finding("progress", finding_class="no_progress"),
@@ -537,6 +636,9 @@ def test_construct_recovery_instruction_builds_exact_valid_reheat_contract() -> 
         "non_idempotent_repeat",
     ]
     assert instruction["evidence_refs"] == list(selection.evidence_event_ids)
+    assert instruction["rejected_hypothesis_refs"] == list(
+        diagnosis.rejected_hypothesis_refs
+    )
     assert instruction["expected_output"] == {
         "kind": "plan",
         "required_sections": [
@@ -619,6 +721,66 @@ def test_reheat_prompt_requires_hypothesis_contract() -> None:
     with pytest.raises(ContractValidationError) as caught:
         validate_public_artifact("recovery_instruction", source)
     assert caught.value.code == "schema_validation_error"
+
+
+def test_recovery_instruction_requires_closed_redacted_rejected_hypothesis_refs() -> (
+    None
+):
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    source = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "minimal-recovery-instruction.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert validate_public_artifact("recovery_instruction", source) == source
+    rejected = deepcopy(source)
+    rejected.pop("rejected_hypothesis_refs", None)
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("recovery_instruction", rejected)
+    assert caught.value.code == "schema_validation_error"
+
+
+@pytest.mark.parametrize(
+    ("refs", "valid"),
+    (
+        ([], True),
+        (["rejected-hypothesis-ref"], True),
+        (["unsafe ref"], False),
+        (["rejected-hypothesis-ref", "rejected-hypothesis-ref"], False),
+        ([f"rejected-hypothesis-{index}" for index in range(101)], False),
+    ),
+)
+def test_recovery_instruction_rejected_hypothesis_refs_are_safe_unique_and_bounded(
+    refs: list[str], valid: bool
+) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    source = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "minimal-recovery-instruction.json"
+        ).read_text(encoding="utf-8")
+    )
+    source["rejected_hypothesis_refs"] = refs
+
+    if valid:
+        assert validate_public_artifact("recovery_instruction", source) == source
+    else:
+        with pytest.raises(ContractValidationError) as caught:
+            validate_public_artifact("recovery_instruction", source)
+        assert caught.value.code == "schema_validation_error"
 
 
 @pytest.mark.parametrize(
@@ -704,7 +866,10 @@ def test_construct_recovery_instruction_maps_causes_in_design_order_without_pros
 def test_construct_recovery_instruction_is_deterministic_fresh_and_redacted() -> None:
     from semantic_reheating.diagnosis import diagnose
     from semantic_reheating.models import TraceEvent
-    from semantic_reheating.policies import construct_recovery_instruction
+    from semantic_reheating.policies import (
+        construct_recovery_instruction,
+        select_recovery_policy,
+    )
 
     secret = "SECRET-MARKER-DO-NOT-COPY"
     diagnosis = diagnose(
@@ -715,11 +880,12 @@ def test_construct_recovery_instruction_is_deterministic_fresh_and_redacted() ->
                     "run_id": "run-policy",
                     "event_id": "secret-evidence",
                     "sequence": 1,
-                    "kind": "error",
+                    "kind": "plan",
                     "actor": "controller",
                     "effect_class": "read_only",
                     "payload": {
                         "diagnostic_cause": "missing_knowledge",
+                        "eliminated_hypotheses": [secret],
                         "secret": secret,
                     },
                 }
@@ -727,7 +893,8 @@ def test_construct_recovery_instruction_is_deterministic_fresh_and_redacted() ->
         ],
         [],
     )
-    selection = _selected(
+    selection = select_recovery_policy(
+        diagnosis,
         [
             _finding("rep", finding_class="repetition"),
             _finding("progress", finding_class="no_progress"),
@@ -747,6 +914,9 @@ def test_construct_recovery_instruction_is_deterministic_fresh_and_redacted() ->
     first["expected_output"]["hypothesis_contract"]["exact_hypotheses"] = 99
     assert second["expected_output"]["hypothesis_contract"]["exact_hypotheses"] == 3
     assert secret not in repr(second)
+    assert second["rejected_hypothesis_refs"] == list(
+        diagnosis.rejected_hypothesis_refs
+    )
     assert secret not in repr(selection)
     assert secret not in repr(diagnosis)
 
@@ -756,10 +926,12 @@ def test_construct_recovery_instruction_fails_closed_and_preserves_resources(
 ) -> None:
     from semantic_reheating import policies
     from semantic_reheating.models import Decision
+    from semantic_reheating.policies import select_recovery_policy
     from semantic_reheating.validation import validate_public_artifact
 
     diagnosis = _diagnosis("missing_knowledge")
-    selection = _selected(
+    selection = select_recovery_policy(
+        diagnosis,
         [
             _finding("rep", finding_class="repetition"),
             _finding("progress", finding_class="no_progress"),
