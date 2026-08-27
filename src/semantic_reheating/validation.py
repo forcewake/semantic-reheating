@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping, Sequence
 from importlib import resources
 from pathlib import Path
 from types import MappingProxyType
@@ -12,7 +11,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-PUBLIC_CONTRACT_SCHEMAS: Mapping[str, str] = MappingProxyType(
+PUBLIC_CONTRACT_SCHEMAS = MappingProxyType(
     {
         "run_policy": "contracts/v1/run-policy.schema.json",
         "detector_finding": "contracts/v1/detector-finding.schema.json",
@@ -147,10 +146,6 @@ def _ensure_json_value(value: Any) -> None:
             for nested in reversed(current):
                 stack.append((nested, depth + 1, False))
             continue
-        if isinstance(current, (Mapping, Sequence)):
-            raise ContractValidationError(
-                "non_json_data", "Only plain JSON objects and arrays are accepted"
-            )
         raise ContractValidationError(
             "non_json_data", "Only JSON-compatible values are accepted"
         )
@@ -238,7 +233,7 @@ def _validator_for(kind: str) -> Draft202012Validator:
 
 
 def _check_contract_major(data: Any) -> None:
-    if not isinstance(data, dict):
+    if type(data) is not dict:
         return
     version = data.get("contract_version")
     if isinstance(version, str):
@@ -252,7 +247,7 @@ def _check_contract_major(data: Any) -> None:
 def validate_public_artifact(kind: str, data: Any) -> Any:
     """Validate real public artifact data against its closed v1 contract."""
     kind = _ensure_public_artifact_kind(kind)
-    if isinstance(data, (str, bytes, bytearray)):
+    if type(data) in (str, bytes, bytearray):
         data = load_public_json(data)
     else:
         _ensure_json_value(data)

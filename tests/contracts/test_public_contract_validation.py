@@ -6,7 +6,7 @@ import subprocess
 import sys
 import zipfile
 from collections import UserDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
 from importlib import resources
 from pathlib import Path
@@ -758,6 +758,53 @@ class _HostileRawBytearray(bytearray):
         raise RuntimeError("__hostile-raw-bytearray-bytes__")
 
 
+_HOSTILE_CLASS_SENTINEL = "__hostile-class__"
+
+
+class _HostileClassObject:
+    @property
+    def __class__(self) -> type[object]:
+        raise RuntimeError(_HOSTILE_CLASS_SENTINEL)
+
+
+class _HostileClassMapping(Mapping[str, object]):
+    @property
+    def __class__(self) -> type[object]:
+        raise RuntimeError(_HOSTILE_CLASS_SENTINEL)
+
+    def __getitem__(self, key: str) -> object:
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+
+class _HostileClassSequence(Sequence[object]):
+    @property
+    def __class__(self) -> type[object]:
+        raise RuntimeError(_HOSTILE_CLASS_SENTINEL)
+
+    def __getitem__(self, index: int) -> object:
+        raise IndexError(index)
+
+    def __len__(self) -> int:
+        return 0
+
+
+class _DangerousDisplayObject:
+    def __repr__(self) -> str:
+        raise RuntimeError("__dangerous-repr__")
+
+    def __str__(self) -> str:
+        raise RuntimeError("__dangerous-str__")
+
+    def __hash__(self) -> int:
+        raise RuntimeError("__dangerous-hash__")
+
+
 _HOSTILE_RAW_SENTINELS = (
     "__hostile-raw-str-len__",
     "__hostile-raw-str-str__",
@@ -792,8 +839,48 @@ def test_hostile_raw_input_subclasses_are_rejected_before_methods_run(
             load_public_json(source)
         else:
             validate_public_artifact("detector_finding", source)
-    assert caught.value.code == "non_json_input"
+    assert caught.value.code == (
+        "non_json_input" if api == "loader" else "non_json_data"
+    )
     assert all(sentinel not in str(caught.value) for sentinel in _HOSTILE_RAW_SENTINELS)
+
+
+@pytest.mark.parametrize(
+    "case", ["object", "mapping", "sequence", "nested-dict", "nested-list"]
+)
+def test_hostile_class_introspection_is_rejected_with_sanitized_error(
+    case: str,
+) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    hostile = _HostileClassObject()
+    values: dict[str, object] = {
+        "object": hostile,
+        "mapping": _HostileClassMapping(),
+        "sequence": _HostileClassSequence(),
+        "nested-dict": {"nested": hostile},
+        "nested-list": [hostile],
+    }
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("detector_finding", values[case])
+    assert caught.value.code == "non_json_data"
+    assert str(caught.value) == "Only JSON-compatible values are accepted"
+    assert _HOSTILE_CLASS_SENTINEL not in str(caught.value)
+
+
+def test_normal_object_with_dangerous_display_methods_is_rejected_safely() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("detector_finding", _DangerousDisplayObject())
+    assert caught.value.code == "non_json_data"
+    assert str(caught.value) == "Only JSON-compatible values are accepted"
 
 
 @pytest.mark.parametrize("source_kind", ["text", "bytes"])
