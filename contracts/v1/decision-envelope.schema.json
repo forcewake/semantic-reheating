@@ -1,0 +1,305 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/contracts/v1/decision-envelope.schema.json",
+  "title": "DecisionEnvelope",
+  "description": "Closed advisory controller decision envelope.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "const": "1.0",
+      "description": "Pinned public contract version."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Public run identifier.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "decision_id": {
+      "type": "string",
+      "description": "Public decision identifier.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "continue",
+        "nudge",
+        "diagnose",
+        "reheat",
+        "restart",
+        "escalate",
+        "stop"
+      ],
+      "description": "Exact closed decision."
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "signals_agree",
+          "repetition_detected",
+          "no_progress_detected",
+          "risk_detected",
+          "budget_limit_reached",
+          "cooling_active",
+          "host_action_required"
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "description": "Stable decision reason codes."
+    },
+    "evidence_event_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Public evidence event identifier.",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+      },
+      "minItems": 0,
+      "maxItems": 10000,
+      "uniqueItems": true,
+      "description": "Evidence event identifiers."
+    },
+    "recovery_policy": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "policy-standard",
+        "policy-conservative",
+        null
+      ],
+      "description": "Closed recovery policy identifier or null."
+    },
+    "recovery_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "turns": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "Turn count."
+        },
+        "tool_calls": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "Tool-call count."
+        },
+        "tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000,
+          "description": "Token count."
+        },
+        "elapsed_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 31536000,
+          "description": "Elapsed seconds."
+        },
+        "cost": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1000000000,
+          "description": "Public cost units."
+        }
+      },
+      "required": [
+        "turns",
+        "tool_calls",
+        "tokens",
+        "elapsed_seconds",
+        "cost"
+      ],
+      "description": "Complete decision recovery budget."
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "must_preserve_evidence": {
+          "type": "boolean",
+          "description": "Evidence must be preserved."
+        },
+        "no_non_idempotent_repeat": {
+          "type": "boolean",
+          "description": "Non-idempotent repeat is prohibited."
+        },
+        "require_host_confirmation": {
+          "type": "boolean",
+          "description": "Host confirmation requirement."
+        },
+        "allowed_effect_classes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "read_only",
+              "idempotent_write"
+            ]
+          },
+          "maxItems": 2,
+          "uniqueItems": true,
+          "description": "Permitted effect classes."
+        }
+      },
+      "required": [
+        "must_preserve_evidence",
+        "no_non_idempotent_repeat",
+        "require_host_confirmation",
+        "allowed_effect_classes"
+      ],
+      "description": "Closed decision constraints."
+    },
+    "cooling_conditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "minimum_elapsed_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 31536000,
+          "description": "Required cooling time."
+        },
+        "require_new_evidence": {
+          "type": "boolean",
+          "description": "Whether new evidence is required."
+        },
+        "minimum_acceptance_gain": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Required acceptance gain."
+        }
+      },
+      "required": [
+        "minimum_elapsed_seconds",
+        "require_new_evidence",
+        "minimum_acceptance_gain"
+      ],
+      "description": "Closed decision cooling conditions."
+    },
+    "confidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Bounded decision confidence."
+        },
+        "contributing_findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "finding_id": {
+                "type": "string",
+                "description": "Public finding identifier.",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              },
+              "finding_class": {
+                "type": "string",
+                "enum": [
+                  "repetition",
+                  "no_progress",
+                  "risk",
+                  "budget"
+                ],
+                "description": "Closed finding class."
+              },
+              "matched": {
+                "type": "boolean",
+                "description": "Whether the finding matched."
+              },
+              "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Bounded finding score."
+              }
+            },
+            "required": [
+              "finding_id",
+              "finding_class",
+              "matched",
+              "score"
+            ],
+            "description": "Redacted contributing finding record."
+          },
+          "minItems": 0,
+          "maxItems": 100,
+          "description": "Closed contributing finding records."
+        }
+      },
+      "required": [
+        "score",
+        "contributing_findings"
+      ],
+      "description": "Closed confidence record."
+    },
+    "requires_host_action": {
+      "type": "boolean",
+      "description": "Whether host action is required."
+    },
+    "human_summary": {
+      "type": "string",
+      "description": "Redacted public human summary.",
+      "minLength": 1,
+      "maxLength": 2000
+    }
+  },
+  "required": [
+    "contract_version",
+    "run_id",
+    "decision_id",
+    "decision",
+    "reason_codes",
+    "evidence_event_ids",
+    "recovery_policy",
+    "recovery_budget",
+    "constraints",
+    "cooling_conditions",
+    "confidence",
+    "requires_host_action",
+    "human_summary"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "decision": {
+            "const": "escalate"
+          }
+        },
+        "required": [
+          "decision"
+        ]
+      },
+      "then": {
+        "properties": {
+          "requires_host_action": {
+            "const": true
+          }
+        }
+      }
+    }
+  ]
+}

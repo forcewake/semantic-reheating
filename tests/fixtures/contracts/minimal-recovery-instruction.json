@@ -1,0 +1,51 @@
+{
+  "contract_version": "1.0",
+  "run_id": "run-example",
+  "instruction_id": "instruction-001",
+  "selected_prompt_asset_id": "prompt-reheat-v1",
+  "variables": [
+    {
+      "name": "current_goal",
+      "value": "Redacted goal."
+    }
+  ],
+  "diagnosed_gaps": [
+    {
+      "kind": "missing_evidence",
+      "description": "Redacted missing evidence."
+    }
+  ],
+  "recovery_budget": {
+    "turns": 1,
+    "tool_calls": 1,
+    "tokens": 100,
+    "elapsed_seconds": 60,
+    "cost": 1
+  },
+  "allowed_tools": [
+    "read_only"
+  ],
+  "forbidden_actions": [
+    "credential_access"
+  ],
+  "evidence_refs": [
+    "evidence-001"
+  ],
+  "expected_output": {
+    "kind": "diagnosis",
+    "required_sections": [
+      "summary"
+    ],
+    "max_characters": 1000
+  },
+  "cooling_conditions": {
+    "minimum_elapsed_seconds": 30,
+    "require_new_evidence": true,
+    "minimum_acceptance_gain": 0.1
+  },
+  "stop_conditions": [
+    "budget_exhausted"
+  ],
+  "advisory_only": true,
+  "grants_authority": false
+}

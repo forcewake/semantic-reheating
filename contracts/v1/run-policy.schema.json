@@ -1,0 +1,424 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/contracts/v1/run-policy.schema.json",
+  "title": "RunPolicy",
+  "description": "Closed public policy for bounded advisory recovery.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "const": "1.0",
+      "description": "Pinned public contract version."
+    },
+    "policy_id": {
+      "type": "string",
+      "description": "Public policy identifier.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "detectors": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "windows": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repetition_events": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "description": "Repetition lookback events."
+            },
+            "no_progress_events": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "description": "No-progress lookback events."
+            }
+          },
+          "required": [
+            "repetition_events",
+            "no_progress_events"
+          ],
+          "description": "Closed detector lookback windows."
+        },
+        "thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repetition_score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Repetition threshold."
+            },
+            "no_progress_score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "No-progress threshold."
+            },
+            "risk_score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Risk threshold."
+            },
+            "budget_score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Budget threshold."
+            }
+          },
+          "required": [
+            "repetition_score",
+            "no_progress_score",
+            "risk_score",
+            "budget_score"
+          ],
+          "description": "Closed detector thresholds."
+        },
+        "weights": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repetition": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Repetition weight."
+            },
+            "no_progress": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "No-progress weight."
+            },
+            "risk": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Risk weight."
+            },
+            "budget": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Budget weight."
+            }
+          },
+          "required": [
+            "repetition",
+            "no_progress",
+            "risk",
+            "budget"
+          ],
+          "description": "Closed detector weights."
+        },
+        "semantic_detector": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Whether the optional semantic detector runs."
+            },
+            "metered": {
+              "type": "boolean",
+              "description": "Whether semantic use is metered."
+            },
+            "weight": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Semantic detector weight."
+            },
+            "required": {
+              "type": "boolean",
+              "description": "Whether semantic output is required when enabled."
+            },
+            "can_relax_hard_stops": {
+              "const": false,
+              "description": "Semantic detection cannot relax hard stops."
+            }
+          },
+          "required": [
+            "enabled",
+            "metered",
+            "weight",
+            "required",
+            "can_relax_hard_stops"
+          ],
+          "description": "Optional bounded semantic detector configuration."
+        }
+      },
+      "required": [
+        "windows",
+        "thresholds",
+        "weights"
+      ],
+      "description": "Closed detector configuration."
+    },
+    "agreeing_signals": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required_classes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "repetition",
+              "no_progress"
+            ]
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "description": "Required gate classes; includes repetition and independent no-progress."
+        },
+        "minimum_count": {
+          "const": 2,
+          "description": "Minimum agreeing detector count."
+        },
+        "budget_can_substitute": {
+          "const": false,
+          "description": "Budget signals cannot substitute for gate evidence."
+        }
+      },
+      "required": [
+        "required_classes",
+        "minimum_count",
+        "budget_can_substitute"
+      ],
+      "description": "Required independent recovery-gate signals."
+    },
+    "recovery_ladder": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "stage": {
+            "type": "string",
+            "enum": [
+              "nudge",
+              "diagnose",
+              "reheat",
+              "restart",
+              "escalate",
+              "stop"
+            ],
+            "description": "Recovery stage."
+          },
+          "permitted": {
+            "type": "boolean",
+            "description": "Whether this advisory stage is permitted."
+          },
+          "requires_host_action": {
+            "type": "boolean",
+            "description": "Whether host action is required."
+          }
+        },
+        "required": [
+          "stage",
+          "permitted",
+          "requires_host_action"
+        ],
+        "description": "Closed recovery ladder entry."
+      },
+      "description": "Closed recovery ladder permissions."
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "per_intervention": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "turns": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000,
+              "description": "Turn count."
+            },
+            "tool_calls": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000,
+              "description": "Tool-call count."
+            },
+            "tokens": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000,
+              "description": "Token count."
+            },
+            "elapsed_seconds": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 31536000,
+              "description": "Elapsed seconds."
+            },
+            "cost": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1000000000,
+              "description": "Public cost units."
+            }
+          },
+          "required": [
+            "turns",
+            "tool_calls",
+            "tokens",
+            "elapsed_seconds",
+            "cost"
+          ],
+          "description": "Limit per advisory intervention."
+        },
+        "whole_run": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "turns": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000,
+              "description": "Turn count."
+            },
+            "tool_calls": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000,
+              "description": "Tool-call count."
+            },
+            "tokens": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000,
+              "description": "Token count."
+            },
+            "elapsed_seconds": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 31536000,
+              "description": "Elapsed seconds."
+            },
+            "cost": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1000000000,
+              "description": "Public cost units."
+            }
+          },
+          "required": [
+            "turns",
+            "tool_calls",
+            "tokens",
+            "elapsed_seconds",
+            "cost"
+          ],
+          "description": "Limit across the whole run."
+        }
+      },
+      "required": [
+        "per_intervention",
+        "whole_run"
+      ],
+      "description": "Complete policy budget limits."
+    },
+    "max_recovery_episodes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Maximum recovery episodes."
+    },
+    "max_reentry_depth": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Maximum re-entry depth."
+    },
+    "side_effect_rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "automatic_repeat_allowed_effect_classes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "read_only",
+              "idempotent_write"
+            ]
+          },
+          "minItems": 0,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "description": "Effect classes allowed for automatic repeat."
+        },
+        "automatic_unconfirmed_non_idempotent_repeat": {
+          "const": false,
+          "description": "Non-idempotent repeats require confirmation."
+        },
+        "unknown_treated_as_repeatable": {
+          "const": false,
+          "description": "Unknown effects are non-repeatable."
+        }
+      },
+      "required": [
+        "automatic_repeat_allowed_effect_classes",
+        "automatic_unconfirmed_non_idempotent_repeat",
+        "unknown_treated_as_repeatable"
+      ],
+      "description": "Closed side-effect rules."
+    },
+    "cooling_conditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "minimum_elapsed_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 31536000,
+          "description": "Required cooling time."
+        },
+        "require_new_evidence": {
+          "type": "boolean",
+          "description": "Whether new evidence is required."
+        },
+        "minimum_acceptance_gain": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Required acceptance gain."
+        }
+      },
+      "required": [
+        "minimum_elapsed_seconds",
+        "require_new_evidence",
+        "minimum_acceptance_gain"
+      ],
+      "description": "Closed whole-policy cooling conditions."
+    }
+  },
+  "required": [
+    "contract_version",
+    "policy_id",
+    "detectors",
+    "agreeing_signals",
+    "recovery_ladder",
+    "budgets",
+    "max_recovery_episodes",
+    "max_reentry_depth",
+    "side_effect_rules",
+    "cooling_conditions"
+  ]
+}

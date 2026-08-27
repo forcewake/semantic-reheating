@@ -1,0 +1,34 @@
+{
+  "contract_version": "1.0",
+  "run_id": "run-example",
+  "outcome_id": "outcome-001",
+  "instruction_id": "instruction-001",
+  "host_result": {
+    "status": "completed",
+    "summary": "Redacted completion."
+  },
+  "consumed_counters": {
+    "turns": 1,
+    "tool_calls": 1,
+    "tokens": 100,
+    "elapsed_seconds": 60,
+    "cost": 1
+  },
+  "evidence_gained": [
+    "evidence-002"
+  ],
+  "acceptance_delta": {
+    "status": "improved",
+    "summary": "Redacted improvement."
+  },
+  "state_delta": {
+    "observed": true,
+    "summary": "Redacted state change."
+  },
+  "error_class": null,
+  "host_denial": {
+    "denied": false,
+    "reason_code": null
+  },
+  "human_escalation": false
+}

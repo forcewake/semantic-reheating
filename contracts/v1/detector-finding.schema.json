@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/contracts/v1/detector-finding.schema.json",
+  "title": "DetectorFinding",
+  "description": "Closed, redacted detector finding.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "const": "1.0",
+      "description": "Pinned public contract version."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Public run identifier.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "finding_id": {
+      "type": "string",
+      "description": "Public identifier.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "detector_name": {
+      "type": "string",
+      "description": "Detector name.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "detector_version": {
+      "type": "string",
+      "description": "Detector version.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "matched": {
+      "type": "boolean",
+      "description": "Whether the detector matched."
+    },
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Bounded detector score."
+    },
+    "finding_class": {
+      "type": "string",
+      "enum": [
+        "repetition",
+        "no_progress",
+        "risk",
+        "budget"
+      ],
+      "description": "Closed finding class."
+    },
+    "event_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Exact public event identifier.",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+      },
+      "minItems": 1,
+      "maxItems": 10000,
+      "uniqueItems": true,
+      "description": "Exact event identifiers evaluated for this finding."
+    },
+    "reason_code": {
+      "type": "string",
+      "enum": [
+        "repetition_detected",
+        "no_progress_detected",
+        "risk_detected",
+        "budget_limit_reached",
+        "detector_degraded",
+        "detector_unavailable"
+      ],
+      "description": "Stable public reason code."
+    },
+    "explanation": {
+      "type": "string",
+      "description": "Redacted human-readable explanation.",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "available",
+            "degraded",
+            "unavailable"
+          ],
+          "description": "Detector availability."
+        },
+        "notice": {
+          "type": "string",
+          "description": "Redacted availability notice.",
+          "minLength": 1,
+          "maxLength": 500
+        }
+      },
+      "required": [
+        "status",
+        "notice"
+      ],
+      "description": "Closed degraded or unavailable notice."
+    }
+  },
+  "required": [
+    "contract_version",
+    "run_id",
+    "finding_id",
+    "detector_name",
+    "detector_version",
+    "matched",
+    "score",
+    "finding_class",
+    "event_ids",
+    "reason_code",
+    "explanation",
+    "availability"
+  ]
+}

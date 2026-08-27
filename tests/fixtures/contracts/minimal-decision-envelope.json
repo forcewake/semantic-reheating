@@ -1,0 +1,46 @@
+{
+  "contract_version": "1.0",
+  "run_id": "run-example",
+  "decision_id": "decision-001",
+  "decision": "escalate",
+  "reason_codes": [
+    "host_action_required"
+  ],
+  "evidence_event_ids": [
+    "event-001"
+  ],
+  "recovery_policy": null,
+  "recovery_budget": {
+    "turns": 1,
+    "tool_calls": 1,
+    "tokens": 100,
+    "elapsed_seconds": 60,
+    "cost": 1
+  },
+  "constraints": {
+    "must_preserve_evidence": true,
+    "no_non_idempotent_repeat": true,
+    "require_host_confirmation": true,
+    "allowed_effect_classes": [
+      "read_only"
+    ]
+  },
+  "cooling_conditions": {
+    "minimum_elapsed_seconds": 30,
+    "require_new_evidence": true,
+    "minimum_acceptance_gain": 0.1
+  },
+  "confidence": {
+    "score": 0.8,
+    "contributing_findings": [
+      {
+        "finding_id": "finding-001",
+        "finding_class": "repetition",
+        "matched": true,
+        "score": 0.9
+      }
+    ]
+  },
+  "requires_host_action": true,
+  "human_summary": "Redacted host action request."
+}

@@ -1,0 +1,19 @@
+{
+  "contract_version": "1.0",
+  "run_id": "run-example",
+  "finding_id": "finding-001",
+  "detector_name": "repetition",
+  "detector_version": "1.0",
+  "matched": true,
+  "score": 0.9,
+  "finding_class": "repetition",
+  "event_ids": [
+    "event-001"
+  ],
+  "reason_code": "repetition_detected",
+  "explanation": "Redacted repeated pattern.",
+  "availability": {
+    "status": "available",
+    "notice": "Detector available."
+  }
+}

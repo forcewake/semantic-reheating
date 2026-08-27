@@ -1,0 +1,307 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/contracts/v1/recovery-instruction.schema.json",
+  "title": "RecoveryInstruction",
+  "description": "Closed advisory recovery instruction with no authority grant.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "const": "1.0",
+      "description": "Pinned public contract version."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Public run identifier.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "instruction_id": {
+      "type": "string",
+      "description": "Public instruction identifier.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "selected_prompt_asset_id": {
+      "type": "string",
+      "description": "Selected public prompt asset identifier.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "variables": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "task_context",
+              "current_goal",
+              "constraint",
+              "evidence_summary",
+              "next_step"
+            ],
+            "description": "Closed variable name."
+          },
+          "value": {
+            "type": "string",
+            "description": "Redacted variable value.",
+            "maxLength": 2000
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "description": "Closed structured prompt variable."
+      },
+      "minItems": 0,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "description": "Closed structured prompt variables."
+    },
+    "diagnosed_gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "missing_evidence",
+              "ambiguous_goal",
+              "failed_acceptance",
+              "stalled_progress",
+              "risk_blocker"
+            ],
+            "description": "Gap class."
+          },
+          "description": {
+            "type": "string",
+            "description": "Redacted gap description.",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        },
+        "required": [
+          "kind",
+          "description"
+        ],
+        "description": "Closed diagnosed gap."
+      },
+      "minItems": 0,
+      "maxItems": 16,
+      "description": "Closed diagnosed gaps."
+    },
+    "recovery_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "turns": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "Turn count."
+        },
+        "tool_calls": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "Tool-call count."
+        },
+        "tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000,
+          "description": "Token count."
+        },
+        "elapsed_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 31536000,
+          "description": "Elapsed seconds."
+        },
+        "cost": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1000000000,
+          "description": "Public cost units."
+        }
+      },
+      "required": [
+        "turns",
+        "tool_calls",
+        "tokens",
+        "elapsed_seconds",
+        "cost"
+      ],
+      "description": "Complete instruction recovery budget."
+    },
+    "allowed_tools": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "read_only",
+          "analysis",
+          "validation"
+        ]
+      },
+      "minItems": 0,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "description": "Closed advisory tool categories."
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "credential_access",
+          "authority_grant",
+          "network_publish",
+          "non_idempotent_repeat"
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "description": "Closed forbidden actions."
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Public evidence reference.",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+      },
+      "minItems": 0,
+      "maxItems": 1000,
+      "uniqueItems": true,
+      "description": "Public evidence references."
+    },
+    "expected_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "diagnosis",
+            "plan",
+            "evidence_summary",
+            "handoff"
+          ],
+          "description": "Expected output kind."
+        },
+        "required_sections": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "summary",
+              "evidence",
+              "constraints",
+              "next_steps",
+              "stop_conditions"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "description": "Required output sections."
+        },
+        "max_characters": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000,
+          "description": "Output bound."
+        }
+      },
+      "required": [
+        "kind",
+        "required_sections",
+        "max_characters"
+      ],
+      "description": "Closed expected output contract."
+    },
+    "cooling_conditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "minimum_elapsed_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 31536000,
+          "description": "Required cooling time."
+        },
+        "require_new_evidence": {
+          "type": "boolean",
+          "description": "Whether new evidence is required."
+        },
+        "minimum_acceptance_gain": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Required acceptance gain."
+        }
+      },
+      "required": [
+        "minimum_elapsed_seconds",
+        "require_new_evidence",
+        "minimum_acceptance_gain"
+      ],
+      "description": "Closed instruction cooling conditions."
+    },
+    "stop_conditions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "budget_exhausted",
+          "host_denial",
+          "risk_detected",
+          "acceptance_met",
+          "cooling_required"
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "description": "Closed stop conditions."
+    },
+    "advisory_only": {
+      "const": true,
+      "description": "Instruction is advisory only."
+    },
+    "grants_authority": {
+      "const": false,
+      "description": "Instruction grants no credentials or authority."
+    }
+  },
+  "required": [
+    "contract_version",
+    "run_id",
+    "instruction_id",
+    "selected_prompt_asset_id",
+    "variables",
+    "diagnosed_gaps",
+    "recovery_budget",
+    "allowed_tools",
+    "forbidden_actions",
+    "evidence_refs",
+    "expected_output",
+    "cooling_conditions",
+    "stop_conditions",
+    "advisory_only",
+    "grants_authority"
+  ]
+}

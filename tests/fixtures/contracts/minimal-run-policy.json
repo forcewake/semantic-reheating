@@ -1,0 +1,75 @@
+{
+  "contract_version": "1.0",
+  "policy_id": "policy-standard",
+  "detectors": {
+    "windows": {
+      "repetition_events": 3,
+      "no_progress_events": 3
+    },
+    "thresholds": {
+      "repetition_score": 0.7,
+      "no_progress_score": 0.7,
+      "risk_score": 0.8,
+      "budget_score": 0.9
+    },
+    "weights": {
+      "repetition": 0.4,
+      "no_progress": 0.4,
+      "risk": 0.1,
+      "budget": 0.1
+    },
+    "semantic_detector": {
+      "enabled": false,
+      "metered": false,
+      "weight": 0,
+      "required": false,
+      "can_relax_hard_stops": false
+    }
+  },
+  "agreeing_signals": {
+    "required_classes": [
+      "repetition",
+      "no_progress"
+    ],
+    "minimum_count": 2,
+    "budget_can_substitute": false
+  },
+  "recovery_ladder": [
+    {
+      "stage": "nudge",
+      "permitted": true,
+      "requires_host_action": false
+    }
+  ],
+  "budgets": {
+    "per_intervention": {
+      "turns": 1,
+      "tool_calls": 1,
+      "tokens": 100,
+      "elapsed_seconds": 60,
+      "cost": 1
+    },
+    "whole_run": {
+      "turns": 5,
+      "tool_calls": 5,
+      "tokens": 500,
+      "elapsed_seconds": 300,
+      "cost": 5
+    }
+  },
+  "max_recovery_episodes": 2,
+  "max_reentry_depth": 1,
+  "side_effect_rules": {
+    "automatic_repeat_allowed_effect_classes": [
+      "read_only",
+      "idempotent_write"
+    ],
+    "automatic_unconfirmed_non_idempotent_repeat": false,
+    "unknown_treated_as_repeatable": false
+  },
+  "cooling_conditions": {
+    "minimum_elapsed_seconds": 30,
+    "require_new_evidence": true,
+    "minimum_acceptance_gain": 0.1
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "contract_version": "1.0",
+  "run_id": "run-example",
+  "evidence_id": "evidence-record-001",
+  "trigger": {
+    "finding_ids": [
+      "finding-001"
+    ],
+    "reason_code": "signals_agree"
+  },
+  "chosen_policy": "policy-standard",
+  "actual_counters": {
+    "turns": 1,
+    "tool_calls": 1,
+    "tokens": 100,
+    "elapsed_seconds": 60,
+    "cost": 1
+  },
+  "new_evidence_refs": [
+    "evidence-002"
+  ],
+  "acceptance_delta": {
+    "status": "improved",
+    "summary": "Redacted improvement."
+  },
+  "repeated_side_effects_avoided": true,
+  "final_status": "recovered"
+}
