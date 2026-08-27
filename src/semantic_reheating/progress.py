@@ -35,9 +35,9 @@ keys never establish progress.
   establishes progress.
 * ``poll_id`` (nonempty string), ``poll_value``, and ``poll_target`` (exact
   finite ``int`` or ``float``, never ``bool``) are read only from
-  ``state_observation`` object payloads. The first value per poll/target is a
-  baseline; a later same-target event with a strictly smaller exact rational
-  distance establishes convergence.
+  ``state_observation`` object payloads. The first value per exact poll/target
+  pair is a baseline; a later event for that pair with a strictly smaller exact
+  rational distance establishes convergence.
 """
 
 from __future__ import annotations
@@ -223,7 +223,7 @@ def classify_progress(trace: Any) -> ProgressAssessment:
     has_prior_event = False
     last_state_fingerprint: str | None = None
     pending_state_expectations: list[tuple[str, int]] = []
-    poll_baselines: dict[str, tuple[Fraction, Fraction]] = {}
+    poll_baselines: dict[tuple[str, Fraction], Fraction] = {}
     reasons: list[ProgressReason] = []
     event_ids: list[str] = []
     for event in events:
@@ -322,16 +322,16 @@ def classify_progress(trace: Any) -> ProgressAssessment:
             distance = _poll_distance(payload.get("poll_value"), target)
             target_number = _poll_number(target)
             if type(poll_id) is str and poll_id and distance is not None and target_number is not None:
-                poll_baseline = poll_baselines.get(poll_id)
+                poll_key = (poll_id, target_number)
+                poll_baseline = poll_baselines.get(poll_key)
                 if (
                     poll_baseline is not None
-                    and poll_baseline[0] == target_number
-                    and distance < poll_baseline[1]
+                    and distance < poll_baseline
                     and ProgressReason.POLL_CONVERGING not in reasons
                 ):
                     reasons.append(ProgressReason.POLL_CONVERGING)
                     event_ids.append(event.event_id)
-                poll_baselines[poll_id] = (target_number, distance)
+                poll_baselines[poll_key] = distance
         if event.kind is TraceKind.TOOL_CALL:
             hypothesis_id = payload.get("hypothesis_id")
             if type(hypothesis_id) is str and hypothesis_id and "hypothesis_test_input" in payload:

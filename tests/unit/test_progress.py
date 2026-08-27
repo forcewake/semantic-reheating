@@ -413,6 +413,52 @@ def test_poll_convergence_requires_a_same_target_distance_decrease_per_poll() ->
     assert assessment.supporting_event_ids == ("event-006",)
 
 
+def test_poll_baselines_are_isolated_by_exact_poll_id_and_target() -> None:
+    from semantic_reheating.progress import ProgressReason, classify_progress
+
+    interleaved = classify_progress(
+        (
+            _event(1, kind="state_observation", payload={"poll_id": "p", "poll_value": 10, "poll_target": 0}),
+            _event(2, kind="state_observation", payload={"poll_id": "p", "poll_value": 100, "poll_target": 100}),
+            _event(3, kind="state_observation", payload={"poll_id": "p", "poll_value": 9, "poll_target": 0}),
+        )
+    )
+    independent_baselines = classify_progress(
+        (
+            _event(1, kind="state_observation", payload={"poll_id": "p", "poll_value": 10, "poll_target": 0}),
+            _event(2, kind="state_observation", payload={"poll_id": "p", "poll_value": 100, "poll_target": 100}),
+        )
+    )
+    original_target_uses_its_own_last_distance = classify_progress(
+        (
+            _event(1, kind="state_observation", payload={"poll_id": "p", "poll_value": 10, "poll_target": 0}),
+            _event(2, kind="state_observation", payload={"poll_id": "p", "poll_value": 100, "poll_target": 100}),
+            _event(3, kind="state_observation", payload={"poll_id": "p", "poll_value": 11, "poll_target": 0}),
+        )
+    )
+    second_target_uses_its_own_baseline = classify_progress(
+        (
+            _event(1, kind="state_observation", payload={"poll_id": "p", "poll_value": 10, "poll_target": 0}),
+            _event(2, kind="state_observation", payload={"poll_id": "p", "poll_value": 90, "poll_target": 100}),
+            _event(3, kind="state_observation", payload={"poll_id": "p", "poll_value": 95, "poll_target": 100}),
+        )
+    )
+    cross_target_only = classify_progress(
+        (
+            _event(1, kind="state_observation", payload={"poll_id": "p", "poll_value": 10, "poll_target": 0}),
+            _event(2, kind="state_observation", payload={"poll_id": "p", "poll_value": 99, "poll_target": 100}),
+        )
+    )
+
+    assert interleaved.reason_codes == (ProgressReason.POLL_CONVERGING,)
+    assert interleaved.supporting_event_ids == ("event-003",)
+    assert independent_baselines.made_progress is False
+    assert original_target_uses_its_own_last_distance.made_progress is False
+    assert second_target_uses_its_own_baseline.reason_codes == (ProgressReason.POLL_CONVERGING,)
+    assert second_target_uses_its_own_baseline.supporting_event_ids == ("event-003",)
+    assert cross_target_only.made_progress is False
+
+
 def test_poll_convergence_compares_unbounded_integer_distances_exactly() -> None:
     from semantic_reheating.progress import ProgressReason, classify_progress
 
