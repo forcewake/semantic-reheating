@@ -65,18 +65,22 @@ def test_wheel_packages_authoritative_schemas_and_validates_outside_checkout(
     with zipfile.ZipFile(wheel) as archive:
         from semantic_reheating.validation import PUBLIC_CONTRACT_SCHEMAS
 
-        packaged_schema_paths = {
+        schema_entries = [
             path
             for path in archive.namelist()
             if path.startswith("semantic_reheating/contracts/")
-        }
+        ]
+        packaged_schema_paths = set(schema_entries)
         expected_schema_paths = {
             f"semantic_reheating/contracts/v1/{Path(schema_path).name}"
             for schema_path in PUBLIC_CONTRACT_SCHEMAS.values()
-        }
+        } | {"semantic_reheating/contracts/v1/trace-event.schema.json"}
         assert packaged_schema_paths == expected_schema_paths
-        assert len(packaged_schema_paths) == 6
+        assert len(schema_entries) == 7
+        assert len(packaged_schema_paths) == 7
         for packaged_path in packaged_schema_paths:
+            info = archive.getinfo(packaged_path)
+            assert (info.external_attr >> 16) & 0o170000 != 0o120000
             authoritative_path = PROJECT_ROOT / "contracts" / "v1" / Path(packaged_path).name
             assert archive.read(packaged_path) == authoritative_path.read_bytes()
 
@@ -99,15 +103,39 @@ def test_wheel_packages_authoritative_schemas_and_validates_outside_checkout(
         kind: json.loads((PROJECT_ROOT / "tests" / "fixtures" / "contracts" / name).read_text())
         for kind, name in ARTIFACTS.items()
     }
+    model_fixtures = {
+        "trace_event": json.loads(
+            (PROJECT_ROOT / "tests" / "fixtures" / "contracts" / "minimal-trace-event.json").read_text()
+        ),
+        "run_policy": json.loads(
+            (PROJECT_ROOT / "tests" / "fixtures" / "contracts" / "minimal-run-policy.json").read_text()
+        ),
+        "decision_envelope": json.loads(
+            (PROJECT_ROOT / "tests" / "fixtures" / "contracts" / "minimal-decision-envelope.json").read_text()
+        ),
+    }
     script = """
 import json
 import os
 import semantic_reheating.validation as validation
+import semantic_reheating.models as models_module
+from semantic_reheating.models import DecisionEnvelope, RunPolicy, TraceEvent
 assert str(validation.__file__).startswith(os.environ["TARGET"]), validation.__file__
+assert str(models_module.__file__).startswith(os.environ["TARGET"]), models_module.__file__
 for kind, value in json.loads(os.environ["FIXTURES"]).items():
     validation.validate_public_artifact(kind, value)
+models = json.loads(os.environ["MODELS"])
+assert TraceEvent.from_dict(models["trace_event"]).to_dict() == models["trace_event"]
+assert RunPolicy.from_dict(models["run_policy"]).to_dict() == models["run_policy"]
+assert DecisionEnvelope.from_dict(models["decision_envelope"]).to_dict() == models["decision_envelope"]
 """
-    environment = {**os.environ, "PYTHONPATH": str(target), "TARGET": str(target), "FIXTURES": json.dumps(fixtures)}
+    environment = {
+        **os.environ,
+        "PYTHONPATH": str(target),
+        "TARGET": str(target),
+        "FIXTURES": json.dumps(fixtures),
+        "MODELS": json.dumps(model_fixtures),
+    }
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=tmp_path,

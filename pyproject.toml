@@ -46,6 +46,7 @@ packages = ["src/semantic_reheating"]
 "contracts/v1/recovery-instruction.schema.json" = "semantic_reheating/contracts/v1/recovery-instruction.schema.json"
 "contracts/v1/recovery-outcome.schema.json" = "semantic_reheating/contracts/v1/recovery-outcome.schema.json"
 "contracts/v1/evidence-record.schema.json" = "semantic_reheating/contracts/v1/evidence-record.schema.json"
+"contracts/v1/trace-event.schema.json" = "semantic_reheating/contracts/v1/trace-event.schema.json"
 
 [[tool.mypy.overrides]]
 module = ["jsonschema", "jsonschema.*"]
