@@ -291,6 +291,7 @@ ADVERSARIAL_ARTIFACTS = (
 PathSegment = str | int
 RequiredCase = tuple[str, tuple[PathSegment, ...], str]
 ValueCase = tuple[str, tuple[PathSegment, ...]]
+ClosedObjectCase = tuple[str, tuple[PathSegment, ...]]
 
 
 def _resolve_local_ref(schema: dict[str, Any], root_schema: dict[str, Any]) -> dict[str, Any]:
@@ -387,6 +388,44 @@ def _item_parts(
     return parts
 
 
+def _is_closed_object_part(part: dict[str, Any]) -> bool:
+    """Return whether one effective schema part closes an object boundary."""
+    schema_type = part.get("type")
+    is_object = schema_type == "object" or (
+        isinstance(schema_type, list) and "object" in schema_type
+    )
+    return (
+        is_object
+        and isinstance(part.get("properties"), dict)
+        and part.get("additionalProperties") is False
+    )
+
+
+def _walk_populated_closed_objects(
+    instance: Any,
+    parts: list[dict[str, Any]],
+    root_schema: dict[str, Any],
+    path: tuple[PathSegment, ...] = (),
+) -> Iterator[tuple[PathSegment, ...]]:
+    """Yield every populated object boundary closed by its effective schema."""
+    if isinstance(instance, dict):
+        if any(_is_closed_object_part(part) for part in parts):
+            yield path
+        for field, value in instance.items():
+            child_parts = _property_parts(parts, field, value, root_schema)
+            if child_parts:
+                yield from _walk_populated_closed_objects(
+                    value, child_parts, root_schema, (*path, field)
+                )
+    elif isinstance(instance, list):
+        for index, value in enumerate(instance):
+            child_parts = _item_parts(parts, value, root_schema)
+            if child_parts:
+                yield from _walk_populated_closed_objects(
+                    value, child_parts, root_schema, (*path, index)
+                )
+
+
 def _walk_populated_invariants(
     instance: Any,
     parts: list[dict[str, Any]],
@@ -451,6 +490,21 @@ def _matrix_cases() -> tuple[list[RequiredCase], list[ValueCase], list[ValueCase
     return required, enums, consts
 
 
+def _closed_object_matrix_cases() -> list[ClosedObjectCase]:
+    """Collect all populated object paths whose effective schema is closed."""
+    cases: list[ClosedObjectCase] = []
+    for kind, schema_name, fixture_name in ADVERSARIAL_ARTIFACTS:
+        schema = json.loads((PROJECT_ROOT / schema_name).read_text())
+        data = fixture(fixture_name)
+        cases.extend(
+            (kind, path)
+            for path in _walk_populated_closed_objects(
+                data, _effective_parts(schema, data, schema), schema
+            )
+        )
+    return cases
+
+
 def _require_matrix_floor(name: str, cases: list[Any], minimum: int) -> None:
     if not cases:
         raise RuntimeError(f"{name} matrix collected zero cases")
@@ -461,9 +515,47 @@ def _require_matrix_floor(name: str, cases: list[Any], minimum: int) -> None:
 
 
 REQUIRED_MATRIX_CASES, ENUM_MATRIX_CASES, CONST_MATRIX_CASES = _matrix_cases()
+CLOSED_OBJECT_MATRIX_CASES = _closed_object_matrix_cases()
 _require_matrix_floor("required", REQUIRED_MATRIX_CASES, 186)
 _require_matrix_floor("enum", ENUM_MATRIX_CASES, 27)
 _require_matrix_floor("const", CONST_MATRIX_CASES, 13)
+
+# This is an independently inventoried current baseline: 19 RunPolicy, 2
+# DetectorFinding, 6 DecisionEnvelope, 6 RecoveryInstruction, 6
+# RecoveryOutcome, and 4 EvidenceRecord object boundaries.
+CLOSED_OBJECT_MATRIX_EXPECTED_COUNT = 43
+CLOSED_OBJECT_MATRIX_NAMED_PATHS: frozenset[ClosedObjectCase] = frozenset(
+    {
+        ("run_policy", ("detectors",)),
+        ("run_policy", ("detectors", "windows")),
+        ("run_policy", ("detectors", "thresholds")),
+        ("run_policy", ("detectors", "weights")),
+        ("run_policy", ("detectors", "semantic_detector")),
+        ("run_policy", ("agreeing_signals",)),
+        ("run_policy", ("recovery_ladder",)),
+        *(("run_policy", ("recovery_ladder", stage)) for stage in (
+            "nudge",
+            "diagnose",
+            "reheat",
+            "restart",
+            "escalate",
+            "stop",
+        )),
+        ("run_policy", ("budgets",)),
+        ("run_policy", ("budgets", "per_intervention")),
+        ("run_policy", ("budgets", "whole_run")),
+        ("run_policy", ("side_effect_rules",)),
+        ("run_policy", ("cooling_conditions",)),
+        ("recovery_instruction", ("variables", 0)),
+        ("recovery_instruction", ("diagnosed_gaps", 0)),
+        ("recovery_instruction", ("recovery_budget",)),
+        ("recovery_instruction", ("expected_output",)),
+        ("recovery_instruction", ("cooling_conditions",)),
+        ("evidence_record", ("actual_counters",)),
+        ("evidence_record", ("acceptance_delta",)),
+        ("evidence_record", ("trigger",)),
+    }
+)
 
 
 def _format_path(path: tuple[PathSegment, ...]) -> str:
@@ -552,6 +644,51 @@ def _required_case_id(case: RequiredCase) -> str:
 def _value_case_id(case: ValueCase, keyword: str) -> str:
     kind, path = case
     return f"{kind}:{_format_path(path)}:{keyword}"
+
+
+def _closed_object_case_id(case: ClosedObjectCase) -> str:
+    kind, path = case
+    return f"{kind}:{_format_path(path)}:unexpected-private-field"
+
+
+def test_closed_object_unknown_field_matrix_has_exact_unique_named_coverage() -> None:
+    collected = set(CLOSED_OBJECT_MATRIX_CASES)
+    assert CLOSED_OBJECT_MATRIX_EXPECTED_COUNT >= 38
+    assert len(CLOSED_OBJECT_MATRIX_CASES) == len(collected), (
+        "closed-object matrix contains duplicate artifact/path cases"
+    )
+    assert len(CLOSED_OBJECT_MATRIX_CASES) == CLOSED_OBJECT_MATRIX_EXPECTED_COUNT
+    assert CLOSED_OBJECT_MATRIX_NAMED_PATHS <= collected, (
+        "closed-object matrix omitted named paths: "
+        f"{sorted(CLOSED_OBJECT_MATRIX_NAMED_PATHS - collected)!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "case", CLOSED_OBJECT_MATRIX_CASES, ids=_closed_object_case_id
+)
+def test_every_populated_closed_contract_object_rejects_unknown_field(
+    case: ClosedObjectCase,
+) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    kind, path = case
+    fixture_name = next(
+        fixture_name
+        for artifact_kind, _, fixture_name in ADVERSARIAL_ARTIFACTS
+        if artifact_kind == kind
+    )
+    invalid = deepcopy(fixture(fixture_name))
+    target = _at_path(invalid, path)
+    assert type(target) is dict
+    assert "unexpected_private_field" not in target
+    target["unexpected_private_field"] = True
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact(kind, invalid)
+    assert caught.value.code == "schema_validation_error"
 
 
 @pytest.mark.parametrize("case", REQUIRED_MATRIX_CASES, ids=_required_case_id)
