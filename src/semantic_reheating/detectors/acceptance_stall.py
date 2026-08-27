@@ -74,6 +74,10 @@ def detect_acceptance_stall(trace: Any, policy: Any) -> dict[str, Any]:
                 True,
                 finding_class="no_progress",
             )
+        # Documented progress ends the global no-progress episode. This
+        # deliberately drops potentially later baselines conservatively: they
+        # may precede the supporting progress, and a new repeat starts anew.
+        baselines.clear()
         baselines[identity] = (delta, position, event.event_id)
     return _finding(
         "acceptance_stall",

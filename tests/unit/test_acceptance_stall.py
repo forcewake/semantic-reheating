@@ -351,6 +351,83 @@ def test_documented_progress_between_identical_checks_suppresses_the_candidate(
     assert detect_acceptance_stall(trace, _policy())["matched"] is False
 
 
+def test_progress_resets_all_acceptance_baselines_before_new_episode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import semantic_reheating.detectors.acceptance_stall as stall_module
+    from semantic_reheating.detectors import detect_acceptance_stall
+
+    classified_lengths: list[int] = []
+    real_classify_progress = stall_module.classify_progress
+
+    def counting_classify_progress(trace: tuple[Any, ...]) -> Any:
+        classified_lengths.append(len(trace))
+        return real_classify_progress(trace)
+
+    monkeypatch.setattr(stall_module, "classify_progress", counting_classify_progress)
+    trace = (
+        _event(4, kind="acceptance_check", payload={"check": "a"}, acceptance_delta=""),
+        _event(5, kind="acceptance_check", payload={"check": "b"}, acceptance_delta=""),
+        _event(6, kind="tool_result", evidence_refs=["evidence://new"]),
+        _event(7, kind="acceptance_check", payload={"check": "a"}, acceptance_delta=""),
+        _event(8, kind="acceptance_check", payload={"check": "b"}, acceptance_delta=""),
+        _event(9, kind="acceptance_check", payload={"check": "b"}, acceptance_delta=""),
+    )
+
+    finding = detect_acceptance_stall(trace, _policy(window=len(trace)))
+
+    assert finding["matched"] is True
+    assert finding["event_ids"] == ["event-008", "event-009"]
+    assert classified_lengths == [4, 2]
+
+
+def test_many_identities_after_one_progress_event_are_classified_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import semantic_reheating.detectors.acceptance_stall as stall_module
+    from semantic_reheating.detectors import detect_acceptance_stall
+
+    identity_count = 100
+    classified_lengths: list[int] = []
+    real_classify_progress = stall_module.classify_progress
+
+    def counting_classify_progress(trace: tuple[Any, ...]) -> Any:
+        classified_lengths.append(len(trace))
+        return real_classify_progress(trace)
+
+    monkeypatch.setattr(stall_module, "classify_progress", counting_classify_progress)
+    baselines = tuple(
+        _event(
+            sequence,
+            kind="acceptance_check",
+            payload={"check": f"check-{sequence}"},
+            acceptance_delta="",
+        )
+        for sequence in range(1, identity_count + 1)
+    )
+    progress = _event(
+        identity_count + 1,
+        kind="tool_result",
+        evidence_refs=["evidence://new"],
+    )
+    repeats = tuple(
+        _event(
+            sequence,
+            kind="acceptance_check",
+            payload={"check": f"check-{sequence - identity_count - 1}"},
+            acceptance_delta="",
+        )
+        for sequence in range(identity_count + 2, 2 * identity_count + 2)
+    )
+    trace = (*baselines, progress, *repeats)
+
+    finding = detect_acceptance_stall(trace, _policy(window=len(trace)))
+
+    assert finding["matched"] is False
+    assert classified_lengths == [identity_count + 2]
+    assert sum(classified_lengths) <= len(trace)
+
+
 def test_declared_payload_digest_is_comparable_but_window_cut_is_not() -> None:
     from semantic_reheating.detectors import detect_acceptance_stall
 
