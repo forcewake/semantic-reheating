@@ -79,36 +79,79 @@ def test_run_policy_model_preserves_ordinary_validation_codes_without_exception_
     assert caught.value.__context__ is None
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [
+_NAMED_STRUCTURAL_SAFETY_MUTATIONS = (
+    (
+        "missing_whole_run",
         lambda source: source["budgets"].pop("whole_run"),
-        *(
-            lambda source, scope=scope, dimension=dimension: source["budgets"][scope].pop(dimension)
-            for scope in ("per_intervention", "whole_run")
-            for dimension in ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost")
-        ),
+    ),
+    *(
+        (
+            f"missing_{scope}_{dimension}",
+            lambda source, scope=scope, dimension=dimension: source["budgets"][scope].pop(dimension),
+        )
+        for scope in ("per_intervention", "whole_run")
+        for dimension in ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost")
+    ),
+    (
+        "automatic_non_idempotent_repeat",
         lambda source: source["side_effect_rules"].__setitem__(
             "automatic_unconfirmed_non_idempotent_repeat", True
         ),
-    ],
-    ids=(
-        "missing_whole_run",
-        "missing_per_turns",
-        "missing_per_tool_calls",
-        "missing_per_tokens",
-        "missing_per_elapsed_seconds",
-        "missing_per_cost",
-        "missing_whole_turns",
-        "missing_whole_tool_calls",
-        "missing_whole_tokens",
-        "missing_whole_elapsed_seconds",
-        "missing_whole_cost",
-        "automatic_non_idempotent_repeat",
+    ),
+    (
+        "unknown_treated_as_repeatable",
+        lambda source: source["side_effect_rules"].__setitem__(
+            "unknown_treated_as_repeatable", True
+        ),
+    ),
+    (
+        "restart_without_host_action",
+        lambda source: source["recovery_ladder"]["restart"].__setitem__(
+            "requires_host_action", False
+        ),
+    ),
+    (
+        "stop_not_permitted",
+        lambda source: source["recovery_ladder"]["stop"].__setitem__("permitted", False),
+    ),
+    (
+        "escalate_not_permitted",
+        lambda source: source["recovery_ladder"]["escalate"].__setitem__("permitted", False),
+    ),
+    (
+        "escalate_without_host_action",
+        lambda source: source["recovery_ladder"]["escalate"].__setitem__(
+            "requires_host_action", False
+        ),
+    ),
+    (
+        "semantic_detector_relaxes_hard_stops",
+        lambda source: source["detectors"]["semantic_detector"].__setitem__(
+            "can_relax_hard_stops", True
+        ),
     ),
 )
-def test_structurally_unsafe_policies_are_schema_rejected_and_sanitized_by_safety_seam(
-    mutation: Any,
+
+
+def _encoded_policy(source: dict[str, Any], representation: str) -> Any:
+    if representation == "dict":
+        return deepcopy(source)
+    encoded = json.dumps(source, separators=(",", ":"))
+    if representation == "str":
+        return encoded
+    if representation == "bytes":
+        return encoded.encode("utf-8")
+    if representation == "bytearray":
+        return bytearray(encoded, "utf-8")
+    raise AssertionError("unknown test representation")
+
+
+@pytest.mark.parametrize(
+    ("mutation_id", "mutation"), _NAMED_STRUCTURAL_SAFETY_MUTATIONS
+)
+@pytest.mark.parametrize("representation", ("dict", "str", "bytes", "bytearray"))
+def test_named_structurally_unsafe_policies_are_schema_rejected_and_sanitized_by_safety_seam(
+    mutation_id: str, mutation: Any, representation: str
 ) -> None:
     from semantic_reheating.models import ModelValidationError, RunPolicy
     from semantic_reheating.validation import (
@@ -120,25 +163,32 @@ def test_structurally_unsafe_policies_are_schema_rejected_and_sanitized_by_safet
     source = _policy()
     mutation(source)
 
+    encoded = _encoded_policy(source, representation)
+
     with pytest.raises(ContractValidationError) as schema_error:
-        validate_public_artifact("run_policy", deepcopy(source))
+        validate_public_artifact("run_policy", encoded)
     assert schema_error.value.code == "schema_validation_error"  # immediate-pass schema proof
     with pytest.raises(ContractValidationError) as safety_error:
-        validate_run_policy(source)
+        validate_run_policy(encoded)
     assert safety_error.value.code == "unsafe_policy"
+    assert safety_error.value.args == ("Unsafe run policy",)
+    assert safety_error.value.__cause__ is None
+    assert safety_error.value.__context__ is None
     with pytest.raises(ModelValidationError) as model_error:
-        RunPolicy.from_dict(source)
+        RunPolicy.from_dict(encoded)
     assert model_error.value.code == "unsafe_policy"
+    assert model_error.value.args == ("Invalid model input",)
     assert model_error.value.__cause__ is None
     assert model_error.value.__context__ is None
 
-    forged = object.__new__(RunPolicy)
-    object.__setattr__(forged, "_source", _freeze_json(source))
-    with pytest.raises(ModelValidationError) as forged_error:
-        forged.to_dict()
-    assert forged_error.value.code == "unsafe_policy"
-    assert forged_error.value.__cause__ is None
-    assert forged_error.value.__context__ is None
+    if representation == "dict":
+        forged = object.__new__(RunPolicy)
+        object.__setattr__(forged, "_source", _freeze_json(source))
+        with pytest.raises(ModelValidationError) as forged_error:
+            forged.to_dict()
+        assert forged_error.value.code == "unsafe_policy"
+        assert forged_error.value.__cause__ is None
+        assert forged_error.value.__context__ is None
 
 
 @pytest.mark.parametrize("dimension", ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost"))
@@ -169,40 +219,48 @@ def test_equal_mixed_numeric_budget_caps_are_safe() -> None:
 
 
 @pytest.mark.parametrize(
-    ("path", "value", "schema_rejects"),
+    ("source", "expected_code", "secret"),
     [
-        (("recovery_ladder", "restart", "requires_host_action"), False, True),
-        (("recovery_ladder", "stop", "permitted"), False, True),
-        (("recovery_ladder", "escalate", "permitted"), False, True),
-        (("recovery_ladder", "escalate", "requires_host_action"), False, True),
-        (("side_effect_rules", "unknown_treated_as_repeatable"), True, True),
-        (("detectors", "semantic_detector", "can_relax_hard_stops"), True, True),
+        ('{"__malformed-policy-secret__":', "invalid_json", "__malformed-policy-secret__"),
+        (
+            '{"__duplicate-policy-secret__":1,"__duplicate-policy-secret__":2}',
+            "duplicate_key",
+            "__duplicate-policy-secret__",
+        ),
+        (b'{"__invalid-utf8-policy-secret__":"\xff"}', "invalid_json_encoding", "__invalid-utf8-policy-secret__"),
+        (bytearray(b'{"__invalid-utf8-bytearray-secret__":"\xff"}'), "invalid_json_encoding", "__invalid-utf8-bytearray-secret__"),
+        ('{"__nonfinite-policy-secret__":NaN}', "invalid_json_number", "__nonfinite-policy-secret__"),
+        (
+            json.dumps({**_policy(), "contract_version": "2.0-__unknown-major-policy-secret__"}),
+            "unknown_contract_major",
+            "__unknown-major-policy-secret__",
+        ),
     ],
 )
-def test_authority_and_hard_stop_invariants_fail_closed(
-    path: tuple[str, ...], value: Any, schema_rejects: bool
+def test_encoded_run_policy_parse_failures_preserve_codes_and_sanitize_exception_graphs(
+    source: str | bytes | bytearray, expected_code: str, secret: str
 ) -> None:
+    from semantic_reheating.models import ModelValidationError, RunPolicy
     from semantic_reheating.validation import (
         ContractValidationError,
-        validate_public_artifact,
         validate_run_policy,
     )
 
-    source = _policy()
-    target: dict[str, Any] = source
-    for segment in path[:-1]:
-        target = target[segment]
-    target[path[-1]] = value
-
-    if schema_rejects:
-        with pytest.raises(ContractValidationError) as schema_error:
-            validate_public_artifact("run_policy", deepcopy(source))
-        assert schema_error.value.code == "schema_validation_error"  # immediate-pass schema proof
-    else:
-        assert validate_public_artifact("run_policy", deepcopy(source)) == source
-    with pytest.raises(ContractValidationError) as caught:
+    with pytest.raises(ContractValidationError) as safety_error:
         validate_run_policy(source)
-    assert caught.value.code == "unsafe_policy"
+    assert safety_error.value.code == expected_code
+    assert safety_error.value.args == ("Invalid run policy",)
+    assert safety_error.value.__cause__ is None
+    assert safety_error.value.__context__ is None
+    assert secret not in str(safety_error.value)
+
+    with pytest.raises(ModelValidationError) as model_error:
+        RunPolicy.from_dict(source)
+    assert model_error.value.code == expected_code
+    assert model_error.value.args == ("Invalid model input",)
+    assert model_error.value.__cause__ is None
+    assert model_error.value.__context__ is None
+    assert secret not in str(model_error.value)
 
 
 @pytest.mark.parametrize(

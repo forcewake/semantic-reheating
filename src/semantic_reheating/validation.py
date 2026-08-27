@@ -360,10 +360,22 @@ def _run_policy_is_safe(policy: dict[str, Any]) -> bool:
 
 def validate_run_policy(data: Any) -> dict[str, Any]:
     """Fail closed for a complete run policy and its semantic safety rules."""
-    named_safety_failure = _has_named_structural_safety_failure(data)
+    normalized = data
+    normalization_failure_code: str | None = None
+    if type(data) in (str, bytes, bytearray):
+        try:
+            normalized = load_public_json(data)
+        except ContractValidationError as error:
+            normalization_failure_code = error.code
+    if normalization_failure_code is not None:
+        raise ContractValidationError(
+            normalization_failure_code, "Invalid run policy"
+        ) from None
+
+    named_safety_failure = _has_named_structural_safety_failure(normalized)
     failure_code: str | None = None
     try:
-        value = validate_public_artifact("run_policy", data)
+        value = validate_public_artifact("run_policy", normalized)
     except ContractValidationError as error:
         failure_code = error.code
         value = None
