@@ -432,3 +432,425 @@ def test_selection_validation_work_is_linear(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(policies, "validate_public_artifact", counted)
     _selected(findings)
     assert calls <= len(findings) + 1
+
+
+def test_construct_recovery_instruction_returns_none_except_for_reheat() -> None:
+    from semantic_reheating.diagnosis import (
+        CauseClass,
+        Diagnosis,
+        UncertaintyDisposition,
+        UncertaintyItem,
+    )
+    from semantic_reheating.models import Decision
+    from semantic_reheating.policies import (
+        PolicySelection,
+        construct_recovery_instruction,
+    )
+
+    diagnosis = Diagnosis(
+        "run-policy",
+        (CauseClass.MISSING_KNOWLEDGE,),
+        (
+            UncertaintyItem(
+                "uncertainty-missing_knowledge",
+                CauseClass.MISSING_KNOWLEDGE,
+                UncertaintyDisposition.VERIFY,
+                False,
+            ),
+        ),
+        ("diagnosis-1",),
+    )
+    for decision in (
+        Decision.CONTINUE,
+        Decision.NUDGE,
+        Decision.DIAGNOSE,
+        Decision.RESTART,
+        Decision.ESCALATE,
+        Decision.STOP,
+    ):
+        selection = PolicySelection(
+            decision, None, (), (), decision is not Decision.CONTINUE
+        )
+        assert construct_recovery_instruction(selection, diagnosis, _policy()) is None
+
+
+def test_construct_recovery_instruction_builds_exact_valid_reheat_contract() -> None:
+    from hashlib import sha256
+
+    from semantic_reheating.canonical import canonicalize_json
+    from semantic_reheating.policies import construct_recovery_instruction
+    from semantic_reheating.validation import validate_public_artifact
+
+    diagnosis = _diagnosis("missing_knowledge", "incorrect_plan", "runtime_defect")
+    selection = _selected(
+        [
+            _finding("rep", finding_class="repetition"),
+            _finding("progress", finding_class="no_progress"),
+        ],
+        _policy(nudge=True, diagnose=True),
+    )
+
+    instruction = construct_recovery_instruction(
+        selection, diagnosis, _policy(nudge=True, diagnose=True)
+    )
+
+    assert instruction is not None
+    assert validate_public_artifact("recovery_instruction", instruction) == instruction
+    basis = {
+        key: value for key, value in instruction.items() if key != "instruction_id"
+    }
+    assert (
+        instruction["instruction_id"]
+        == "instruction-" + sha256(canonicalize_json(basis)).hexdigest()[:24]
+    )
+    assert instruction == {
+        **basis,
+        "instruction_id": instruction["instruction_id"],
+    }
+    assert instruction["run_id"] == diagnosis.run_id
+    assert instruction["selected_prompt_asset_id"] == "prompt-reheat-v1"
+    assert instruction["variables"] == [
+        {
+            "name": "constraint",
+            "value": (
+                "Produce exactly three mutually exclusive, falsifiable hypotheses "
+                "and one discriminating read-only test per hypothesis."
+            ),
+        },
+        {
+            "name": "evidence_summary",
+            "value": "Preserve the referenced public evidence identifiers.",
+        },
+        {
+            "name": "next_step",
+            "value": (
+                "Return advisory structured output to the host runtime without "
+                "executing tools."
+            ),
+        },
+    ]
+    assert instruction["allowed_tools"] == ["read_only", "analysis", "validation"]
+    assert instruction["forbidden_actions"] == [
+        "credential_access",
+        "authority_grant",
+        "network_publish",
+        "non_idempotent_repeat",
+    ]
+    assert instruction["evidence_refs"] == list(selection.evidence_event_ids)
+    assert instruction["expected_output"] == {
+        "kind": "plan",
+        "required_sections": [
+            "summary",
+            "evidence",
+            "constraints",
+            "next_steps",
+            "stop_conditions",
+        ],
+        "max_characters": 6000,
+        "hypothesis_contract": {
+            "exact_hypotheses": 3,
+            "mutually_exclusive": True,
+            "falsifiable": True,
+            "discriminating_tests_per_hypothesis": 1,
+            "allowed_test_effect_classes": ["read_only"],
+        },
+    }
+    assert instruction["advisory_only"] is True
+    assert instruction["grants_authority"] is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        {"exact_hypotheses": 2},
+        {"exact_hypotheses": 4},
+        {"discriminating_tests_per_hypothesis": 0},
+        {"discriminating_tests_per_hypothesis": 2},
+        {"allowed_test_effect_classes": ["non_idempotent_write"]},
+        {"unexpected": True},
+    ),
+)
+def test_reheat_hypothesis_contract_is_closed_and_fail_closed(
+    mutation: dict[str, object],
+) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    source = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "minimal-recovery-instruction.json"
+        ).read_text(encoding="utf-8")
+    )
+    source["expected_output"]["hypothesis_contract"] = {
+        "exact_hypotheses": 3,
+        "mutually_exclusive": True,
+        "falsifiable": True,
+        "discriminating_tests_per_hypothesis": 1,
+        "allowed_test_effect_classes": ["read_only"],
+    }
+    assert validate_public_artifact("recovery_instruction", source) == source
+    rejected = deepcopy(source)
+    rejected["expected_output"]["hypothesis_contract"].update(mutation)
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("recovery_instruction", rejected)
+    assert caught.value.code == "schema_validation_error"
+
+
+def test_reheat_prompt_requires_hypothesis_contract() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    source = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "contracts"
+            / "minimal-recovery-instruction.json"
+        ).read_text(encoding="utf-8")
+    )
+    source["expected_output"].pop("hypothesis_contract")
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("recovery_instruction", source)
+    assert caught.value.code == "schema_validation_error"
+
+
+@pytest.mark.parametrize(
+    ("causes", "expected_gaps"),
+    (
+        (
+            ("missing_knowledge",),
+            [("missing_evidence", "Required evidence is unavailable.")],
+        ),
+        (
+            ("ambiguous_completion",),
+            [("ambiguous_goal", "Completion criteria require clarification.")],
+        ),
+        (
+            ("incorrect_plan",),
+            [("failed_acceptance", "Acceptance criteria did not validate the plan.")],
+        ),
+        (
+            ("unsuitable_tool", "runtime_defect"),
+            [
+                (
+                    "stalled_progress",
+                    "Progress is stalled pending a safe reassessment.",
+                ),
+                (
+                    "stalled_progress",
+                    "Progress is stalled pending a safe reassessment.",
+                ),
+            ],
+        ),
+        (
+            ("missing_authority", "unsafe_side_effect", "exhausted_budget"),
+            [
+                (
+                    "risk_blocker",
+                    "Recovery is blocked by a safety or authority constraint.",
+                ),
+                (
+                    "risk_blocker",
+                    "Recovery is blocked by a safety or authority constraint.",
+                ),
+                (
+                    "risk_blocker",
+                    "Recovery is blocked by a safety or authority constraint.",
+                ),
+            ],
+        ),
+    ),
+)
+def test_construct_recovery_instruction_maps_causes_in_design_order_without_prose(
+    causes: tuple[str, ...], expected_gaps: list[tuple[str, str]]
+) -> None:
+    from semantic_reheating.models import Decision
+    from semantic_reheating.policies import (
+        PolicySelection,
+        RecoveryPolicy,
+        construct_recovery_instruction,
+    )
+
+    diagnosis = _diagnosis(*causes)
+    selection = PolicySelection(
+        Decision.REHEAT,
+        RecoveryPolicy.BRANCH,
+        ("signals_agree",),
+        diagnosis.evidence_event_ids,
+        False,
+    )
+    instruction = construct_recovery_instruction(
+        selection, diagnosis, _policy(nudge=True, diagnose=True)
+    )
+
+    assert instruction is not None
+    assert instruction["diagnosed_gaps"] == [
+        {"kind": kind, "description": description}
+        for kind, description in expected_gaps
+    ]
+    serialized = repr(instruction)
+    assert "diagnostic_cause" not in serialized
+    assert "hypotheses" not in instruction
+    assert "tool_calls" not in instruction
+
+
+def test_construct_recovery_instruction_is_deterministic_fresh_and_redacted() -> None:
+    from semantic_reheating.diagnosis import diagnose
+    from semantic_reheating.models import TraceEvent
+    from semantic_reheating.policies import construct_recovery_instruction
+
+    secret = "SECRET-MARKER-DO-NOT-COPY"
+    diagnosis = diagnose(
+        [
+            TraceEvent.from_dict(
+                {
+                    "contract_version": "1.0",
+                    "run_id": "run-policy",
+                    "event_id": "secret-evidence",
+                    "sequence": 1,
+                    "kind": "error",
+                    "actor": "controller",
+                    "effect_class": "read_only",
+                    "payload": {
+                        "diagnostic_cause": "missing_knowledge",
+                        "secret": secret,
+                    },
+                }
+            )
+        ],
+        [],
+    )
+    selection = _selected(
+        [
+            _finding("rep", finding_class="repetition"),
+            _finding("progress", finding_class="no_progress"),
+        ],
+        _policy(nudge=True, diagnose=True),
+    )
+    first = construct_recovery_instruction(
+        selection, diagnosis, _policy(nudge=True, diagnose=True)
+    )
+    second = construct_recovery_instruction(
+        selection, diagnosis, _policy(nudge=True, diagnose=True)
+    )
+
+    assert first == second
+    assert first is not second
+    assert first is not None and second is not None
+    first["expected_output"]["hypothesis_contract"]["exact_hypotheses"] = 99
+    assert second["expected_output"]["hypothesis_contract"]["exact_hypotheses"] == 3
+    assert secret not in repr(second)
+    assert secret not in repr(selection)
+    assert secret not in repr(diagnosis)
+
+
+def test_construct_recovery_instruction_fails_closed_and_preserves_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from semantic_reheating import policies
+    from semantic_reheating.models import Decision
+    from semantic_reheating.validation import validate_public_artifact
+
+    diagnosis = _diagnosis("missing_knowledge")
+    selection = _selected(
+        [
+            _finding("rep", finding_class="repetition"),
+            _finding("progress", finding_class="no_progress"),
+        ],
+        _policy(nudge=True, diagnose=True),
+    )
+    forged = object.__new__(policies.PolicySelection)
+    invalid_reheat = policies.PolicySelection(
+        Decision.REHEAT,
+        None,
+        ("signals_agree",),
+        (),
+        False,
+    )
+    for bad_selection, bad_diagnosis, bad_policy, code in (
+        (
+            forged,
+            diagnosis,
+            _policy(nudge=True, diagnose=True),
+            "invalid_policy_selection",
+        ),
+        (
+            invalid_reheat,
+            diagnosis,
+            _policy(nudge=True, diagnose=True),
+            "invalid_reheat_selection",
+        ),
+        (selection, object(), _policy(nudge=True, diagnose=True), "invalid_diagnosis"),
+        (selection, diagnosis, object(), "invalid_run_policy"),
+    ):
+        with pytest.raises(policies.PolicySelectionError) as caught:
+            policies.construct_recovery_instruction(
+                bad_selection, bad_diagnosis, bad_policy
+            )
+        assert caught.value.code == code
+        assert caught.value.args == ("Invalid policy selection input",)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+
+    def invalid_canonical(*args: object, **kwargs: object) -> bytes:
+        raise ValueError("SECRET-MARKER-DO-NOT-LEAK")
+
+    monkeypatch.setattr(policies, "canonicalize_json", invalid_canonical)
+    with pytest.raises(policies.PolicySelectionError) as canonical_error:
+        policies.construct_recovery_instruction(
+            selection, diagnosis, _policy(nudge=True, diagnose=True)
+        )
+    assert canonical_error.value.code == "invalid_recovery_instruction"
+    assert "SECRET-MARKER-DO-NOT-LEAK" not in repr(canonical_error.value)
+    assert canonical_error.value.__cause__ is None
+    assert canonical_error.value.__context__ is None
+
+    from semantic_reheating.canonical import canonicalize_json
+
+    monkeypatch.setattr(policies, "canonicalize_json", canonicalize_json)
+
+    def invalid_validator(*args: object, **kwargs: object) -> object:
+        raise ValueError("SECRET-MARKER-DO-NOT-LEAK")
+
+    monkeypatch.setattr(policies, "validate_public_artifact", invalid_validator)
+    with pytest.raises(policies.PolicySelectionError) as validator_error:
+        policies.construct_recovery_instruction(
+            selection, diagnosis, _policy(nudge=True, diagnose=True)
+        )
+    assert validator_error.value.code == "invalid_recovery_instruction"
+    assert "SECRET-MARKER-DO-NOT-LEAK" not in repr(validator_error.value)
+    assert validator_error.value.__cause__ is None
+    assert validator_error.value.__context__ is None
+
+    monkeypatch.setattr(policies, "validate_public_artifact", validate_public_artifact)
+
+    from semantic_reheating.diagnosis import Diagnosis
+    from semantic_reheating.policies import RecoveryPolicy
+
+    unsafe_run = Diagnosis("unsafe run id", (), (), ())
+    unsafe_selection = policies.PolicySelection(
+        Decision.REHEAT, RecoveryPolicy.BRANCH, ("signals_agree",), (), False
+    )
+    with pytest.raises(policies.PolicySelectionError) as run_error:
+        policies.construct_recovery_instruction(
+            unsafe_selection, unsafe_run, _policy(nudge=True, diagnose=True)
+        )
+    assert run_error.value.code == "invalid_recovery_instruction"
+    assert run_error.value.__cause__ is None
+    assert run_error.value.__context__ is None
+
+    def resource(*args: object, **kwargs: object) -> bytes:
+        raise MemoryError()
+
+    monkeypatch.setattr(policies, "canonicalize_json", resource)
+    with pytest.raises(MemoryError):
+        policies.construct_recovery_instruction(
+            selection, diagnosis, _policy(nudge=True, diagnose=True)
+        )

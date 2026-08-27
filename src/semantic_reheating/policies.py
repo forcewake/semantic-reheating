@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from hashlib import sha256
 from re import compile as re_compile
 from typing import Any, NoReturn
 
-from .diagnosis import CauseClass, Diagnosis
+from .canonical import canonicalize_json
+from .diagnosis import CauseClass, Diagnosis, UncertaintyDisposition, UncertaintyItem
 from .models import Decision, EffectClass, FindingClass, RunPolicy
 from .validation import validate_public_artifact
 
@@ -20,6 +22,47 @@ _REASON_BY_CLASS = {
     "no_progress": "no_progress_detected",
     "risk": "risk_detected",
     "budget": "budget_limit_reached",
+}
+_RECOVERY_GAPS = {
+    CauseClass.MISSING_KNOWLEDGE: (
+        "missing_evidence",
+        "Required evidence is unavailable.",
+    ),
+    CauseClass.AMBIGUOUS_COMPLETION: (
+        "ambiguous_goal",
+        "Completion criteria require clarification.",
+    ),
+    CauseClass.INCORRECT_PLAN: (
+        "failed_acceptance",
+        "Acceptance criteria did not validate the plan.",
+    ),
+    CauseClass.UNSUITABLE_TOOL: (
+        "stalled_progress",
+        "Progress is stalled pending a safe reassessment.",
+    ),
+    CauseClass.RUNTIME_DEFECT: (
+        "stalled_progress",
+        "Progress is stalled pending a safe reassessment.",
+    ),
+    CauseClass.MISSING_AUTHORITY: (
+        "risk_blocker",
+        "Recovery is blocked by a safety or authority constraint.",
+    ),
+    CauseClass.UNSAFE_SIDE_EFFECT: (
+        "risk_blocker",
+        "Recovery is blocked by a safety or authority constraint.",
+    ),
+    CauseClass.EXHAUSTED_BUDGET: (
+        "risk_blocker",
+        "Recovery is blocked by a safety or authority constraint.",
+    ),
+}
+_HYPOTHESIS_CONTRACT = {
+    "exact_hypotheses": 3,
+    "mutually_exclusive": True,
+    "falsifiable": True,
+    "discriminating_tests_per_hypothesis": 1,
+    "allowed_test_effect_classes": ["read_only"],
 }
 
 
@@ -213,6 +256,174 @@ def _validated_policy(policy: Any) -> RunPolicy:
     if invalid or type(fresh) is not RunPolicy:
         _fail("invalid_run_policy")
     return fresh
+
+
+def _validated_recovery_selection(selection: Any) -> PolicySelection:
+    if type(selection) is not PolicySelection:
+        _fail("invalid_policy_selection")
+    fresh: Any = None
+    invalid = False
+    try:
+        data = selection.to_dict()
+        if type(data) is not dict:
+            invalid = True
+        else:
+            recovery_policy = data["recovery_policy"]
+            fresh = PolicySelection(
+                Decision(data["decision"]),
+                RecoveryPolicy(recovery_policy)
+                if recovery_policy is not None
+                else None,
+                tuple(data["reason_codes"]),
+                tuple(data["evidence_event_ids"]),
+                data["requires_host_action"],
+            )
+    except (MemoryError, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - typed selection integrity boundary.
+        invalid = True
+    if invalid or type(fresh) is not PolicySelection:
+        _fail("invalid_policy_selection")
+    return fresh
+
+
+def _validated_recovery_diagnosis(diagnosis: Any) -> Diagnosis:
+    if type(diagnosis) is not Diagnosis:
+        _fail("invalid_diagnosis")
+    fresh: Any = None
+    invalid = False
+    try:
+        data = diagnosis.to_dict()
+        if type(data) is not dict:
+            invalid = True
+        else:
+            causes = tuple(CauseClass(value) for value in data["cause_classes"])
+            uncertainties = tuple(
+                UncertaintyItem(
+                    item["uncertainty_id"],
+                    CauseClass(item["cause_class"]),
+                    UncertaintyDisposition(item["disposition"]),
+                    item["high_risk"],
+                )
+                for item in data["uncertainty_map"]
+            )
+            fresh = Diagnosis(
+                data["run_id"], causes, uncertainties, tuple(data["evidence_event_ids"])
+            )
+    except (MemoryError, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - typed diagnosis integrity boundary.
+        invalid = True
+    if invalid or type(fresh) is not Diagnosis:
+        _fail("invalid_diagnosis")
+    return fresh
+
+
+def _copy_json(value: Any) -> Any:
+    if type(value) is dict:
+        return {key: _copy_json(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_copy_json(item) for item in value]
+    return value
+
+
+def construct_recovery_instruction(
+    selection: Any, diagnosis: Any, policy: Any
+) -> dict[str, Any] | None:
+    """Construct a deterministic, bounded advisory instruction for exact REHEAT."""
+    fresh_selection = _validated_recovery_selection(selection)
+    fresh_diagnosis = _validated_recovery_diagnosis(diagnosis)
+    fresh_policy = _validated_policy(policy)
+    if fresh_selection.decision is not Decision.REHEAT:
+        return None
+    if (
+        fresh_selection.recovery_policy is None
+        or "signals_agree" not in fresh_selection.reason_codes
+    ):
+        _fail("invalid_reheat_selection")
+
+    failure = False
+    try:
+        policy_data = fresh_policy.to_dict()
+        basis: dict[str, Any] = {
+            "contract_version": "1.0",
+            "run_id": fresh_diagnosis.run_id,
+            "selected_prompt_asset_id": "prompt-reheat-v1",
+            "variables": [
+                {
+                    "name": "constraint",
+                    "value": (
+                        "Produce exactly three mutually exclusive, falsifiable "
+                        "hypotheses and one discriminating read-only test per hypothesis."
+                    ),
+                },
+                {
+                    "name": "evidence_summary",
+                    "value": "Preserve the referenced public evidence identifiers.",
+                },
+                {
+                    "name": "next_step",
+                    "value": (
+                        "Return advisory structured output to the host runtime "
+                        "without executing tools."
+                    ),
+                },
+            ],
+            "diagnosed_gaps": [
+                {
+                    "kind": _RECOVERY_GAPS[cause][0],
+                    "description": _RECOVERY_GAPS[cause][1],
+                }
+                for cause in fresh_diagnosis.cause_classes
+            ],
+            "recovery_budget": _copy_json(policy_data["budgets"]["per_intervention"]),
+            "allowed_tools": ["read_only", "analysis", "validation"],
+            "forbidden_actions": [
+                "credential_access",
+                "authority_grant",
+                "network_publish",
+                "non_idempotent_repeat",
+            ],
+            "evidence_refs": list(fresh_selection.evidence_event_ids),
+            "expected_output": {
+                "kind": "plan",
+                "required_sections": [
+                    "summary",
+                    "evidence",
+                    "constraints",
+                    "next_steps",
+                    "stop_conditions",
+                ],
+                "max_characters": 6000,
+                "hypothesis_contract": _copy_json(_HYPOTHESIS_CONTRACT),
+            },
+            "cooling_conditions": _copy_json(policy_data["cooling_conditions"]),
+            "stop_conditions": [
+                "budget_exhausted",
+                "host_denial",
+                "risk_detected",
+                "acceptance_met",
+                "cooling_required",
+            ],
+            "advisory_only": True,
+            "grants_authority": False,
+        }
+        source = {
+            "instruction_id": "instruction-"
+            + sha256(canonicalize_json(basis)).hexdigest()[:24],
+            **basis,
+        }
+        validated = validate_public_artifact("recovery_instruction", source)
+        if type(validated) is dict:
+            return _copy_json(validated)
+        failure = True
+    except (MemoryError, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - instruction assembly must not leak inputs.
+        failure = True
+    if failure:
+        _fail("invalid_recovery_instruction")
+    _fail("invalid_recovery_instruction")
 
 
 def _validated_findings(findings: Any, run_id: str) -> tuple[dict[str, Any], ...]:

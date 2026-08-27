@@ -224,6 +224,42 @@
           "minimum": 1,
           "maximum": 100000,
           "description": "Output bound."
+        },
+        "hypothesis_contract": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "exact_hypotheses": {
+              "type": "integer",
+              "const": 3
+            },
+            "mutually_exclusive": {
+              "type": "boolean",
+              "const": true
+            },
+            "falsifiable": {
+              "type": "boolean",
+              "const": true
+            },
+            "discriminating_tests_per_hypothesis": {
+              "type": "integer",
+              "const": 1
+            },
+            "allowed_test_effect_classes": {
+              "type": "array",
+              "const": [
+                "read_only"
+              ]
+            }
+          },
+          "required": [
+            "exact_hypotheses",
+            "mutually_exclusive",
+            "falsifiable",
+            "discriminating_tests_per_hypothesis",
+            "allowed_test_effect_classes"
+          ],
+          "description": "Closed bounded hypothesis and test contract."
         }
       },
       "required": [
@@ -303,5 +339,28 @@
     "stop_conditions",
     "advisory_only",
     "grants_authority"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "selected_prompt_asset_id": {
+            "const": "prompt-reheat-v1"
+          }
+        },
+        "required": [
+          "selected_prompt_asset_id"
+        ]
+      },
+      "then": {
+        "properties": {
+          "expected_output": {
+            "required": [
+              "hypothesis_contract"
+            ]
+          }
+        }
+      }
+    }
   ]
 }

@@ -36,7 +36,16 @@
     "required_sections": [
       "summary"
     ],
-    "max_characters": 1000
+    "max_characters": 1000,
+    "hypothesis_contract": {
+      "exact_hypotheses": 3,
+      "mutually_exclusive": true,
+      "falsifiable": true,
+      "discriminating_tests_per_hypothesis": 1,
+      "allowed_test_effect_classes": [
+        "read_only"
+      ]
+    }
   },
   "cooling_conditions": {
     "minimum_elapsed_seconds": 30,

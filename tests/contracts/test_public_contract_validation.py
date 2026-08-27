@@ -549,9 +549,9 @@ _require_matrix_floor("enum", ENUM_MATRIX_CASES, 27)
 _require_matrix_floor("const", CONST_MATRIX_CASES, 13)
 
 # This is an independently inventoried current baseline: 19 RunPolicy, 2
-# DetectorFinding, 6 DecisionEnvelope, 6 RecoveryInstruction, 6
+# DetectorFinding, 6 DecisionEnvelope, 7 RecoveryInstruction, 6
 # RecoveryOutcome, and 4 EvidenceRecord object boundaries.
-CLOSED_OBJECT_MATRIX_EXPECTED_COUNT = 43
+CLOSED_OBJECT_MATRIX_EXPECTED_COUNT = 44
 CLOSED_OBJECT_MATRIX_NAMED_PATHS: frozenset[ClosedObjectCase] = frozenset(
     {
         ("run_policy", ("detectors",)),
@@ -578,6 +578,7 @@ CLOSED_OBJECT_MATRIX_NAMED_PATHS: frozenset[ClosedObjectCase] = frozenset(
         ("recovery_instruction", ("diagnosed_gaps", 0)),
         ("recovery_instruction", ("recovery_budget",)),
         ("recovery_instruction", ("expected_output",)),
+        ("recovery_instruction", ("expected_output", "hypothesis_contract")),
         ("recovery_instruction", ("cooling_conditions",)),
         ("evidence_record", ("actual_counters",)),
         ("evidence_record", ("acceptance_delta",)),
@@ -626,6 +627,8 @@ def _enum_sentinel(value: Any, enums: list[Any]) -> Any:
 def _const_sentinel(value: Any) -> Any:
     if isinstance(value, str):
         return f"{value}-invalid"
+    if type(value) is list:
+        return [*value, "__contract_matrix_invalid_const__"]
     if type(value) is bool:
         return not value
     if type(value) is int:
