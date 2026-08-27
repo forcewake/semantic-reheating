@@ -28,6 +28,28 @@ def _event(
     return TraceEvent.from_dict(source)
 
 
+def test_pending_state_expectations_retains_only_distinct_baselines() -> None:
+    from semantic_reheating.progress import _PendingStateExpectations
+
+    pending = _PendingStateExpectations()
+    for _ in range(50_000):
+        pending.add("state-a")
+
+    assert pending.count == 1
+    assert pending.observe("state-a") is False
+    assert pending.count == 1
+    assert pending.observe("state-b") is True
+    assert pending.count == 0
+
+    pending.add("state-a")
+    pending.add("state-b")
+    assert pending.count == 2
+    assert pending.observe("state-a") is True
+    assert pending.count == 0
+    assert type(pending._baselines) is set
+    assert not hasattr(pending, "__dict__")
+
+
 def test_empty_window_returns_an_immutable_no_progress_assessment() -> None:
     from dataclasses import FrozenInstanceError
 
@@ -364,6 +386,67 @@ def test_expected_state_change_requires_a_later_observed_fingerprint_change() ->
     assert observed.reason_codes == (ProgressReason.EXPECTED_STATE_CHANGE_OBSERVED,)
     assert observed.supporting_event_ids == ("event-005",)
     assert never_appears.made_progress is False
+
+
+def test_duplicate_expected_state_changes_with_same_observations_are_not_progress() -> None:
+    from semantic_reheating.progress import classify_progress
+
+    duplicate_count = 2_000
+    trace = tuple(
+        _event(sequence, kind="tool_call", state_fingerprint="state-a", expected_state_change=True)
+        for sequence in range(1, duplicate_count + 1)
+    ) + tuple(
+        _event(sequence, kind="state_observation", state_fingerprint="state-a")
+        for sequence in range(duplicate_count + 1, (2 * duplicate_count) + 1)
+    )
+
+    assert classify_progress(trace).made_progress is False
+
+
+def test_changed_observation_after_duplicate_expected_state_changes_is_progress_once() -> None:
+    from semantic_reheating.progress import ProgressReason, classify_progress
+
+    duplicate_count = 2_000
+    trace = tuple(
+        _event(sequence, kind="tool_call", state_fingerprint="state-a", expected_state_change=True)
+        for sequence in range(1, duplicate_count + 1)
+    ) + tuple(
+        _event(sequence, kind="state_observation", state_fingerprint="state-a")
+        for sequence in range(duplicate_count + 1, (2 * duplicate_count) + 1)
+    ) + (_event((2 * duplicate_count) + 1, kind="state_observation", state_fingerprint="state-b"),)
+
+    assessment = classify_progress(trace)
+
+    assert assessment.reason_codes == (ProgressReason.EXPECTED_STATE_CHANGE_OBSERVED,)
+    assert assessment.supporting_event_ids == (f"event-{(2 * duplicate_count) + 1:03d}",)
+
+
+def test_state_observation_does_not_satisfy_its_own_expected_state_change() -> None:
+    from semantic_reheating.progress import classify_progress
+
+    assessment = classify_progress(
+        (
+            _event(4, kind="state_observation", state_fingerprint="state-a", expected_state_change=True),
+            _event(5, kind="state_observation", state_fingerprint="state-a"),
+        )
+    )
+
+    assert assessment.made_progress is False
+
+
+def test_changed_state_observation_consumes_pending_expectation_before_later_observations() -> None:
+    from semantic_reheating.progress import ProgressReason, classify_progress
+
+    assessment = classify_progress(
+        (
+            _event(4, kind="tool_call", state_fingerprint="state-a", expected_state_change=True),
+            _event(5, kind="state_observation", state_fingerprint="state-b"),
+            _event(6, kind="state_observation", state_fingerprint="state-b"),
+        )
+    )
+
+    assert assessment.reason_codes == (ProgressReason.EXPECTED_STATE_CHANGE_OBSERVED,)
+    assert assessment.supporting_event_ids == ("event-005",)
 
 
 def test_expected_state_change_without_a_baseline_or_expectation_is_not_progress() -> None:

@@ -200,6 +200,31 @@ def _assessment(reasons: list[ProgressReason], event_ids: list[str]) -> Progress
     return ProgressAssessment(bool(reasons), tuple(reasons), tuple(dict.fromkeys(event_ids)))
 
 
+class _PendingStateExpectations:
+    """Bounded summary of distinct state baselines awaiting a changed observation."""
+
+    __slots__ = ("_baselines",)
+
+    def __init__(self) -> None:
+        self._baselines: set[str] = set()
+
+    @property
+    def count(self) -> int:
+        """Return the number of distinct pending baseline fingerprints."""
+        return len(self._baselines)
+
+    def add(self, baseline: str) -> None:
+        """Remember one exact nonempty baseline, collapsing duplicate expectations."""
+        self._baselines.add(baseline)
+
+    def observe(self, fingerprint: str) -> bool:
+        """Return whether this observation differs from a pending baseline and consume it."""
+        changed = bool(self._baselines) and (len(self._baselines) > 1 or fingerprint not in self._baselines)
+        if changed:
+            self._baselines.clear()
+        return changed
+
+
 def classify_progress(trace: Any) -> ProgressAssessment:
     """Classify one contiguous window using only the module marker contract.
 
@@ -222,7 +247,7 @@ def classify_progress(trace: Any) -> ProgressAssessment:
     has_required_acceptance_baseline = False
     has_prior_event = False
     last_state_fingerprint: str | None = None
-    pending_state_expectations: list[tuple[str, int]] = []
+    pending_state_expectations = _PendingStateExpectations()
     poll_baselines: dict[tuple[str, Fraction], Fraction] = {}
     reasons: list[ProgressReason] = []
     event_ids: list[str] = []
@@ -230,11 +255,9 @@ def classify_progress(trace: Any) -> ProgressAssessment:
         payload = _payload_object(event)
         fingerprint = event.state_fingerprint
         baseline = fingerprint if type(fingerprint) is str and fingerprint else last_state_fingerprint
-        if event.expected_state_change is True and baseline is not None:
-            pending_state_expectations.append((baseline, event.sequence))
         if event.kind is TraceKind.STATE_OBSERVATION and type(fingerprint) is str and fingerprint:
             if (
-                any(sequence < event.sequence and expected != fingerprint for expected, sequence in pending_state_expectations)
+                pending_state_expectations.observe(fingerprint)
                 and ProgressReason.EXPECTED_STATE_CHANGE_OBSERVED not in reasons
             ):
                 reasons.append(ProgressReason.EXPECTED_STATE_CHANGE_OBSERVED)
@@ -242,6 +265,8 @@ def classify_progress(trace: Any) -> ProgressAssessment:
             last_state_fingerprint = fingerprint
         elif type(fingerprint) is str and fingerprint:
             last_state_fingerprint = fingerprint
+        if event.expected_state_change is True and baseline is not None:
+            pending_state_expectations.add(baseline)
         if event.kind is TraceKind.ACCEPTANCE_CHECK and type(payload) is dict and payload.get("required_verification") is True:
             if (
                 has_required_acceptance_baseline
