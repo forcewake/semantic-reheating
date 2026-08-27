@@ -402,7 +402,7 @@ def test_parse_trace_does_not_return_a_forged_exact_model() -> None:
     from dataclasses import fields
     from types import MappingProxyType
 
-    import semantic_reheating.models as models
+    from semantic_reheating import models
     from semantic_reheating.models import TraceEvent, parse_trace
 
     assert not hasattr(models, "_VALIDATED_MODEL_CONSTRUCTION")
