@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 from collections import UserDict
+from collections.abc import Iterator
+from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -72,6 +75,377 @@ def fixture(name: str) -> dict[str, object]:
     return json.loads(
         (PROJECT_ROOT / "tests" / "fixtures" / "contracts" / name).read_text()
     )
+
+
+# Keep the schema/fixture registry explicit: the public validator deliberately
+# excludes trace_event, and these tests must not infer coverage from filenames.
+ADVERSARIAL_ARTIFACTS = (
+    ("run_policy", "contracts/v1/run-policy.schema.json", "minimal-run-policy.json"),
+    (
+        "detector_finding",
+        "contracts/v1/detector-finding.schema.json",
+        "minimal-detector-finding.json",
+    ),
+    (
+        "decision_envelope",
+        "contracts/v1/decision-envelope.schema.json",
+        "minimal-decision-envelope.json",
+    ),
+    (
+        "recovery_instruction",
+        "contracts/v1/recovery-instruction.schema.json",
+        "minimal-recovery-instruction.json",
+    ),
+    (
+        "recovery_outcome",
+        "contracts/v1/recovery-outcome.schema.json",
+        "minimal-recovery-outcome.json",
+    ),
+    (
+        "evidence_record",
+        "contracts/v1/evidence-record.schema.json",
+        "minimal-evidence-record.json",
+    ),
+)
+
+PathSegment = str | int
+RequiredCase = tuple[str, tuple[PathSegment, ...], str]
+ValueCase = tuple[str, tuple[PathSegment, ...]]
+
+
+def _resolve_local_ref(schema: dict[str, Any], root_schema: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a local JSON Pointer reference without silently ignoring it."""
+    resolved = schema
+    seen: set[str] = set()
+    while "$ref" in resolved:
+        reference = resolved["$ref"]
+        if not isinstance(reference, str) or not reference.startswith("#/"):
+            raise AssertionError(f"Unsupported non-local schema reference: {reference!r}")
+        if reference in seen:
+            raise AssertionError(f"Cyclic local schema reference: {reference}")
+        seen.add(reference)
+        target: Any = root_schema
+        for token in reference[2:].split("/"):
+            token = token.replace("~1", "/").replace("~0", "~")
+            if not isinstance(target, dict) or token not in target:
+                raise AssertionError(f"Unresolvable local schema reference: {reference}")
+            target = target[token]
+        if not isinstance(target, dict):
+            raise TypeError(f"Local schema reference is not an object: {reference}")
+        siblings = {key: value for key, value in resolved.items() if key != "$ref"}
+        resolved = target if not siblings else {"allOf": [target, siblings]}
+    return resolved
+
+
+def _matches_condition(
+    condition: dict[str, Any], instance: Any, root_schema: dict[str, Any]
+) -> bool:
+    condition_with_defs = {"$defs": root_schema.get("$defs", {}), **condition}
+    return Draft202012Validator(condition_with_defs).is_valid(instance)
+
+
+def _effective_parts(
+    schema: dict[str, Any], instance: Any, root_schema: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return every conjunction branch applicable to this fixture instance."""
+    schema = _resolve_local_ref(schema, root_schema)
+    parts = [schema]
+    all_of = schema.get("allOf", [])
+    if not isinstance(all_of, list):
+        raise TypeError("Schema allOf must be an array")
+    for branch in all_of:
+        if not isinstance(branch, dict):
+            raise TypeError("Schema allOf branch must be an object")
+        branch = _resolve_local_ref(branch, root_schema)
+        if "if" in branch:
+            condition = branch["if"]
+            if not isinstance(condition, dict):
+                raise AssertionError("Schema conditional must be an object")
+            selected = "then" if _matches_condition(condition, instance, root_schema) else "else"
+            selected_schema = branch.get(selected)
+            if selected_schema is None:
+                continue
+            if not isinstance(selected_schema, dict):
+                raise AssertionError("Schema conditional branch must be an object")
+            parts.extend(_effective_parts(selected_schema, instance, root_schema))
+        else:
+            parts.extend(_effective_parts(branch, instance, root_schema))
+    return parts
+
+
+def _property_parts(
+    parent_parts: list[dict[str, Any]],
+    property_name: str,
+    instance: Any,
+    root_schema: dict[str, Any],
+) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    for parent in parent_parts:
+        properties = parent.get("properties", {})
+        if not isinstance(properties, dict):
+            raise TypeError("Schema properties must be an object")
+        property_schema = properties.get(property_name)
+        if property_schema is None:
+            continue
+        if not isinstance(property_schema, dict):
+            raise TypeError("Property schema must be an object")
+        parts.extend(_effective_parts(property_schema, instance, root_schema))
+    return parts
+
+
+def _item_parts(
+    parent_parts: list[dict[str, Any]], instance: Any, root_schema: dict[str, Any]
+) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    for parent in parent_parts:
+        item_schema = parent.get("items")
+        if item_schema is None:
+            continue
+        if not isinstance(item_schema, dict):
+            raise TypeError("Array item schema must be an object")
+        parts.extend(_effective_parts(item_schema, instance, root_schema))
+    return parts
+
+
+def _walk_populated_invariants(
+    instance: Any,
+    parts: list[dict[str, Any]],
+    root_schema: dict[str, Any],
+    path: tuple[PathSegment, ...] = (),
+) -> Iterator[tuple[str, tuple[PathSegment, ...], str | None]]:
+    if isinstance(instance, dict):
+        required_fields = {
+            field
+            for part in parts
+            for field in part.get("required", [])
+            if isinstance(field, str) and field in instance
+        }
+        for field in sorted(required_fields):
+            yield "required", path, field
+        for field, value in instance.items():
+            child_parts = _property_parts(parts, field, value, root_schema)
+            if not child_parts:
+                continue
+            child_path = (*path, field)
+            if any("enum" in part for part in child_parts):
+                yield "enum", child_path, None
+            if any("const" in part for part in child_parts):
+                yield "const", child_path, None
+            yield from _walk_populated_invariants(
+                value, child_parts, root_schema, child_path
+            )
+    elif isinstance(instance, list):
+        for index, value in enumerate(instance):
+            child_parts = _item_parts(parts, value, root_schema)
+            if not child_parts:
+                continue
+            child_path = (*path, index)
+            if any("enum" in part for part in child_parts):
+                yield "enum", child_path, None
+            if any("const" in part for part in child_parts):
+                yield "const", child_path, None
+            yield from _walk_populated_invariants(
+                value, child_parts, root_schema, child_path
+            )
+
+
+def _matrix_cases() -> tuple[list[RequiredCase], list[ValueCase], list[ValueCase]]:
+    required: list[RequiredCase] = []
+    enums: list[ValueCase] = []
+    consts: list[ValueCase] = []
+    for kind, schema_name, fixture_name in ADVERSARIAL_ARTIFACTS:
+        schema = json.loads((PROJECT_ROOT / schema_name).read_text())
+        data = fixture(fixture_name)
+        for invariant, path, field in _walk_populated_invariants(
+            data, _effective_parts(schema, data, schema), schema
+        ):
+            if invariant == "required":
+                assert field is not None
+                required.append((kind, path, field))
+            elif invariant == "enum":
+                enums.append((kind, path))
+            elif invariant == "const":
+                consts.append((kind, path))
+            else:  # pragma: no cover - guarded by the fixed collector vocabulary.
+                raise AssertionError(f"Unknown invariant type: {invariant}")
+    return required, enums, consts
+
+
+def _require_matrix_floor(name: str, cases: list[Any], minimum: int) -> None:
+    if not cases:
+        raise RuntimeError(f"{name} matrix collected zero cases")
+    if len(cases) < minimum:
+        raise RuntimeError(
+            f"{name} matrix shrank to {len(cases)} cases; expected at least {minimum}"
+        )
+
+
+REQUIRED_MATRIX_CASES, ENUM_MATRIX_CASES, CONST_MATRIX_CASES = _matrix_cases()
+_require_matrix_floor("required", REQUIRED_MATRIX_CASES, 186)
+_require_matrix_floor("enum", ENUM_MATRIX_CASES, 27)
+_require_matrix_floor("const", CONST_MATRIX_CASES, 13)
+
+
+def _format_path(path: tuple[PathSegment, ...]) -> str:
+    rendered = "$"
+    for segment in path:
+        rendered += f"[{segment}]" if isinstance(segment, int) else f".{segment}"
+    return rendered
+
+
+def _at_path(data: dict[str, Any], path: tuple[PathSegment, ...]) -> Any:
+    current: Any = data
+    for segment in path:
+        current = current[segment]
+    return current
+
+
+def _enum_sentinel(value: Any, enums: list[Any]) -> Any:
+    if isinstance(value, str) or value is None:
+        candidate = "__contract_matrix_invalid_enum__"
+        while candidate in enums:
+            candidate += "_"
+        return candidate
+    if type(value) is bool:
+        candidate = not value
+        if candidate not in enums:
+            return candidate
+    if type(value) is int:
+        candidate = value + 1
+        while candidate in enums:
+            candidate += 1
+        return candidate
+    if type(value) is float:
+        candidate = value + 1.0
+        while candidate in enums:
+            candidate += 1.0
+        return candidate
+    raise AssertionError(f"No deterministic enum sentinel for {type(value)!r}")
+
+
+def _const_sentinel(value: Any) -> Any:
+    if isinstance(value, str):
+        return f"{value}-invalid"
+    if type(value) is bool:
+        return not value
+    if type(value) is int:
+        return value + 1
+    if type(value) is float:
+        return value + 1.0
+    raise AssertionError(f"No same-type distinct const sentinel for {type(value)!r}")
+
+
+def _value_constraint(case: ValueCase, keyword: str) -> list[Any]:
+    kind, path = case
+    schema_name = next(
+        schema_name
+        for artifact_kind, schema_name, _ in ADVERSARIAL_ARTIFACTS
+        if artifact_kind == kind
+    )
+    schema = json.loads((PROJECT_ROOT / schema_name).read_text())
+    data = fixture(
+        next(
+            fixture_name
+            for artifact_kind, _, fixture_name in ADVERSARIAL_ARTIFACTS
+            if artifact_kind == kind
+        )
+    )
+    parts = _effective_parts(schema, data, schema)
+    current: Any = data
+    for segment in path:
+        if isinstance(segment, str):
+            parts = _property_parts(parts, segment, current[segment], schema)
+        else:
+            parts = _item_parts(parts, current[segment], schema)
+        current = current[segment]
+    values = [part[keyword] for part in parts if keyword in part]
+    if not values:
+        raise AssertionError(f"{keyword} case lost its effective schema: {kind} {_format_path(path)}")
+    return values
+
+
+def _required_case_id(case: RequiredCase) -> str:
+    kind, path, field = case
+    return f"{kind}:{_format_path(path)}:remove-{field}"
+
+
+def _value_case_id(case: ValueCase, keyword: str) -> str:
+    kind, path = case
+    return f"{kind}:{_format_path(path)}:{keyword}"
+
+
+@pytest.mark.parametrize("case", REQUIRED_MATRIX_CASES, ids=_required_case_id)
+def test_every_populated_required_contract_field_is_rejected(case: RequiredCase) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    kind, path, field = case
+    fixture_name = next(
+        fixture_name
+        for artifact_kind, _, fixture_name in ADVERSARIAL_ARTIFACTS
+        if artifact_kind == kind
+    )
+    invalid = deepcopy(fixture(fixture_name))
+    del _at_path(invalid, path)[field]
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact(kind, invalid)
+    assert caught.value.code == "schema_validation_error"
+
+
+@pytest.mark.parametrize(
+    "case", ENUM_MATRIX_CASES, ids=lambda case: _value_case_id(case, "enum")
+)
+def test_every_populated_contract_enum_is_rejected(case: ValueCase) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    kind, path = case
+    fixture_name = next(
+        fixture_name
+        for artifact_kind, _, fixture_name in ADVERSARIAL_ARTIFACTS
+        if artifact_kind == kind
+    )
+    invalid = deepcopy(fixture(fixture_name))
+    enum_values = [value for values in _value_constraint(case, "enum") for value in values]
+    target = _at_path(invalid, path)
+    parent = _at_path(invalid, path[:-1])
+    parent[path[-1]] = _enum_sentinel(target, enum_values)
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact(kind, invalid)
+    assert caught.value.code == "schema_validation_error"
+
+
+@pytest.mark.parametrize(
+    "case", CONST_MATRIX_CASES, ids=lambda case: _value_case_id(case, "const")
+)
+def test_every_populated_contract_const_is_rejected(case: ValueCase) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    kind, path = case
+    fixture_name = next(
+        fixture_name
+        for artifact_kind, _, fixture_name in ADVERSARIAL_ARTIFACTS
+        if artifact_kind == kind
+    )
+    invalid = deepcopy(fixture(fixture_name))
+    target = _at_path(invalid, path)
+    parent = _at_path(invalid, path[:-1])
+    parent[path[-1]] = "2.0" if path == ("contract_version",) else _const_sentinel(target)
+    expected_code = (
+        "unknown_contract_major"
+        if path == ("contract_version",)
+        else "schema_validation_error"
+    )
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact(kind, invalid)
+    assert caught.value.code == expected_code
 
 
 @pytest.mark.parametrize("kind,fixture_name", ARTIFACTS.items())
