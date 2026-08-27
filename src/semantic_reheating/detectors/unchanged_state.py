@@ -54,6 +54,7 @@ def detect_unchanged_state(trace: Any, policy: Any) -> dict[str, Any]:
                         True,
                         finding_class="no_progress",
                     )
+                pending.clear()
             elif pending:
                 pending.clear()
             latest = (fingerprint, position, event.event_id)

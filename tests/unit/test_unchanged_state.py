@@ -488,6 +488,67 @@ def test_progress_resource_failure_propagates(
     assert raised.value is expected
 
 
+def test_productive_same_state_observation_consumes_pending_expectation_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import semantic_reheating.detectors.unchanged_state as unchanged_module
+    from semantic_reheating.detectors import detect_unchanged_state
+
+    classified_lengths: list[int] = []
+    original = unchanged_module.classify_progress
+
+    def counting_progress(trace: tuple[Any, ...]) -> object:
+        classified_lengths.append(len(trace))
+        return original(trace)
+
+    monkeypatch.setattr(unchanged_module, "classify_progress", counting_progress)
+    trace = (
+        _event(1, kind="state_observation", state_fingerprint="state-a"),
+        _event(2, kind="tool_call", expected_state_change=True),
+        _event(
+            3,
+            kind="state_observation",
+            state_fingerprint="state-a",
+            evidence_refs=["evidence://new"],
+        ),
+        *(
+            _event(index, kind="state_observation", state_fingerprint="state-a")
+            for index in range(4, 81)
+        ),
+    )
+
+    finding = detect_unchanged_state(trace, _policy(window=len(trace)))
+
+    assert finding["matched"] is False
+    assert finding["score"] == 0.0
+    assert finding["event_ids"] == ["event-080"]
+    assert len(classified_lengths) == 1
+    assert sum(classified_lengths) <= len(trace)
+
+
+def test_new_expectation_after_productive_consumption_starts_a_new_episode() -> None:
+    from semantic_reheating.detectors import detect_unchanged_state
+
+    finding = detect_unchanged_state(
+        (
+            _event(1, kind="state_observation", state_fingerprint="state-a"),
+            _event(2, kind="tool_call", expected_state_change=True),
+            _event(
+                3,
+                kind="state_observation",
+                state_fingerprint="state-a",
+                evidence_refs=["evidence://new"],
+            ),
+            _event(4, kind="tool_call", expected_state_change=True),
+            _event(5, kind="state_observation", state_fingerprint="state-a"),
+        ),
+        _policy(),
+    )
+
+    assert finding["matched"] is True
+    assert finding["event_ids"] == ["event-003", "event-004", "event-005"]
+
+
 def test_progress_classification_is_called_only_for_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

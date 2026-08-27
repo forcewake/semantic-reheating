@@ -128,6 +128,55 @@ def test_same_check_identity_and_explicit_delta_match_with_two_event_support() -
     assert finding["event_ids"] == ["event-004", "event-005"]
 
 
+def test_changed_delta_rebases_the_acceptance_baseline_without_resurrection() -> None:
+    from semantic_reheating.detectors import detect_acceptance_stall
+
+    common = {"check": "build", "target": "controller"}
+    resurrected = detect_acceptance_stall(
+        (
+            _event(
+                4, kind="acceptance_check", payload=common, acceptance_delta="unchanged"
+            ),
+            _event(
+                5,
+                kind="acceptance_check",
+                payload=common,
+                acceptance_delta="criterion changed",
+            ),
+            _event(
+                6, kind="acceptance_check", payload=common, acceptance_delta="unchanged"
+            ),
+        ),
+        _policy(),
+    )
+    latest_baseline = detect_acceptance_stall(
+        (
+            _event(
+                4, kind="acceptance_check", payload=common, acceptance_delta="unchanged"
+            ),
+            _event(
+                5,
+                kind="acceptance_check",
+                payload=common,
+                acceptance_delta="criterion changed",
+            ),
+            _event(
+                6,
+                kind="acceptance_check",
+                payload=common,
+                acceptance_delta="criterion changed",
+            ),
+        ),
+        _policy(),
+    )
+
+    assert resurrected["matched"] is False
+    assert resurrected["score"] == 0.0
+    assert resurrected["event_ids"] == ["event-006"]
+    assert latest_baseline["matched"] is True
+    assert latest_baseline["event_ids"] == ["event-005", "event-006"]
+
+
 def test_reordered_payload_and_volatile_request_id_match_the_same_check() -> None:
     from semantic_reheating.detectors import detect_acceptance_stall
 

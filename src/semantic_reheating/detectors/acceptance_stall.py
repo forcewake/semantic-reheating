@@ -39,16 +39,20 @@ def detect_acceptance_stall(trace: Any, policy: Any) -> dict[str, Any]:
     window, parsed_policy = _validated_inputs(
         trace, policy, window_policy="no_progress"
     )
-    baselines: dict[tuple[tuple[str, str], str], tuple[int, str]] = {}
+    baselines: dict[tuple[str, str], tuple[str, int, str]] = {}
     for position, event in enumerate(window):
         key = _acceptance_key(event)
         if key is None:
             continue
-        baseline = baselines.get(key)
+        identity, delta = key
+        baseline = baselines.get(identity)
         if baseline is None:
-            baselines[key] = (position, event.event_id)
+            baselines[identity] = (delta, position, event.event_id)
             continue
-        baseline_position, baseline_id = baseline
+        baseline_delta, baseline_position, baseline_id = baseline
+        if delta != baseline_delta:
+            baselines[identity] = (delta, position, event.event_id)
+            continue
         classification_failed = False
         try:
             made_progress = classify_progress(
@@ -70,7 +74,7 @@ def detect_acceptance_stall(trace: Any, policy: Any) -> dict[str, Any]:
                 True,
                 finding_class="no_progress",
             )
-        baselines[key] = (position, event.event_id)
+        baselines[identity] = (delta, position, event.event_id)
     return _finding(
         "acceptance_stall",
         window,
