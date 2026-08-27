@@ -394,3 +394,126 @@ def test_valid_run_policy_round_trips_through_to_dict_pickle_and_deepcopy() -> N
     assert policy.to_dict() == _policy()
     assert pickle.loads(pickle.dumps(policy)).to_dict() == _policy()
     assert deepcopy(policy).to_dict() == _policy()
+
+
+def _set_policy_path(source: dict[str, Any], path: tuple[str, ...], value: int) -> None:
+    target: dict[str, Any] = source
+    for segment in path[:-1]:
+        target = target[segment]
+    target[path[-1]] = value
+
+
+def _assert_bounded_integer_failure(source: dict[str, Any]) -> None:
+    from semantic_reheating.models import ModelValidationError, RunPolicy
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+        validate_run_policy,
+    )
+
+    for api, expected_type, expected_message in (
+        (lambda: validate_public_artifact("run_policy", source), ContractValidationError, "JSON integer exceeds the bit limit"),
+        (lambda: validate_run_policy(source), ContractValidationError, "Invalid run policy"),
+        (lambda: RunPolicy.from_dict(source), ModelValidationError, "Invalid model input"),
+    ):
+        with pytest.raises(expected_type) as caught:
+            api()
+        assert caught.value.code == "json_integer_too_large"
+        assert caught.value.args == (expected_message,)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert "10**4300" not in repr(caught.value)
+
+
+def test_direct_huge_whole_run_tokens_has_a_typed_sanitized_public_boundary() -> None:
+    """A huge direct integer must not reach jsonschema's decimal diagnostic path."""
+    source = _policy()
+    huge = 10**4300
+    source["budgets"]["whole_run"]["tokens"] = huge
+
+    _assert_bounded_integer_failure(source)
+
+
+_BOUNDED_RUN_POLICY_INTEGER_PATHS = (
+    ("detectors", "windows", "repetition_events"),
+    ("detectors", "windows", "no_progress_events"),
+    ("detectors", "thresholds", "repetition_score"),
+    ("detectors", "thresholds", "no_progress_score"),
+    ("detectors", "thresholds", "risk_score"),
+    ("detectors", "thresholds", "budget_score"),
+    ("detectors", "weights", "repetition"),
+    ("detectors", "weights", "no_progress"),
+    ("detectors", "weights", "risk"),
+    ("detectors", "weights", "budget"),
+    ("detectors", "semantic_detector", "weight"),
+    *(("budgets", scope, dimension) for scope in ("per_intervention", "whole_run") for dimension in ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost")),
+    ("max_recovery_episodes",),
+    ("max_reentry_depth",),
+    ("cooling_conditions", "minimum_elapsed_seconds"),
+    ("cooling_conditions", "minimum_acceptance_gain"),
+)
+
+
+@pytest.mark.parametrize("path", _BOUNDED_RUN_POLICY_INTEGER_PATHS)
+def test_every_bounded_run_policy_number_rejects_an_integer_above_the_resource_cap(
+    path: tuple[str, ...],
+) -> None:
+    from semantic_reheating.validation import MAX_JSON_INTEGER_BITS
+
+    source = _policy()
+    _set_policy_path(source, path, 1 << MAX_JSON_INTEGER_BITS)
+
+    _assert_bounded_integer_failure(source)
+
+
+def test_negative_integer_above_the_resource_cap_is_rejected_without_value_leakage() -> None:
+    from semantic_reheating.validation import MAX_JSON_INTEGER_BITS
+
+    source = _policy()
+    _set_policy_path(source, ("budgets", "whole_run", "tokens"), -(1 << MAX_JSON_INTEGER_BITS))
+
+    _assert_bounded_integer_failure(source)
+
+
+def test_integer_bit_cap_defers_at_boundary_to_ordinary_schema_validation() -> None:
+    from semantic_reheating.validation import (
+        MAX_JSON_INTEGER_BITS,
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    source = _policy()
+    source["budgets"]["whole_run"]["tokens"] = (1 << MAX_JSON_INTEGER_BITS) - 1
+    with pytest.raises(ContractValidationError) as boundary_error:
+        validate_public_artifact("run_policy", source)
+    assert boundary_error.value.code == "schema_validation_error"
+
+    source["budgets"]["whole_run"]["tokens"] = 1 << MAX_JSON_INTEGER_BITS
+    with pytest.raises(ContractValidationError) as over_cap_error:
+        validate_public_artifact("run_policy", source)
+    assert over_cap_error.value.code == "json_integer_too_large"
+
+
+def test_unexpected_run_policy_validator_failure_is_sanitized_at_public_and_safety_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from semantic_reheating import validation
+
+    sentinel = "__unexpected-validator-sentinel__"
+
+    class UnexpectedValidator:
+        def iter_errors(self, data: Any) -> Any:
+            raise RuntimeError(sentinel)
+
+    monkeypatch.setitem(validation._VALIDATOR_CACHE, "run_policy", UnexpectedValidator())
+    for api, expected_message in (
+        (lambda: validation.validate_public_artifact("run_policy", _policy()), "Invalid public artifact"),
+        (lambda: validation.validate_run_policy(_policy()), "Invalid run policy"),
+    ):
+        with pytest.raises(validation.ContractValidationError) as caught:
+            api()
+        assert caught.value.code == "schema_validation_error"
+        assert caught.value.args == (expected_message,)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        assert sentinel not in repr(caught.value)

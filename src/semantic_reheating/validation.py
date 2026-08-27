@@ -69,6 +69,9 @@ MAX_JSON_KEY_CHARS = 4_096
 MAX_JSON_AGGREGATE_CHARS = 1_048_576
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 10_000
+# Direct Python integers bypass JSON text parsing. Bound their magnitude before
+# schema validation so a validator diagnostic can never format an unbounded int.
+MAX_JSON_INTEGER_BITS = 4_096
 
 
 def _ensure_json_value(value: Any) -> None:
@@ -105,7 +108,13 @@ def _ensure_json_value(value: Any) -> None:
                     "JSON value exceeds the aggregate character limit",
                 )
             continue
-        if current is None or type(current) in (bool, int):
+        if current is None or type(current) is bool:
+            continue
+        if type(current) is int:
+            if abs(current).bit_length() > MAX_JSON_INTEGER_BITS:
+                raise ContractValidationError(
+                    "json_integer_too_large", "JSON integer exceeds the bit limit"
+                )
             continue
         if type(current) is float:
             if math.isfinite(current):
@@ -253,18 +262,28 @@ def validate_public_artifact(kind: str, data: Any) -> Any:
         _ensure_json_value(data)
     _check_contract_major(data)
     validator = _validator_for(kind)
-    errors = sorted(
-        validator.iter_errors(data),
-        key=lambda error: tuple(str(part) for part in error.absolute_path),
-    )
-    if errors:
-        error = errors[0]
-        path = "$"
-        for segment in error.absolute_path:
-            path += f"[{segment}]" if isinstance(segment, int) else f".{segment}"
+    unexpected_validator_failure = False
+    try:
+        errors = sorted(
+            validator.iter_errors(data),
+            key=lambda error: tuple(str(part) for part in error.absolute_path),
+        )
+        if errors:
+            error = errors[0]
+            path = "$"
+            for segment in error.absolute_path:
+                path += f"[{segment}]" if isinstance(segment, int) else f".{segment}"
+            raise ContractValidationError(
+                "schema_validation_error",
+                f"Invalid {kind} at {path}: validator {error.validator}",
+            )
+    except ContractValidationError:
+        raise
+    except Exception:  # noqa: BLE001 - jsonschema diagnostics must be sanitized.
+        unexpected_validator_failure = True
+    if unexpected_validator_failure:
         raise ContractValidationError(
-            "schema_validation_error",
-            f"Invalid {kind} at {path}: validator {error.validator}",
+            "schema_validation_error", "Invalid public artifact"
         )
     return data
 
