@@ -7,7 +7,7 @@ import math
 from importlib import resources
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Never
 
 from jsonschema import Draft202012Validator
 
@@ -267,3 +267,96 @@ def validate_public_artifact(kind: str, data: Any) -> Any:
             f"Invalid {kind} at {path}: validator {error.validator}",
         )
     return data
+
+
+def _unsafe_policy() -> Never:
+    raise ContractValidationError("unsafe_policy", "Unsafe run policy") from None
+
+
+_BUDGET_DIMENSIONS = ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost")
+
+
+def _has_named_structural_safety_failure(data: Any) -> bool:
+    """Recognize only the closed raw shapes that weaken policy safety limits."""
+    if type(data) is not dict:
+        return False
+    budgets = data.get("budgets")
+    if type(budgets) is dict:
+        if "whole_run" not in budgets:
+            return True
+        for scope_name in ("per_intervention", "whole_run"):
+            scope = budgets.get(scope_name)
+            if type(scope) is dict and any(
+                dimension not in scope for dimension in _BUDGET_DIMENSIONS
+            ):
+                return True
+    side_effect_rules = data.get("side_effect_rules")
+    return (
+        type(side_effect_rules) is dict
+        and side_effect_rules.get("automatic_unconfirmed_non_idempotent_repeat") is True
+    )
+
+
+def _run_policy_is_safe(policy: dict[str, Any]) -> bool:
+    """Recheck policy invariants that must survive typed-state tampering."""
+    budgets = policy["budgets"]
+    per_intervention = budgets["per_intervention"]
+    whole_run = budgets["whole_run"]
+    dimensions = ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost")
+    if any(whole_run[dimension] < per_intervention[dimension] for dimension in dimensions):
+        return False
+
+    signals = policy["agreeing_signals"]
+    if (
+        set(signals["required_classes"]) != {"repetition", "no_progress"}
+        or signals["minimum_count"] != 2
+        or signals["budget_can_substitute"] is not False
+    ):
+        return False
+
+    ladder = policy["recovery_ladder"]
+    if (
+        ladder["restart"]["requires_host_action"] is not True
+        or ladder["escalate"]["requires_host_action"] is not True
+        or ladder["escalate"]["permitted"] is not True
+        or ladder["stop"]["permitted"] is not True
+        or (ladder["reheat"]["permitted"] is True and policy["max_recovery_episodes"] == 0)
+    ):
+        return False
+
+    rules = policy["side_effect_rules"]
+    if (
+        rules["automatic_unconfirmed_non_idempotent_repeat"] is not False
+        or rules["unknown_treated_as_repeatable"] is not False
+        or not set(rules["automatic_repeat_allowed_effect_classes"]).issubset(
+            {"read_only", "idempotent_write"}
+        )
+    ):
+        return False
+
+    semantic = policy["detectors"].get("semantic_detector")
+    return semantic is None or semantic["can_relax_hard_stops"] is False
+
+
+def validate_run_policy(data: Any) -> dict[str, Any]:
+    """Fail closed for a complete run policy and its semantic safety rules."""
+    named_safety_failure = _has_named_structural_safety_failure(data)
+    failure_code: str | None = None
+    try:
+        value = validate_public_artifact("run_policy", data)
+    except ContractValidationError as error:
+        failure_code = error.code
+        value = None
+    if failure_code is not None:
+        if named_safety_failure:
+            _unsafe_policy()
+        raise ContractValidationError(failure_code, "Invalid run policy") from None
+    if type(value) is not dict:
+        _unsafe_policy()
+    try:
+        safe = _run_policy_is_safe(value)
+    except Exception:  # noqa: BLE001 - schema-valid semantic checks fail closed
+        _unsafe_policy()
+    if not safe:
+        _unsafe_policy()
+    return value

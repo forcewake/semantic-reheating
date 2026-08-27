@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from importlib import resources
@@ -19,6 +19,7 @@ from .validation import (
     _ensure_json_value,
     load_public_json,
     validate_public_artifact,
+    validate_run_policy,
 )
 
 
@@ -342,6 +343,31 @@ def _validated_public(kind: str, data: Any) -> dict[str, Any]:
     return value
 
 
+def _validated_run_policy(data: Any) -> dict[str, Any]:
+    failure_code: str | None = None
+    try:
+        value = validate_public_artifact("run_policy", data)
+    except ContractValidationError as error:
+        failure_code = error.code
+        value = None
+    except Exception:  # noqa: BLE001 - public/model boundary must not leak native errors
+        failure_code = "unsafe_policy"
+        value = None
+    if failure_code is not None or type(value) is not dict:
+        raise ModelValidationError(failure_code or "unsafe_policy")
+    try:
+        value = validate_run_policy(value)
+    except ContractValidationError as error:
+        failure_code = error.code
+        value = None
+    except Exception:  # noqa: BLE001 - public/model boundary must not leak native errors
+        failure_code = "unsafe_policy"
+        value = None
+    if failure_code is not None or type(value) is not dict:
+        raise ModelValidationError(failure_code or "unsafe_policy")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class DetectorWindows:
     repetition_events: int
@@ -451,7 +477,7 @@ class RunPolicy:
 
     @staticmethod
     def from_dict(data: Any) -> RunPolicy:
-        value = _validated_public("run_policy", data)
+        value = _validated_run_policy(data)
         detector_data = value["detectors"]
         windows = detector_data["windows"]
         thresholds = detector_data["thresholds"]
@@ -496,11 +522,32 @@ class RunPolicy:
     def to_dict(self) -> dict[str, Any]:
         try:
             source = self._source
-        except Exception as error:
-            raise ModelValidationError("invalid_model_state") from error
+        except AttributeError:
+            source = None
         if type(source) is not MappingProxyType:
             raise ModelValidationError("invalid_model_state")
-        return _validated_public("run_policy", _thaw_model_source(source))
+        try:
+            value = _thaw_model_source(source)
+        except ModelValidationError:
+            value = None
+        if type(value) is not dict:
+            raise ModelValidationError("unsafe_policy")
+        return _validated_run_policy(value)
+
+    def allows_reheat(self, finding_classes: Sequence[FindingClass]) -> bool:
+        """Allow only the fixed independent repetition/no-progress gate."""
+        policy = self.to_dict()
+        if type(finding_classes) not in (list, tuple):
+            raise ModelValidationError("invalid_finding_classes") from None
+        if any(type(finding) is not FindingClass for finding in finding_classes):
+            raise ModelValidationError("invalid_finding_classes") from None
+        observed = set(finding_classes)
+        return (
+            policy["recovery_ladder"]["reheat"]["permitted"] is True
+            and policy["max_recovery_episodes"] > 0
+            and FindingClass.REPETITION in observed
+            and FindingClass.NO_PROGRESS in observed
+        )
 
     def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
         return (RunPolicy.from_dict, (self.to_dict(),))
