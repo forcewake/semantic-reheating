@@ -39,6 +39,18 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/semantic_reheating"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"contracts/v1/run-policy.schema.json" = "semantic_reheating/contracts/v1/run-policy.schema.json"
+"contracts/v1/detector-finding.schema.json" = "semantic_reheating/contracts/v1/detector-finding.schema.json"
+"contracts/v1/decision-envelope.schema.json" = "semantic_reheating/contracts/v1/decision-envelope.schema.json"
+"contracts/v1/recovery-instruction.schema.json" = "semantic_reheating/contracts/v1/recovery-instruction.schema.json"
+"contracts/v1/recovery-outcome.schema.json" = "semantic_reheating/contracts/v1/recovery-outcome.schema.json"
+"contracts/v1/evidence-record.schema.json" = "semantic_reheating/contracts/v1/evidence-record.schema.json"
+
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 addopts = "-m 'not pressure_live'"
 markers = [

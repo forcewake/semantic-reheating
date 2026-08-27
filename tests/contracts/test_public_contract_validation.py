@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import zipfile
 from collections import UserDict
 from collections.abc import Iterator
 from copy import deepcopy
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +29,94 @@ def test_public_validation_api_exposes_the_six_closed_v1_artifacts() -> None:
         "recovery_outcome",
         "evidence_record",
     }
+
+
+def test_source_checkout_falls_back_to_authoritative_contracts() -> None:
+    """Source mode reads top-level contracts when no packaged resource exists."""
+    from semantic_reheating import validation
+
+    validation._VALIDATOR_CACHE.clear()
+    schema_path = resources.files("semantic_reheating").joinpath(
+        validation.PUBLIC_CONTRACT_SCHEMAS["run_policy"]
+    )
+    assert not schema_path.is_file()
+    fixture_data = json.loads(
+        (
+            PROJECT_ROOT / "tests" / "fixtures" / "contracts" / "minimal-run-policy.json"
+        ).read_text()
+    )
+    assert validation.validate_public_artifact("run_policy", fixture_data) == fixture_data
+
+
+def test_wheel_packages_authoritative_schemas_and_validates_outside_checkout(
+    tmp_path: Path,
+) -> None:
+    """The installed wheel is self-contained and its schemas cannot drift."""
+    wheel_dir = tmp_path / "wheels"
+    wheel_dir.mkdir()
+    subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(wheel_dir)],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheel = next(wheel_dir.glob("semantic_reheating-*.whl"))
+    with zipfile.ZipFile(wheel) as archive:
+        from semantic_reheating.validation import PUBLIC_CONTRACT_SCHEMAS
+
+        packaged_schema_paths = {
+            path
+            for path in archive.namelist()
+            if path.startswith("semantic_reheating/contracts/")
+        }
+        expected_schema_paths = {
+            f"semantic_reheating/contracts/v1/{Path(schema_path).name}"
+            for schema_path in PUBLIC_CONTRACT_SCHEMAS.values()
+        }
+        assert packaged_schema_paths == expected_schema_paths
+        assert len(packaged_schema_paths) == 6
+        for packaged_path in packaged_schema_paths:
+            authoritative_path = PROJECT_ROOT / "contracts" / "v1" / Path(packaged_path).name
+            assert archive.read(packaged_path) == authoritative_path.read_bytes()
+
+    target = tmp_path / "isolated-wheel"
+    subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--no-deps",
+            "--target",
+            str(target),
+            str(wheel),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    fixtures = {
+        kind: json.loads((PROJECT_ROOT / "tests" / "fixtures" / "contracts" / name).read_text())
+        for kind, name in ARTIFACTS.items()
+    }
+    script = """
+import json
+import os
+import semantic_reheating.validation as validation
+assert str(validation.__file__).startswith(os.environ["TARGET"]), validation.__file__
+for kind, value in json.loads(os.environ["FIXTURES"]).items():
+    validation.validate_public_artifact(kind, value)
+"""
+    environment = {**os.environ, "PYTHONPATH": str(target), "TARGET": str(target), "FIXTURES": json.dumps(fixtures)}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_run_policy_schema_and_minimal_fixture_validate() -> None:
@@ -678,3 +771,117 @@ def test_unknown_kind_is_typed_and_registry_is_closed() -> None:
             "trace_event", fixture("minimal-detector-finding.json")
         )
     assert caught.value.code == "unknown_artifact_kind"
+
+
+@pytest.mark.parametrize("container", [{}, []])
+def test_direct_cyclic_json_containers_fail_with_stable_typed_error(container: Any) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    if type(container) is dict:
+        container["cycle"] = container
+    else:
+        container.append(container)
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("detector_finding", container)
+    assert caught.value.code == "json_cycle"
+
+
+def test_direct_json_value_just_over_depth_limit_fails_closed() -> None:
+    from semantic_reheating.validation import (
+        MAX_JSON_DEPTH,
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    value: object = None
+    for _ in range(MAX_JSON_DEPTH + 1):
+        value = [value]
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("detector_finding", value)
+    assert caught.value.code == "json_depth_exceeded"
+
+
+def test_direct_json_value_just_over_node_limit_fails_closed() -> None:
+    from semantic_reheating.validation import (
+        MAX_JSON_NODES,
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("detector_finding", [None] * MAX_JSON_NODES)
+    assert caught.value.code == "json_node_limit_exceeded"
+
+
+def test_schema_validation_diagnostics_do_not_echo_sensitive_instance_values() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    sentinel = "__sensitive-contract-secret__"
+    invalid = fixture("minimal-decision-envelope.json")
+    invalid["decision"] = sentinel
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("decision_envelope", invalid)
+    assert caught.value.code == "schema_validation_error"
+    assert sentinel not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("source", "code", "secret"),
+    [
+        ('{"__sensitive-duplicate-key__": 1, "__sensitive-duplicate-key__": 2}', "duplicate_key", "__sensitive-duplicate-key__"),
+        ("not-used", "unknown_artifact_kind", "__sensitive-artifact-kind__"),
+        ("not-used", "unknown_contract_major", "__sensitive-contract-major__"),
+    ],
+)
+def test_public_validation_diagnostics_do_not_echo_caller_controlled_values(
+    source: str, code: str, secret: str
+) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        load_public_json,
+        validate_public_artifact,
+    )
+
+    with pytest.raises(ContractValidationError) as caught:
+        if code == "duplicate_key":
+            load_public_json(source)
+        elif code == "unknown_artifact_kind":
+            validate_public_artifact(secret, fixture("minimal-detector-finding.json"))
+        else:
+            invalid = fixture("minimal-detector-finding.json")
+            invalid["contract_version"] = secret
+            validate_public_artifact("detector_finding", invalid)
+    assert caught.value.code == code
+    assert secret not in str(caught.value)
+
+
+def test_run_policy_escalation_stage_requires_host_action() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    invalid = fixture("minimal-run-policy.json")
+    invalid["recovery_ladder"]["escalate"]["requires_host_action"] = False  # type: ignore[index]
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("run_policy", invalid)
+    assert caught.value.code == "schema_validation_error"
+
+
+def test_recovery_capable_decision_cannot_relax_non_idempotent_repeat_safety() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    invalid = fixture("minimal-decision-envelope.json")
+    invalid["constraints"]["no_non_idempotent_repeat"] = False  # type: ignore[index]
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("decision_envelope", invalid)
+    assert caught.value.code == "schema_validation_error"

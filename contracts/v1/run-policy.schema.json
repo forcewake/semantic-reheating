@@ -213,7 +213,7 @@
             "$ref": "#/$defs/recovery_stage_permission"
           },
           "escalate": {
-            "$ref": "#/$defs/recovery_stage_permission"
+            "$ref": "#/$defs/escalation_stage_permission"
           },
           "stop": {
             "$ref": "#/$defs/recovery_stage_permission"
@@ -434,6 +434,21 @@
         "requires_host_action"
       ],
       "description": "Closed permission record for one recovery stage."
+    },
+    "escalation_stage_permission": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/recovery_stage_permission"
+        },
+        {
+          "properties": {
+            "requires_host_action": {
+              "const": true
+            }
+          }
+        }
+      ],
+      "description": "Closed escalation permission requiring host action."
     }
   }
 }

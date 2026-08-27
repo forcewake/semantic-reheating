@@ -135,7 +135,7 @@
           "description": "Evidence must be preserved."
         },
         "no_non_idempotent_repeat": {
-          "type": "boolean",
+          "const": true,
           "description": "Non-idempotent repeat is prohibited."
         },
         "require_host_confirmation": {
