@@ -34,13 +34,32 @@
     "minimum_count": 2,
     "budget_can_substitute": false
   },
-  "recovery_ladder": [
-    {
-      "stage": "nudge",
+  "recovery_ladder": {
+    "nudge": {
+      "permitted": true,
+      "requires_host_action": false
+    },
+    "diagnose": {
+      "permitted": true,
+      "requires_host_action": false
+    },
+    "reheat": {
+      "permitted": true,
+      "requires_host_action": false
+    },
+    "restart": {
+      "permitted": true,
+      "requires_host_action": true
+    },
+    "escalate": {
+      "permitted": true,
+      "requires_host_action": true
+    },
+    "stop": {
       "permitted": true,
       "requires_host_action": false
     }
-  ],
+  },
   "budgets": {
     "per_intervention": {
       "turns": 1,

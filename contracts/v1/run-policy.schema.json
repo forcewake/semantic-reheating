@@ -197,43 +197,37 @@
       "description": "Required independent recovery-gate signals."
     },
     "recovery_ladder": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 7,
-      "uniqueItems": true,
-      "items": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "stage": {
-            "type": "string",
-            "enum": [
-              "nudge",
-              "diagnose",
-              "reheat",
-              "restart",
-              "escalate",
-              "stop"
-            ],
-            "description": "Recovery stage."
+          "nudge": {
+            "$ref": "#/$defs/recovery_stage_permission"
           },
-          "permitted": {
-            "type": "boolean",
-            "description": "Whether this advisory stage is permitted."
+          "diagnose": {
+            "$ref": "#/$defs/recovery_stage_permission"
           },
-          "requires_host_action": {
-            "type": "boolean",
-            "description": "Whether host action is required."
+          "reheat": {
+            "$ref": "#/$defs/recovery_stage_permission"
+          },
+          "restart": {
+            "$ref": "#/$defs/recovery_stage_permission"
+          },
+          "escalate": {
+            "$ref": "#/$defs/recovery_stage_permission"
+          },
+          "stop": {
+            "$ref": "#/$defs/recovery_stage_permission"
           }
         },
         "required": [
-          "stage",
-          "permitted",
-          "requires_host_action"
+          "nudge",
+          "diagnose",
+          "reheat",
+          "restart",
+          "escalate",
+          "stop"
         ],
-        "description": "Closed recovery ladder entry."
-      },
-      "description": "Closed recovery ladder permissions."
+        "description": "Complete, closed recovery stage permissions keyed by stage."
     },
     "budgets": {
       "type": "object",
@@ -420,5 +414,26 @@
     "max_reentry_depth",
     "side_effect_rules",
     "cooling_conditions"
-  ]
+  ],
+  "$defs": {
+    "recovery_stage_permission": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "permitted": {
+          "type": "boolean",
+          "description": "Whether this advisory stage is permitted."
+        },
+        "requires_host_action": {
+          "type": "boolean",
+          "description": "Whether host action is required."
+        }
+      },
+      "required": [
+        "permitted",
+        "requires_host_action"
+      ],
+      "description": "Closed permission record for one recovery stage."
+    }
+  }
 }

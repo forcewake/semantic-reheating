@@ -169,6 +169,59 @@ def test_closed_contracts_reject_wrong_scalar_and_collection_types(
     assert caught.value.code == "schema_validation_error"
 
 
+def test_run_policy_rejects_conflicting_duplicate_recovery_stage() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    invalid = fixture("minimal-run-policy.json")
+    invalid["recovery_ladder"] = [
+        {
+            "stage": "nudge",
+            "permitted": True,
+            "requires_host_action": False,
+        },
+        {
+            "stage": "nudge",
+            "permitted": False,
+            "requires_host_action": True,
+        },
+    ]
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("run_policy", invalid)
+    assert caught.value.code == "schema_validation_error"
+
+
+def test_run_policy_rejects_missing_recovery_stage() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    invalid = fixture("minimal-run-policy.json")
+    invalid["recovery_ladder"].pop("stop")  # type: ignore[index]
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("run_policy", invalid)
+    assert caught.value.code == "schema_validation_error"
+
+
+def test_run_policy_rejects_unknown_recovery_stage() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    invalid = fixture("minimal-run-policy.json")
+    invalid["recovery_ladder"]["override"] = {  # type: ignore[index]
+        "permitted": True,
+        "requires_host_action": False,
+    }
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("run_policy", invalid)
+    assert caught.value.code == "schema_validation_error"
+
+
 def test_decision_enum_is_closed_and_escalation_requires_host_action() -> None:
     from semantic_reheating.validation import (
         ContractValidationError,
@@ -212,6 +265,14 @@ def test_strict_json_loader_accepts_utf8_bytes_and_text_only() -> None:
     with pytest.raises(ContractValidationError) as caught:
         load_public_json(42)  # type: ignore[arg-type]
     assert caught.value.code == "non_json_input"
+
+
+def test_strict_json_loader_rejects_malformed_utf8_bytes() -> None:
+    from semantic_reheating.validation import ContractValidationError, load_public_json
+
+    with pytest.raises(ContractValidationError) as caught:
+        load_public_json(b'{"public":"\xff"}')
+    assert caught.value.code == "invalid_json_encoding"
 
 
 def test_validation_rejects_non_json_host_objects_and_nonfinite_direct_data() -> None:
