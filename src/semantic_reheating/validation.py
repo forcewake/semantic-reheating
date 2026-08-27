@@ -61,7 +61,13 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 # These limits bound validation work on untrusted public artifacts while allowing
-# substantially larger documents than the shipped v1 fixtures.
+# substantially larger documents than the shipped v1 fixtures. Raw input limits
+# protect decoding/parsing; traversal limits protect direct Python JSON values.
+MAX_JSON_INPUT_BYTES = 1_048_576
+MAX_JSON_INPUT_CHARS = 1_048_576
+MAX_JSON_STRING_CHARS = 262_144
+MAX_JSON_KEY_CHARS = 4_096
+MAX_JSON_AGGREGATE_CHARS = 1_048_576
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 10_000
 
@@ -71,6 +77,7 @@ def _ensure_json_value(value: Any) -> None:
     active_containers: set[int] = set()
     stack: list[tuple[Any, int, bool]] = [(value, 0, False)]
     node_count = 0
+    aggregate_chars = 0
     while stack:
         current, depth, leaving = stack.pop()
         if leaving:
@@ -86,7 +93,20 @@ def _ensure_json_value(value: Any) -> None:
             raise ContractValidationError(
                 "json_depth_exceeded", "JSON value exceeds the nesting-depth limit"
             )
-        if current is None or type(current) in (str, bool, int):
+        if type(current) is str:
+            string_chars = len(current)
+            if string_chars > MAX_JSON_STRING_CHARS:
+                raise ContractValidationError(
+                    "json_string_too_large", "JSON string exceeds the character limit"
+                )
+            aggregate_chars += string_chars
+            if aggregate_chars > MAX_JSON_AGGREGATE_CHARS:
+                raise ContractValidationError(
+                    "json_character_limit_exceeded",
+                    "JSON value exceeds the aggregate character limit",
+                )
+            continue
+        if current is None or type(current) in (bool, int):
             continue
         if type(current) is float:
             if math.isfinite(current):
@@ -104,6 +124,17 @@ def _ensure_json_value(value: Any) -> None:
                 if type(key) is not str:
                     raise ContractValidationError(
                         "non_json_data", "JSON object keys must be strings"
+                    )
+                key_chars = len(key)
+                if key_chars > MAX_JSON_KEY_CHARS:
+                    raise ContractValidationError(
+                        "json_key_too_large", "JSON object key exceeds the character limit"
+                    )
+                aggregate_chars += key_chars
+                if aggregate_chars > MAX_JSON_AGGREGATE_CHARS:
+                    raise ContractValidationError(
+                        "json_character_limit_exceeded",
+                        "JSON value exceeds the aggregate character limit",
                     )
                 stack.append((nested, depth + 1, False))
             continue
@@ -127,8 +158,13 @@ def _ensure_json_value(value: Any) -> None:
 
 def load_public_json(source: str | bytes | bytearray) -> Any:
     """Load one public JSON text/byte payload without permissive JSON extensions."""
-    if isinstance(source, bytearray):
-        source = bytes(source)
+    if isinstance(source, (bytes, bytearray)):
+        if len(source) > MAX_JSON_INPUT_BYTES:
+            raise ContractValidationError(
+                "json_input_too_large", "JSON input exceeds the byte limit"
+            )
+        if isinstance(source, bytearray):
+            source = bytes(source)
     if isinstance(source, bytes):
         try:
             source = source.decode("utf-8", errors="strict")
@@ -139,6 +175,10 @@ def load_public_json(source: str | bytes | bytearray) -> Any:
     if not isinstance(source, str):
         raise ContractValidationError(
             "non_json_input", "JSON loader accepts text or bytes only"
+        )
+    if len(source) > MAX_JSON_INPUT_CHARS:
+        raise ContractValidationError(
+            "json_input_too_large", "JSON input exceeds the character limit"
         )
     try:
         data = json.loads(
@@ -155,11 +195,17 @@ def load_public_json(source: str | bytes | bytearray) -> Any:
     return data
 
 
-def _validator_for(kind: str) -> Draft202012Validator:
-    if not isinstance(kind, str) or kind not in PUBLIC_CONTRACT_SCHEMAS:
+def _ensure_public_artifact_kind(kind: object) -> str:
+    """Accept an exact built-in registered kind before mapping operations."""
+    if type(kind) is not str or kind not in PUBLIC_CONTRACT_SCHEMAS:
         raise ContractValidationError(
             "unknown_artifact_kind", "Unknown public artifact kind"
         )
+    return kind
+
+
+def _validator_for(kind: str) -> Draft202012Validator:
+    kind = _ensure_public_artifact_kind(kind)
     if kind not in _VALIDATOR_CACHE:
         try:
             schema_resource = resources.files("semantic_reheating").joinpath(
@@ -201,6 +247,7 @@ def _check_contract_major(data: Any) -> None:
 
 def validate_public_artifact(kind: str, data: Any) -> Any:
     """Validate real public artifact data against its closed v1 contract."""
+    kind = _ensure_public_artifact_kind(kind)
     if isinstance(data, (str, bytes, bytearray)):
         data = load_public_json(data)
     else:

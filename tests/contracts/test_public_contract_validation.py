@@ -734,6 +734,21 @@ def test_strict_json_loader_accepts_utf8_bytes_and_text_only() -> None:
     assert caught.value.code == "non_json_input"
 
 
+@pytest.mark.parametrize("source_kind", ["text", "bytes"])
+def test_strict_json_loader_rejects_oversized_raw_text_and_bytes(
+    source_kind: str,
+) -> None:
+    from semantic_reheating.validation import ContractValidationError, load_public_json
+
+    limit = 1_048_576
+    source = " " * limit + "0"
+    if source_kind == "bytes":
+        source = source.encode("utf-8")
+    with pytest.raises(ContractValidationError) as caught:
+        load_public_json(source)
+    assert caught.value.code == "json_input_too_large"
+
+
 def test_strict_json_loader_rejects_malformed_utf8_bytes() -> None:
     from semantic_reheating.validation import ContractValidationError, load_public_json
 
@@ -760,6 +775,42 @@ def test_validation_rejects_non_json_host_objects_and_nonfinite_direct_data() ->
     assert caught.value.code == "non_json_data"
 
 
+def test_direct_json_string_just_over_limit_fails_closed() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("detector_finding", ["s" * 262_145])
+    assert caught.value.code == "json_string_too_large"
+
+
+def test_direct_json_key_just_over_limit_fails_closed() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    key = "__oversized-json-key__" + "k" * 4_075
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("detector_finding", {key: None})
+    assert caught.value.code == "json_key_too_large"
+    assert key not in str(caught.value)
+
+
+def test_direct_json_strings_over_aggregate_limit_fail_closed() -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    value = ["s" * 262_144] * 5
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact("detector_finding", value)
+    assert caught.value.code == "json_character_limit_exceeded"
+
+
 def test_unknown_kind_is_typed_and_registry_is_closed() -> None:
     from semantic_reheating.validation import (
         ContractValidationError,
@@ -771,6 +822,40 @@ def test_unknown_kind_is_typed_and_registry_is_closed() -> None:
             "trace_event", fixture("minimal-detector-finding.json")
         )
     assert caught.value.code == "unknown_artifact_kind"
+
+
+@pytest.mark.parametrize(
+    "hostile_kind",
+    [
+        type(
+            "HostileDisplayKind",
+            (str,),
+            {"__str__": lambda self: "__hostile-kind-display__"},
+        )("detector_finding"),
+        type(
+            "HostileHashKind",
+            (str,),
+            {
+                "__hash__": lambda self: (_ for _ in ()).throw(
+                    RuntimeError("__hostile-kind-hash__")
+                )
+            },
+        )("detector_finding"),
+    ],
+)
+def test_str_subclass_artifact_kinds_are_rejected_before_hostile_methods(
+    hostile_kind: str,
+) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        validate_public_artifact,
+    )
+
+    with pytest.raises(ContractValidationError) as caught:
+        validate_public_artifact(hostile_kind, fixture("minimal-detector-finding.json"))
+    assert caught.value.code == "unknown_artifact_kind"
+    assert "__hostile-kind-display__" not in str(caught.value)
+    assert "__hostile-kind-hash__" not in str(caught.value)
 
 
 @pytest.mark.parametrize("container", [{}, []])
