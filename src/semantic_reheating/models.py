@@ -195,7 +195,10 @@ class BudgetCounters:
         if any(type(value) is not int or value < 0 for value in (turns, tool_calls, tokens)):
             raise ModelValidationError("invalid_budget_counters")
         if any(
-            type(value) not in (int, float) or not math.isfinite(value) or value < 0
+            not (
+                (type(value) is int and value >= 0)
+                or (type(value) is float and math.isfinite(value) and value >= 0)
+            )
             for value in (elapsed_seconds, cost)
         ):
             raise ModelValidationError("invalid_budget_counters")
@@ -300,6 +303,9 @@ class TraceEvent:
         if type(source) is not MappingProxyType:
             raise ModelValidationError("invalid_model_state")
         return _validate_trace(_thaw_model_source(source))
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        return (TraceEvent.from_dict, (self.to_dict(),))
 
 
 def parse_trace(events: Any) -> tuple[TraceEvent, ...]:
@@ -496,6 +502,9 @@ class RunPolicy:
             raise ModelValidationError("invalid_model_state")
         return _validated_public("run_policy", _thaw_model_source(source))
 
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        return (RunPolicy.from_dict, (self.to_dict(),))
+
 
 @dataclass(frozen=True, slots=True)
 class DecisionConstraints:
@@ -588,3 +597,6 @@ class DecisionEnvelope:
         if type(source) is not MappingProxyType:
             raise ModelValidationError("invalid_model_state")
         return _validated_public("decision_envelope", _thaw_model_source(source))
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        return (DecisionEnvelope.from_dict, (self.to_dict(),))

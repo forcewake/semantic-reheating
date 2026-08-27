@@ -426,6 +426,27 @@ def test_budget_counters_from_dict_requires_exact_public_shape_and_roundtrips() 
     assert BudgetCounters.from_dict(valid).to_dict() == valid
 
 
+@pytest.mark.parametrize("field", ("elapsed_seconds", "cost"))
+def test_budget_counters_preserve_huge_exact_integer_dimensions(field: str) -> None:
+    from semantic_reheating.models import BudgetCounters
+
+    huge = 10**1000
+    values: dict[str, Any] = {
+        "turns": 1,
+        "tool_calls": 2,
+        "tokens": 3,
+        "elapsed_seconds": 4.5,
+        "cost": 6.0,
+    }
+    values[field] = huge
+
+    direct = BudgetCounters(**values)
+    parsed = BudgetCounters.from_dict(values)
+
+    assert getattr(direct, field) == huge
+    assert parsed.to_dict() == values
+
+
 def test_budget_counters_to_dict_revalidates_tampered_state() -> None:
     import pytest
 
@@ -465,6 +486,66 @@ def test_all_valid_core_and_nested_models_have_no_public_dict() -> None:
         DecisionEnvelope.from_dict(_fixture("minimal-decision-envelope.json")),
     ):
         assert_slots(model)
+
+
+@pytest.mark.parametrize(
+    ("model_class", "fixture_name"),
+    (
+        ("TraceEvent", "minimal-trace-event.json"),
+        ("RunPolicy", "minimal-run-policy.json"),
+        ("DecisionEnvelope", "minimal-decision-envelope.json"),
+    ),
+)
+@pytest.mark.parametrize("operation", ("deepcopy", "pickle"))
+def test_core_models_copy_and_pickle_via_validated_exact_reconstruction(
+    model_class: str, fixture_name: str, operation: str
+) -> None:
+    import pickle
+
+    from semantic_reheating import models
+
+    model_type = getattr(models, model_class)
+    model = model_type.from_dict(_fixture(fixture_name))
+    copied = deepcopy(model) if operation == "deepcopy" else pickle.loads(pickle.dumps(model))
+
+    assert type(copied) is model_type
+    assert copied is not model
+    assert copied.to_dict() == model.to_dict()
+
+
+@pytest.mark.parametrize(
+    ("model_class", "fixture_name"),
+    (
+        ("TraceEvent", "minimal-trace-event.json"),
+        ("RunPolicy", "minimal-run-policy.json"),
+        ("DecisionEnvelope", "minimal-decision-envelope.json"),
+    ),
+)
+@pytest.mark.parametrize("operation", ("deepcopy", "pickle"))
+def test_core_model_copy_and_pickle_reject_forged_invalid_sources_without_leaks(
+    model_class: str, fixture_name: str, operation: str
+) -> None:
+    import pickle
+    from types import MappingProxyType
+
+    import pytest
+
+    from semantic_reheating import models
+    from semantic_reheating.models import ModelValidationError
+
+    sentinel = "__forged-copy-source-secret__"
+    model_type = getattr(models, model_class)
+    forged = object.__new__(model_type)
+    object.__setattr__(
+        forged,
+        "_source",
+        MappingProxyType({"contract_version": "2.0", "secret": sentinel}),
+    )
+
+    with pytest.raises(ModelValidationError) as caught:
+        deepcopy(forged) if operation == "deepcopy" else pickle.dumps(forged)
+    assert caught.value.code == "unknown_contract_major"
+    assert sentinel not in str(caught.value)
 
 
 def test_trace_event_is_deeply_immutable_and_to_dict_is_fresh() -> None:
