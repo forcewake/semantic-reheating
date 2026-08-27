@@ -734,6 +734,68 @@ def test_strict_json_loader_accepts_utf8_bytes_and_text_only() -> None:
     assert caught.value.code == "non_json_input"
 
 
+class _HostileRawStr(str):
+    def __len__(self) -> int:
+        raise RuntimeError("__hostile-raw-str-len__")
+
+    def __str__(self) -> str:
+        raise RuntimeError("__hostile-raw-str-str__")
+
+
+class _HostileRawBytes(bytes):
+    def __len__(self) -> int:
+        raise RuntimeError("__hostile-raw-bytes-len__")
+
+    def decode(self, *args: object, **kwargs: object) -> str:
+        raise RuntimeError("__hostile-raw-bytes-decode__")
+
+
+class _HostileRawBytearray(bytearray):
+    def __len__(self) -> int:
+        raise RuntimeError("__hostile-raw-bytearray-len__")
+
+    def __bytes__(self) -> bytes:
+        raise RuntimeError("__hostile-raw-bytearray-bytes__")
+
+
+_HOSTILE_RAW_SENTINELS = (
+    "__hostile-raw-str-len__",
+    "__hostile-raw-str-str__",
+    "__hostile-raw-bytes-len__",
+    "__hostile-raw-bytes-decode__",
+    "__hostile-raw-bytearray-len__",
+    "__hostile-raw-bytearray-bytes__",
+)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        _HostileRawStr('{"public":true}'),
+        _HostileRawBytes(b'{"public":true}'),
+        _HostileRawBytearray(b'{"public":true}'),
+    ],
+    ids=["str-subclass", "bytes-subclass", "bytearray-subclass"],
+)
+@pytest.mark.parametrize("api", ["loader", "artifact"])
+def test_hostile_raw_input_subclasses_are_rejected_before_methods_run(
+    source: str | bytes | bytearray, api: str
+) -> None:
+    from semantic_reheating.validation import (
+        ContractValidationError,
+        load_public_json,
+        validate_public_artifact,
+    )
+
+    with pytest.raises(ContractValidationError) as caught:
+        if api == "loader":
+            load_public_json(source)
+        else:
+            validate_public_artifact("detector_finding", source)
+    assert caught.value.code == "non_json_input"
+    assert all(sentinel not in str(caught.value) for sentinel in _HOSTILE_RAW_SENTINELS)
+
+
 @pytest.mark.parametrize("source_kind", ["text", "bytes"])
 def test_strict_json_loader_rejects_oversized_raw_text_and_bytes(
     source_kind: str,

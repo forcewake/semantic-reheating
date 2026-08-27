@@ -158,6 +158,10 @@ def _ensure_json_value(value: Any) -> None:
 
 def load_public_json(source: str | bytes | bytearray) -> Any:
     """Load one public JSON text/byte payload without permissive JSON extensions."""
+    if type(source) not in (str, bytes, bytearray):
+        raise ContractValidationError(
+            "non_json_input", "JSON loader accepts text or bytes only"
+        )
     if isinstance(source, (bytes, bytearray)):
         if len(source) > MAX_JSON_INPUT_BYTES:
             raise ContractValidationError(
