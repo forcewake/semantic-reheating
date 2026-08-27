@@ -1,15 +1,51 @@
 """Deterministic progress classification from validated trace facts.
 
-Payloads are opaque except for the exact documented shapes interpreted by this
-module.  Classification never treats message or plan prose as evidence.
+Only the exact markers below are evidence; changed prose and unmarked payload
+keys never establish progress.
+
+* ``pagination_cursor`` (exact JSON scalar) and ``batch_item_id`` (exact
+  string) are read only from ``tool_result`` and ``state_observation`` object
+  payloads. Their first observation is a baseline; a later value not previously
+  observed establishes the corresponding reason.
+* ``hypothesis_id`` (nonempty string) and ``hypothesis_test_input`` (any exact
+  JSON value) are read only from ``tool_call`` object payloads. The first
+  fingerprint per hypothesis is a baseline; a later material input not seen for
+  that hypothesis establishes progress. Input object keys ``event_id``,
+  ``timestamp``, and ``request_id`` are excluded only at their exact immediate
+  input paths.
+* ``error_fingerprint`` (nonempty string field) and ``stack_frames`` (list of
+  strings in the object payload) are read only from ``error`` events. The first
+  error is a baseline; a later new fingerprint or frame establishes progress.
+* ``evidence_refs`` is an exact array of strings read only from the dedicated
+  trace-event field. The first event in the window is a baseline; a later event
+  with a new reference establishes progress.
+* ``eliminated_hypotheses`` is read only from a ``plan`` object payload and
+  must be a nonempty list of nonempty strings. The first qualifying plan is a
+  baseline; a later qualifying plan with a new identifier establishes progress.
+* ``required_verification`` must be exactly ``true`` in an
+  ``acceptance_check`` object payload. It establishes a baseline only when seen
+  on an acceptance check; only a later acceptance check with the same marker
+  and a nonempty string ``acceptance_delta`` establishes progress.
+* ``new_plan_id`` (nonempty string) or ``new_capabilities`` (nonempty list of
+  nonempty strings) is read only from a ``handoff`` object payload and directly
+  establishes a productive handoff.
+* ``expected_state_change`` must be exactly ``true`` on any event and have a
+  current or prior nonempty ``state_fingerprint`` baseline; only a later
+  ``state_observation`` with a different nonempty ``state_fingerprint``
+  establishes progress.
+* ``poll_id`` (nonempty string), ``poll_value``, and ``poll_target`` (exact
+  finite ``int`` or ``float``, never ``bool``) are read only from
+  ``state_observation`` object payloads. The first value per poll/target is a
+  baseline; a later same-target event with a strictly smaller exact rational
+  distance establishes convergence.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from decimal import Decimal
 from enum import Enum
+from fractions import Fraction
 from itertools import pairwise
 from typing import Any
 
@@ -127,24 +163,32 @@ def _scalar_key(value: Any) -> tuple[type[Any], Any] | None:
 
 
 def _hypothesis_fingerprint(value: Any) -> str | None:
-    """Return a redacted canonical input fingerprint, or ignore a bad boundary."""
+    """Return a canonical fingerprint for every JSON input value shape."""
+    nested_volatile_paths = (
+        "/hypothesis_test_input/event_id",
+        "/hypothesis_test_input/timestamp",
+        "/hypothesis_test_input/request_id",
+    )
     try:
-        return action_fingerprint(value).digest
+        return action_fingerprint(
+            {"hypothesis_test_input": value},
+            excluded_paths=nested_volatile_paths if type(value) is dict else (),
+        ).digest
     except Exception:  # noqa: BLE001 - malformed opaque payloads are no-progress.
         return None
 
 
-def _poll_number(value: Any) -> Decimal | None:
-    """Return an exact Decimal for an exact finite documented poll number."""
+def _poll_number(value: Any) -> Fraction | None:
+    """Return an exact rational for an exact finite documented poll number."""
     if type(value) is int:
-        return Decimal(value)
+        return Fraction(value)
     if type(value) is float and math.isfinite(value):
-        return Decimal.from_float(value)
+        return Fraction.from_float(value)
     return None
 
 
-def _poll_distance(value: Any, target: Any) -> Decimal | None:
-    """Return an exact finite numeric distance for documented poll values."""
+def _poll_distance(value: Any, target: Any) -> Fraction | None:
+    """Return an exact finite rational distance for documented poll values."""
     numeric_value = _poll_number(value)
     numeric_target = _poll_number(target)
     if numeric_value is None or numeric_target is None:
@@ -157,12 +201,13 @@ def _assessment(reasons: list[ProgressReason], event_ids: list[str]) -> Progress
 
 
 def classify_progress(trace: Any) -> ProgressAssessment:
-    """Classify progress from documented factual fields in one contiguous window.
+    """Classify one contiguous window using only the module marker contract.
 
-    Pagination and batches inspect only ``tool_result`` or ``state_observation``
-    object payloads. ``pagination_cursor`` must be an exact JSON scalar;
-    ``batch_item_id`` must be an exact string. The initial observation is only a
-    baseline, while a later value not observed earlier establishes progress.
+    The module docstring lists every exact marker, its allowed event kind and
+    type, and its baseline rule. In particular, marker-like prose, fields on an
+    unauthorized kind, and unmarked payload keys are no-progress. This function
+    returns each of the closed eleven reasons at most once, supported only by
+    the event identifier that supplied the qualifying later evidence.
     """
     events = _validated_window(trace)
     seen_cursors: set[tuple[type[Any], Any]] = set()
@@ -173,10 +218,12 @@ def classify_progress(trace: Any) -> ProgressAssessment:
     has_error_baseline = False
     seen_evidence_refs: set[str] = set()
     seen_eliminated_hypotheses: set[str] = set()
+    has_plan_elimination_baseline = False
+    has_required_acceptance_baseline = False
     has_prior_event = False
     last_state_fingerprint: str | None = None
     pending_state_expectations: list[tuple[str, int]] = []
-    poll_baselines: dict[str, tuple[Decimal, Decimal]] = {}
+    poll_baselines: dict[str, tuple[Fraction, Fraction]] = {}
     reasons: list[ProgressReason] = []
     event_ids: list[str] = []
     for event in events:
@@ -195,16 +242,16 @@ def classify_progress(trace: Any) -> ProgressAssessment:
             last_state_fingerprint = fingerprint
         elif type(fingerprint) is str and fingerprint:
             last_state_fingerprint = fingerprint
-        if (
-            event.kind is TraceKind.ACCEPTANCE_CHECK
-            and type(payload) is dict
-            and payload.get("required_verification") is True
-            and type(event.acceptance_delta) is str
-            and event.acceptance_delta
-            and ProgressReason.REQUIRED_ACCEPTANCE_VERIFIED not in reasons
-        ):
-            reasons.append(ProgressReason.REQUIRED_ACCEPTANCE_VERIFIED)
-            event_ids.append(event.event_id)
+        if event.kind is TraceKind.ACCEPTANCE_CHECK and type(payload) is dict and payload.get("required_verification") is True:
+            if (
+                has_required_acceptance_baseline
+                and type(event.acceptance_delta) is str
+                and event.acceptance_delta
+                and ProgressReason.REQUIRED_ACCEPTANCE_VERIFIED not in reasons
+            ):
+                reasons.append(ProgressReason.REQUIRED_ACCEPTANCE_VERIFIED)
+                event_ids.append(event.event_id)
+            has_required_acceptance_baseline = True
         if event.kind is TraceKind.HANDOFF and type(payload) is dict:
             plan_id = payload.get("new_plan_id")
             capabilities = payload.get("new_capabilities")
@@ -222,13 +269,18 @@ def classify_progress(trace: Any) -> ProgressAssessment:
             reasons.append(ProgressReason.EVIDENCE_ADDED)
             event_ids.append(event.event_id)
         seen_evidence_refs.update(evidence_refs)
-        eliminated = payload.get("eliminated_hypotheses") if payload is not None else None
+        eliminated = payload.get("eliminated_hypotheses") if event.kind is TraceKind.PLAN and payload is not None else None
         if type(eliminated) is list and eliminated and all(type(item) is str and item for item in eliminated):
             unseen_hypotheses = [item for item in eliminated if item not in seen_eliminated_hypotheses]
-            if has_prior_event and unseen_hypotheses and ProgressReason.HYPOTHESIS_ELIMINATED not in reasons:
+            if (
+                has_plan_elimination_baseline
+                and unseen_hypotheses
+                and ProgressReason.HYPOTHESIS_ELIMINATED not in reasons
+            ):
                 reasons.append(ProgressReason.HYPOTHESIS_ELIMINATED)
                 event_ids.append(event.event_id)
             seen_eliminated_hypotheses.update(eliminated)
+            has_plan_elimination_baseline = True
         if event.kind is TraceKind.ERROR:
             fingerprint = event.error_fingerprint
             if type(fingerprint) is str and fingerprint:

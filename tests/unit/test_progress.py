@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 
 def _event(
     sequence: int,
@@ -105,6 +107,76 @@ def test_hypothesis_input_progress_requires_an_explicit_marker_and_new_fingerpri
     assert classify_progress(unmarked_arguments).made_progress is False
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    (
+        ("alpha", "beta"),
+        (None, True),
+        (True, False),
+        (1, 2),
+        (1.25, 2.5),
+        (["one"], ["two"]),
+        ({"query": "one"}, {"query": "two"}),
+    ),
+)
+def test_hypothesis_input_progress_distinguishes_json_value_shapes(
+    first: object, second: object
+) -> None:
+    from semantic_reheating.progress import ProgressReason, classify_progress
+
+    assessment = classify_progress(
+        (
+            _event(4, kind="tool_call", payload={"hypothesis_id": "h", "hypothesis_test_input": first}),
+            _event(5, kind="tool_call", payload={"hypothesis_id": "h", "hypothesis_test_input": second}),
+        )
+    )
+
+    assert assessment.reason_codes == (ProgressReason.HYPOTHESIS_INPUT_CHANGED,)
+    assert assessment.supporting_event_ids == ("event-005",)
+
+
+def test_hypothesis_input_fingerprinting_is_canonical_and_excludes_nested_volatile_fields() -> None:
+    from semantic_reheating.progress import classify_progress
+
+    same_semantic_object = classify_progress(
+        (
+            _event(
+                4,
+                kind="tool_call",
+                payload={"hypothesis_id": "h", "hypothesis_test_input": {"a": 1, "b": 2}},
+            ),
+            _event(
+                5,
+                kind="tool_call",
+                payload={"hypothesis_id": "h", "hypothesis_test_input": {"b": 2, "a": 1}},
+            ),
+        )
+    )
+    volatile_only = classify_progress(
+        (
+            _event(
+                4,
+                kind="tool_call",
+                payload={
+                    "hypothesis_id": "h",
+                    "hypothesis_test_input": {"query": "same", "event_id": "one", "timestamp": "old", "request_id": "a"},
+                },
+            ),
+            _event(
+                5,
+                kind="tool_call",
+                payload={
+                    "hypothesis_id": "h",
+                    "hypothesis_test_input": {"query": "same", "event_id": "two", "timestamp": "new", "request_id": "b"},
+                },
+            ),
+        )
+    )
+
+    assert same_semantic_object.made_progress is False
+    assert volatile_only.made_progress is False
+
+
 def test_error_fingerprint_changes_and_new_stack_frames_are_progress() -> None:
     from semantic_reheating.progress import ProgressReason, classify_progress
 
@@ -145,8 +217,8 @@ def test_evidence_and_eliminated_hypotheses_require_a_prior_window_baseline() ->
     )
     elimination = classify_progress(
         (
-            _event(4, payload={"eliminated_hypotheses": ["h-1"]}),
-            _event(5, payload={"eliminated_hypotheses": ["h-1", "h-2"]}),
+            _event(4, kind="plan", payload={"eliminated_hypotheses": ["h-1"]}),
+            _event(5, kind="plan", payload={"eliminated_hypotheses": ["h-1", "h-2"]}),
         )
     )
 
@@ -157,16 +229,56 @@ def test_evidence_and_eliminated_hypotheses_require_a_prior_window_baseline() ->
     assert classify_progress((_event(4, evidence_refs=["evidence://one"]),)).made_progress is False
     assert classify_progress(
         (
-            _event(4, payload={"eliminated_hypotheses": ["h-1"]}),
-            _event(5, payload={"eliminated_hypotheses": ["h-1"]}),
+            _event(4, kind="plan", payload={"eliminated_hypotheses": ["h-1"]}),
+            _event(5, kind="plan", payload={"eliminated_hypotheses": ["h-1"]}),
         )
     ).made_progress is False
 
 
-def test_acceptance_progress_requires_trace_contract_verification_evidence() -> None:
+@pytest.mark.parametrize("kind", ("message", "tool_call", "state_observation"))
+def test_eliminated_hypotheses_marker_is_ignored_outside_plan_events(kind: str) -> None:
+    from semantic_reheating.progress import classify_progress
+
+    assessment = classify_progress(
+        (
+            _event(4, kind=kind, payload={"eliminated_hypotheses": ["h-1"]}),
+            _event(5, kind=kind, payload={"eliminated_hypotheses": ["h-1", "h-2"]}),
+        )
+    )
+
+    assert assessment.made_progress is False
+
+
+def test_acceptance_progress_requires_a_required_acceptance_check_rerun() -> None:
     from semantic_reheating.progress import ProgressReason, classify_progress
 
     verified = classify_progress(
+        (
+            _event(
+                4,
+                kind="acceptance_check",
+                payload={"required_verification": True},
+                acceptance_delta="criterion satisfied",
+            ),
+            _event(
+                5,
+                kind="acceptance_check",
+                payload={"required_verification": True},
+                acceptance_delta="criterion satisfied again",
+            ),
+        )
+    )
+    singleton_required = classify_progress(
+        (
+            _event(
+                4,
+                kind="acceptance_check",
+                payload={"required_verification": True},
+                acceptance_delta="criterion satisfied",
+            ),
+        )
+    )
+    unrelated_then_required = classify_progress(
         (
             _event(4),
             _event(
@@ -177,21 +289,45 @@ def test_acceptance_progress_requires_trace_contract_verification_evidence() -> 
             ),
         )
     )
-    unrequired = classify_progress(
+    unrequired_then_required = classify_progress(
         (
-            _event(4),
             _event(
-                5,
+                4,
                 kind="acceptance_check",
                 payload={"required_verification": False},
                 acceptance_delta="criterion satisfied",
+            ),
+            _event(
+                5,
+                kind="acceptance_check",
+                payload={"required_verification": True},
+                acceptance_delta="criterion satisfied",
+            ),
+        )
+    )
+    empty_rerun = classify_progress(
+        (
+            _event(
+                4,
+                kind="acceptance_check",
+                payload={"required_verification": True},
+                acceptance_delta="criterion satisfied",
+            ),
+            _event(
+                5,
+                kind="acceptance_check",
+                payload={"required_verification": True},
+                acceptance_delta="",
             ),
         )
     )
 
     assert verified.reason_codes == (ProgressReason.REQUIRED_ACCEPTANCE_VERIFIED,)
     assert verified.supporting_event_ids == ("event-005",)
-    assert unrequired.made_progress is False
+    assert singleton_required.made_progress is False
+    assert unrelated_then_required.made_progress is False
+    assert unrequired_then_required.made_progress is False
+    assert empty_rerun.made_progress is False
 
 
 def test_productive_handoff_requires_a_new_plan_or_capability() -> None:
@@ -275,6 +411,43 @@ def test_poll_convergence_requires_a_same_target_distance_decrease_per_poll() ->
 
     assert assessment.reason_codes == (ProgressReason.POLL_CONVERGING,)
     assert assessment.supporting_event_ids == ("event-006",)
+
+
+def test_poll_convergence_compares_unbounded_integer_distances_exactly() -> None:
+    from semantic_reheating.progress import ProgressReason, classify_progress
+
+    converging = classify_progress(
+        (
+            _event(
+                4,
+                kind="state_observation",
+                payload={"poll_id": "p", "poll_value": 10**1000 + 1, "poll_target": 0},
+            ),
+            _event(
+                5,
+                kind="state_observation",
+                payload={"poll_id": "p", "poll_value": 10**1000, "poll_target": 0},
+            ),
+        )
+    )
+    diverging = classify_progress(
+        (
+            _event(
+                4,
+                kind="state_observation",
+                payload={"poll_id": "p", "poll_value": 10**1000, "poll_target": 0},
+            ),
+            _event(
+                5,
+                kind="state_observation",
+                payload={"poll_id": "p", "poll_value": 10**1000 + 1, "poll_target": 0},
+            ),
+        )
+    )
+
+    assert converging.reason_codes == (ProgressReason.POLL_CONVERGING,)
+    assert converging.supporting_event_ids == ("event-005",)
+    assert diverging.made_progress is False
 
 
 def test_poll_controls_and_non_poll_payload_kinds_are_not_progress() -> None:
@@ -480,10 +653,7 @@ def test_one_event_can_support_multiple_reasons_with_one_supporting_id() -> None
         )
     )
 
-    assert assessment.reason_codes == (
-        ProgressReason.REQUIRED_ACCEPTANCE_VERIFIED,
-        ProgressReason.EVIDENCE_ADDED,
-    )
+    assert assessment.reason_codes == (ProgressReason.EVIDENCE_ADDED,)
     assert assessment.supporting_event_ids == ("event-005",)
 
 
