@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 
 def test_console_help_is_available_offline() -> None:
+    project_root = Path(__file__).resolve().parents[1]
     executable = (
-        Path(".venv") / "Scripts" / "reheat.exe"
+        project_root / ".venv" / "Scripts" / "reheat.exe"
         if os.name == "nt"
-        else Path(".venv") / "bin" / "reheat"
+        else project_root / ".venv" / "bin" / "reheat"
     )
     assert executable.is_file(), f"project-local console executable is missing: {executable}"
 
