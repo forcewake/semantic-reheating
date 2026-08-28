@@ -62,8 +62,8 @@ def _slug(heading: str) -> str:
     return re.sub(r"[ _]+", "-", normalized).strip("-")
 
 
-def _reject_symlink_components(root: Path, lexical_target: Path) -> None:
-    """Reject links before resolution so a symlink cannot escape lexical checks."""
+def _validate_lexical_link_components(root: Path, lexical_target: Path) -> None:
+    """Validate currently-existing lexical components before resolution."""
     root_stat = root.lstat()
     assert stat.S_ISDIR(root_stat.st_mode) and not stat.S_ISLNK(root_stat.st_mode)
     try:
@@ -73,13 +73,21 @@ def _reject_symlink_components(root: Path, lexical_target: Path) -> None:
             f"path escapes project root before resolution: {lexical_target}"
         ) from error
     current = root
-    for part in relative.parts:
+    for index, part in enumerate(relative.parts):
         current /= part
         try:
             component_stat = current.lstat()
         except FileNotFoundError:
             continue
         assert not stat.S_ISLNK(component_stat.st_mode), f"symlink component: {current}"
+        if index == len(relative.parts) - 1:
+            assert stat.S_ISREG(component_stat.st_mode), (
+                f"non-regular final component: {current}"
+            )
+        else:
+            assert stat.S_ISDIR(component_stat.st_mode), (
+                f"non-directory intermediate component: {current}"
+            )
 
 
 def _validate_links(
@@ -101,7 +109,7 @@ def _validate_links(
         link_path, separator, fragment = decoded.partition("#")
         assert link_path, target
         lexical_target = (path.parent / link_path).absolute()
-        _reject_symlink_components(root, lexical_target)
+        _validate_lexical_link_components(root, lexical_target)
         try:
             target_path = lexical_target.resolve(strict=True)
         except (OSError, RuntimeError) as error:
@@ -113,6 +121,39 @@ def _validate_links(
             target_text = target_path.read_text(encoding="utf-8")
             headings = {_slug(value) for value in HEADING.findall(target_text)}
             assert fragment in headings, target
+
+
+def _reject_fifo_consumption(monkeypatch: pytest.MonkeyPatch, fifo: Path) -> None:
+    original_resolve = Path.resolve
+    original_stat = Path.stat
+    original_read_text = Path.read_text
+
+    def contains_fifo(candidate: Path) -> bool:
+        normalized = Path(os.path.normpath(candidate))
+        return normalized == fifo or fifo in normalized.parents
+
+    def reject_fifo_resolve(candidate: Path, strict: bool = False) -> Path:
+        if contains_fifo(candidate):
+            raise AssertionError("FIFO must be rejected before stat, open, or resolve")
+        return original_resolve(candidate, strict=strict)
+
+    def reject_fifo_stat(
+        candidate: Path, *, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        if follow_symlinks and contains_fifo(candidate):
+            raise AssertionError("FIFO must be rejected before stat, open, or resolve")
+        return original_stat(candidate, follow_symlinks=follow_symlinks)
+
+    def reject_fifo_read_text(
+        candidate: Path, encoding: str | None = None, errors: str | None = None
+    ) -> str:
+        if contains_fifo(candidate):
+            raise AssertionError("FIFO must be rejected before stat, open, or resolve")
+        return original_read_text(candidate, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "resolve", reject_fifo_resolve)
+    monkeypatch.setattr(Path, "stat", reject_fifo_stat)
+    monkeypatch.setattr(Path, "read_text", reject_fifo_read_text)
 
 
 def test_every_prompt_link_is_local_resolved_and_safe() -> None:
@@ -177,3 +218,56 @@ def test_link_validation_rejects_symlinks_before_resolution(tmp_path: Path) -> N
     os.symlink(contract_dir, nested)
     with pytest.raises(AssertionError, match="symlink component"):
         _validate_links(prompt, "[bad](../contracts/nested/safe.json)\n", root)
+
+
+def test_link_validation_rejects_fifo_leaf_before_consumption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("os.mkfifo is unavailable")
+    root = tmp_path / "pack"
+    prompt_dir = root / "prompts"
+    contract_dir = root / "contracts"
+    prompt_dir.mkdir(parents=True)
+    contract_dir.mkdir()
+    fifo = contract_dir / "target.fifo"
+    os.mkfifo(fifo)
+    prompt = prompt_dir / "notice.md"
+
+    _reject_fifo_consumption(monkeypatch, fifo)
+    with pytest.raises(AssertionError, match="non-regular final component"):
+        _validate_links(prompt, "[bad](../contracts/target.fifo)\n", root)
+
+
+def test_link_validation_rejects_fifo_intermediate_before_consumption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("os.mkfifo is unavailable")
+    root = tmp_path / "pack"
+    prompt_dir = root / "prompts"
+    contract_dir = root / "contracts"
+    prompt_dir.mkdir(parents=True)
+    contract_dir.mkdir()
+    fifo = contract_dir / "nested.fifo"
+    os.mkfifo(fifo)
+    prompt = prompt_dir / "notice.md"
+
+    _reject_fifo_consumption(monkeypatch, fifo)
+    with pytest.raises(AssertionError, match="non-directory intermediate component"):
+        _validate_links(prompt, "[bad](../contracts/nested.fifo/child.json)\n", root)
+
+
+def test_link_validation_accepts_regular_leaf_through_regular_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "pack"
+    prompt_dir = root / "prompts"
+    contract_dir = root / "contracts" / "nested"
+    prompt_dir.mkdir(parents=True)
+    contract_dir.mkdir(parents=True)
+    target = contract_dir / "safe.json"
+    target.write_text("# Contract\n", encoding="utf-8")
+    prompt = prompt_dir / "notice.md"
+
+    _validate_links(prompt, "[safe](../contracts/nested/safe.json#contract)\n", root)

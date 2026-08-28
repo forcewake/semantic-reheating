@@ -451,25 +451,28 @@ def test_asset_specific_cooling_and_verify_trigger_are_not_copied() -> None:
 
 def _validate_annealing_hygiene(text: str) -> None:
     exact = "Semantic reheating is not decoding-temperature control and is not simulated annealing in the strict mathematical sense."
-    assert _section(text, "Purpose").count(exact) == 1
-    assert _section(text, "Runtime form").count(exact) == 1
-    assert re.search(
-        r"\bnot\s+simulated annealing\s+in the strict mathematical sense",
-        text,
-        re.IGNORECASE,
-    )
-    assert not re.search(r"\bis simulated annealing\b", text, re.IGNORECASE)
+    required_sections = ("Purpose", "Runtime form")
+    for section_name in required_sections:
+        assert _section(text, section_name).count(exact) == 1
+    assert text.count(exact) == len(required_sections)
+    remaining = text.replace(exact, "")
+    assert "simulated annealing" not in remaining.lower()
     assert not re.search(
-        r"\bdecoding[- ]temperature control\b", text.replace(exact, ""), re.IGNORECASE
+        r"\bdecoding[- ]temperature control\b", remaining, re.IGNORECASE
     )
 
 
 def test_bounded_reheating_has_only_the_exact_strict_annealing_nonclaim() -> None:
     text = _read_prompt(PROMPTS_DIR / "bounded-reheating.md")
+    exact = "Semantic reheating is not decoding-temperature control and is not simulated annealing in the strict mathematical sense."
     _validate_annealing_hygiene(text)
     for mutation in (
         text.replace("not simulated annealing", "simulated annealing", 1),
         text.replace("strict mathematical ", "", 1),
+        f"{text}\nSemantic reheating is simulated annealing.\n",
+        f"{text}\nSemantic reheating equals simulated annealing.\n",
+        f"{text}\nSemantic reheating is equivalent to simulated annealing.\n",
+        f"{text}\n{exact}\n",
     ):
         with pytest.raises(AssertionError):
             _validate_annealing_hygiene(mutation)
