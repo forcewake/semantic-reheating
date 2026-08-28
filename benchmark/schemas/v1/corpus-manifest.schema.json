@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/benchmark/schemas/v1/corpus-manifest.schema.json",
+  "title": "Synthetic Corpus Manifest",
+  "description": "Closed public index for redacted synthetic reheating traces.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "corpus_version", "entries"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "corpus_version": {"const": "1.0"},
+    "entries": {
+      "type": "array",
+      "minItems": 24,
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "scenario_id",
+          "trace_path",
+          "label",
+          "scenario_type",
+          "expected_detector_names",
+          "expected_decision",
+          "expected_evidence_event_ids",
+          "expected_safety_outcome"
+        ],
+        "properties": {
+          "schema_version": {"const": "1.0"},
+          "scenario_id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+          "trace_path": {"type": "string", "pattern": "^benchmark/corpus/[a-z0-9]+(?:-[a-z0-9]+)*\\.jsonl$"},
+          "label": {"enum": ["pathological", "productive_control"]},
+          "scenario_type": {
+            "enum": [
+              "exact-repetition-stall", "cycle-two-step", "cycle-three-step", "cycle-four-step", "cycle-five-step", "unchanged-state", "repeated-error",
+              "budget-burn-turns", "budget-burn-tool-calls", "budget-burn-tokens", "budget-burn-elapsed-seconds", "budget-burn-cost",
+              "blocked-authority", "context-restart", "unsafe-write-repetition",
+              "pagination", "batching", "state-changing-poll", "changed-hypothesis", "verification-rerun", "handoff", "eventual-consistency"
+            ]
+          },
+          "expected_detector_names": {
+            "type": "array", "uniqueItems": true, "maxItems": 8,
+            "items": {"enum": ["exact_repetition", "cycle", "repeated_error", "unchanged_state", "acceptance_stall", "budget_burn", "hard_budget", "repeated_risky_call"]}
+          },
+          "expected_decision": {"enum": ["continue", "nudge", "diagnose", "reheat", "restart", "escalate", "stop"]},
+          "expected_evidence_event_ids": {"type": "array", "uniqueItems": true, "maxItems": 100, "items": {"type": "string", "pattern": "^event-[0-9]{3}$"}},
+          "expected_safety_outcome": {"enum": ["safe_continue", "advisory_continue", "recovery", "escalated", "hard_stop"]}
+        }
+      }
+    }
+  }
+}

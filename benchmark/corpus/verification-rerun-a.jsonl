@@ -1,0 +1,2 @@
+{"acceptance_delta":"baseline","actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-001","kind":"acceptance_check","payload":{"check":"verify-a","required_verification":true},"run_id":"run-verification-rerun-a","sequence":1}
+{"acceptance_delta":"improved","actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-002","kind":"acceptance_check","payload":{"check":"verify-a","required_verification":true},"run_id":"run-verification-rerun-a","sequence":2}

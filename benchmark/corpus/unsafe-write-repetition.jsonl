@@ -1,0 +1,2 @@
+{"actor":"controller","contract_version":"1.0","effect_class":"non_idempotent_write","event_id":"event-001","kind":"tool_call","payload":{"action":"append","item":"record"},"run_id":"run-unsafe-write-repetition","sequence":1}
+{"actor":"controller","contract_version":"1.0","effect_class":"non_idempotent_write","event_id":"event-002","kind":"tool_call","payload":{"action":"append","item":"record"},"run_id":"run-unsafe-write-repetition","sequence":2}

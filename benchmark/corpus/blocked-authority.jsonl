@@ -1,0 +1,2 @@
+{"actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-001","kind":"plan","payload":{"diagnostic_cause":"missing_authority"},"run_id":"run-blocked-authority","sequence":1}
+{"actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-002","kind":"message","payload":{"status":"awaiting-host"},"run_id":"run-blocked-authority","sequence":2}

@@ -1,0 +1,1 @@
+{"actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-001","kind":"handoff","payload":{"new_capabilities":["read"],"new_plan_id":"plan-a"},"run_id":"run-handoff-a","sequence":1}

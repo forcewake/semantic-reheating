@@ -1,0 +1,2 @@
+{"actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-001","kind":"plan","payload":{"diagnostic_cause":"runtime_defect"},"run_id":"run-context-restart","sequence":1}
+{"actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-002","kind":"message","payload":{"status":"new-context-requested"},"run_id":"run-context-restart","sequence":2}

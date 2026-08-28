@@ -1,0 +1,2 @@
+{"actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-001","kind":"state_observation","payload":{"poll_id":"consistency-b","poll_target":0,"poll_value":5},"run_id":"run-eventual-consistency-b","sequence":1,"state_fingerprint":"pending"}
+{"actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-002","kind":"state_observation","payload":{"poll_id":"consistency-b","poll_target":0,"poll_value":1},"run_id":"run-eventual-consistency-b","sequence":2,"state_fingerprint":"settled"}

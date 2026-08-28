@@ -1,0 +1,2 @@
+{"actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-001","kind":"tool_result","payload":{"pagination_cursor":"page-b-1"},"run_id":"run-pagination-b","sequence":1}
+{"actor":"controller","contract_version":"1.0","effect_class":"read_only","event_id":"event-002","kind":"tool_result","payload":{"pagination_cursor":"page-b-2"},"run_id":"run-pagination-b","sequence":2}
