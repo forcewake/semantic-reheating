@@ -17,6 +17,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from jsonschema import Draft202012Validator, ValidationError
@@ -45,26 +46,6 @@ _ARTIFACTS = {
     ),
     "evidence_record": ("minimal-evidence-record.json", "evidence-record.schema.json"),
 }
-_CONSTRAINT_KEYS = frozenset(
-    {
-        "type",
-        "enum",
-        "const",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "multipleOf",
-        "minLength",
-        "maxLength",
-        "pattern",
-        "required",
-        "additionalProperties",
-        "minItems",
-        "maxItems",
-        "uniqueItems",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -199,21 +180,25 @@ def _add_unknown(parts: tuple[str | int, ...]) -> Callable[[Any], Any]:
 
 
 def _resolve(
-    root: dict[str, Any], node: dict[str, Any], pointer: tuple[str | int, ...]
+    root: dict[str, Any],
+    node: dict[str, Any],
+    pointer: tuple[str | int, ...],
+    active_locations: frozenset[tuple[str | int, ...]] = frozenset(),
 ) -> tuple[dict[str, Any], tuple[str | int, ...]]:
-    ref = node.get("$ref")
-    if ref is None:
-        return node, pointer
-    assert type(ref) is str and ref.startswith("#/") and not ref.startswith("#//"), ref
-    target: Any = root
-    ref_parts: list[str] = []
-    for part in ref[2:].split("/"):
-        unescaped = part.replace("~1", "/").replace("~0", "~")
-        ref_parts.append(unescaped)
-        target = target[unescaped]
-    assert type(target) is dict
-    overlays = {key: item for key, item in node.items() if key != "$ref"}
-    return {**target, **overlays}, tuple(ref_parts)
+    """Resolve a local reference chain without silently accepting a cycle."""
+    seen = set(active_locations)
+    while "$ref" in node:
+        ref = node["$ref"]
+        target_pointer = _ref_parts(ref)
+        if target_pointer in seen:
+            raise AssertionError("cyclic_local_ref")
+        seen.add(target_pointer)
+        target = _at(root, target_pointer)
+        assert type(target) is dict
+        overlays = {key: item for key, item in node.items() if key != "$ref"}
+        node = {**target, **overlays}
+        pointer = target_pointer
+    return node, pointer
 
 
 def _wrong_type(types: object) -> object:
@@ -304,7 +289,10 @@ def _leaf_errors(errors: Iterator[ValidationError]) -> tuple[ValidationError, ..
 
 
 def _ref_parts(ref: str) -> tuple[str, ...]:
-    assert type(ref) is str and ref.startswith("#/") and not ref.startswith("#//"), ref
+    assert type(ref) is str and ref.startswith("#"), ref
+    if ref == "#":
+        return ()
+    assert ref.startswith("#/") and not ref.startswith("#//"), ref
     return tuple(
         part.replace("~1", "/").replace("~0", "~") for part in ref[2:].split("/")
     )
@@ -481,30 +469,193 @@ def _all_seed_variants() -> tuple[SeedVariant, ...]:
 SEED_VARIANTS = _all_seed_variants()
 
 
+_DRAFT_METADATA_ANNOTATIONS = frozenset(
+    {
+        "$anchor",
+        "$comment",
+        "$defs",
+        "$dynamicAnchor",
+        "$id",
+        "$schema",
+        "$vocabulary",
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
+        "default",
+        "deprecated",
+        "description",
+        "examples",
+        "format",
+        "readOnly",
+        "title",
+        "writeOnly",
+    }
+)
+_DRAFT_APPLICATOR_KEYWORDS = frozenset(
+    {
+        "$dynamicRef",
+        "$ref",
+        "additionalProperties",
+        "allOf",
+        "anyOf",
+        "contains",
+        "dependentSchemas",
+        "if",
+        "items",
+        "not",
+        "oneOf",
+        "patternProperties",
+        "prefixItems",
+        "properties",
+        "propertyNames",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+_DRAFT_VALIDATOR_KEYWORDS = frozenset(Draft202012Validator.VALIDATORS)
+_DRAFT_ASSERTION_KEYWORDS = _DRAFT_VALIDATOR_KEYWORDS - (
+    _DRAFT_METADATA_ANNOTATIONS | _DRAFT_APPLICATOR_KEYWORDS
+)
+# These are intentionally an explicit implementation contract, rather than a
+# catch-all exclusion for Draft keywords added by a later jsonschema release.
+_SUPPORTED_APPLICATOR_KEYWORDS = frozenset(
+    {"$ref", "allOf", "else", "if", "items", "oneOf", "properties", "then"}
+)
+
+
+def _draft_child_schemas(
+    node: Mapping[str, Any],
+) -> Iterator[tuple[tuple[str | int, ...], Mapping[str, Any], bool]]:
+    """Yield Draft child schemas using the applicator grammar only.
+
+    The final flag says whether child assertions contribute direct validation
+    errors at that location.  An `if` condition controls an application but
+    does not itself reject an instance.
+    """
+    definitions = node.get("$defs")
+    if type(definitions) is dict:
+        for key, child in definitions.items():
+            if type(child) is dict:
+                yield ("$defs", key), child, True
+    for keyword in ("properties", "patternProperties", "dependentSchemas"):
+        children = node.get(keyword)
+        if type(children) is dict:
+            for key, child in children.items():
+                if type(child) is dict:
+                    yield (keyword, key), child, True
+    for keyword in (
+        "additionalProperties",
+        "contains",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ):
+        child = node.get(keyword)
+        if type(child) is dict:
+            yield (keyword,), child, keyword != "not"
+    for keyword in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        children = node.get(keyword)
+        if type(children) is list:
+            for index, child in enumerate(children):
+                if type(child) is dict:
+                    yield (keyword, index), child, True
+    condition = node.get("if")
+    if type(condition) is dict:
+        yield ("if",), condition, False
+
+
+def _draft_assertion_inventory(root: dict[str, Any]) -> set[tuple[str, str]]:
+    """Independently inventory directly-asserting Draft 2020-12 keywords."""
+    found: set[tuple[str, str]] = set()
+
+    def visit(
+        node: Mapping[str, Any],
+        path: tuple[str | int, ...],
+        asserting: bool,
+        active_locations: frozenset[tuple[str | int, ...]],
+    ) -> None:
+        if "$ref" in node:
+            target = _ref_parts(node["$ref"])
+            if target in active_locations:
+                raise AssertionError("cyclic_local_ref")
+            target_node = _at(root, target)
+            assert type(target_node) is dict
+            visit(target_node, target, asserting, active_locations | {target})
+        if asserting:
+            for keyword in node:
+                if keyword in _DRAFT_ASSERTION_KEYWORDS or (
+                    keyword == "additionalProperties" and node[keyword] is False
+                ):
+                    found.add((_schema_pointer(path + (keyword,)), keyword))
+        for suffix, child, child_asserting in _draft_child_schemas(node):
+            visit(
+                child,
+                path + suffix,
+                asserting and child_asserting,
+                active_locations | {path},
+            )
+
+    visit(root, (), True, frozenset({()}))
+    return found
+
+
+def _draft_unsupported_keywords(root: dict[str, Any]) -> set[tuple[str, str]]:
+    """Return registry-recognized applicators lacking a mutation traversal."""
+    unsupported: set[tuple[str, str]] = set()
+
+    def visit(
+        node: Mapping[str, Any],
+        path: tuple[str | int, ...],
+        active_locations: frozenset[tuple[str | int, ...]],
+    ) -> None:
+        if "$ref" in node:
+            target = _ref_parts(node["$ref"])
+            if target in active_locations:
+                raise AssertionError("cyclic_local_ref")
+            target_node = _at(root, target)
+            assert type(target_node) is dict
+            visit(target_node, target, active_locations | {target})
+        for keyword in node:
+            if (
+                keyword in _DRAFT_APPLICATOR_KEYWORDS
+                and keyword not in _SUPPORTED_APPLICATOR_KEYWORDS
+                and not (keyword == "additionalProperties" and node[keyword] is False)
+            ):
+                unsupported.add((_schema_pointer(path + (keyword,)), keyword))
+        for suffix, child, _ in _draft_child_schemas(node):
+            visit(child, path + suffix, active_locations | {path})
+
+    visit(root, (), frozenset({()}))
+    return unsupported
+
+
+def _assert_draft_coverage(
+    artifact: str,
+    root: dict[str, Any],
+    coverage: set[tuple[str, str, str]],
+) -> None:
+    missing = {
+        (pointer, keyword)
+        for pointer, keyword in _draft_assertion_inventory(root)
+        if (artifact, pointer, keyword) not in coverage
+    } | _draft_unsupported_keywords(root)
+    if missing:
+        pointer, keyword = min(missing)
+        raise AssertionError(f"uncovered_draft_keyword:{pointer}:{keyword}")
+
+
 def _constraints(
     root: dict[str, Any], node: dict[str, Any], pointer: tuple[str | int, ...] = ()
 ) -> set[tuple[str, str]]:
-    node, pointer = _resolve(root, node, pointer)
-    found = {
-        (_schema_pointer(pointer + (key,)), key)
-        for key in node
-        if key in _CONSTRAINT_KEYS
-    }
-    for index, member in enumerate(node.get("allOf", [])):
-        if "if" in member and "then" in member:
-            found |= _constraints(
-                root, member["then"], pointer + ("allOf", index, "then")
-            )
-        else:
-            found |= _constraints(root, member, pointer + ("allOf", index))
-    for index, member in enumerate(node.get("oneOf", [])):
-        found |= _constraints(root, member, pointer + ("oneOf", index))
-    for field, child in node.get("properties", {}).items():
-        found |= _constraints(root, child, pointer + ("properties", field))
-    items = node.get("items")
-    if type(items) is dict:
-        found |= _constraints(root, items, pointer + ("items",))
-    return found
+    """Compatibility shim for the independent Draft inventory."""
+    assert node is root and pointer == ()
+    return _draft_assertion_inventory(root)
 
 
 def _has_enum_or_const(node: dict[str, Any]) -> bool:
@@ -543,6 +694,50 @@ def _novel_item(root: dict[str, Any], node: dict[str, Any], value: Any) -> Any |
     return None
 
 
+def _valid_schema_value(root: dict[str, Any], node: dict[str, Any]) -> Any | None:
+    """Return a small standalone value accepted by a property schema, if known."""
+    node, _ = _resolve(root, node, ())
+    validator = Draft202012Validator(node)
+    candidates: list[Any] = []
+    if "const" in node:
+        candidates.append(node["const"])
+    if "enum" in node:
+        candidates.extend(node["enum"])
+    types = node.get("type")
+    type_names = (types,) if type(types) is str else tuple(types or ())
+    if not type_names:
+        candidates.extend(("task15-added", 0, True, [], {}, None))
+    if "string" in type_names:
+        candidates.extend(("", "x", "ok", "task15-added"))
+    if "integer" in type_names or "number" in type_names:
+        candidates.extend((-1, 0, 1, 2))
+    if "boolean" in type_names:
+        candidates.extend((False, True))
+    if "array" in type_names:
+        candidates.append([])
+    if "object" in type_names:
+        candidates.append({})
+    if "null" in type_names:
+        candidates.append(None)
+    for candidate in candidates:
+        if validator.is_valid(candidate):
+            return deepcopy(candidate)
+    return None
+
+
+def _add_properties(
+    parts: tuple[str | int, ...], replacements: tuple[tuple[str, Any], ...]
+) -> Callable[[Any], Any]:
+    def apply(value: Any) -> Any:
+        copied = deepcopy(value)
+        target = _at(copied, parts)
+        for field, replacement in replacements:
+            target[field] = deepcopy(replacement)
+        return copied
+
+    return apply
+
+
 def _walk_seed(
     artifact: str,
     seed: SeedVariant,
@@ -551,8 +746,10 @@ def _walk_seed(
     value: Any,
     schema_path: tuple[str | int, ...] = (),
     instance_path: tuple[str | int, ...] = (),
+    active_locations: frozenset[tuple[str | int, ...]] = frozenset(),
 ) -> tuple[list[Mutation], list[Exclusion]]:
-    node, schema_path = _resolve(root, node, schema_path)
+    node, schema_path = _resolve(root, node, schema_path, active_locations)
+    active_locations = active_locations | {schema_path}
     mutations: list[Mutation] = []
     exclusions: list[Exclusion] = []
 
@@ -561,12 +758,16 @@ def _walk_seed(
         description: str,
         changed: tuple[str | int, ...],
         apply: Callable[[Any], Any],
+        *,
+        changed_paths: tuple[tuple[str | int, ...], ...] | None = None,
     ) -> None:
-        declared = changed
-        for index in range(len(changed)):
-            if type(_at(seed.value, changed[:index])) is list:
-                declared = changed[:index]
-                break
+        def declared_path(path: tuple[str | int, ...]) -> tuple[str | int, ...]:
+            for index in range(len(path)):
+                if type(_at(seed.value, path[:index])) is list:
+                    return path[:index]
+            return path
+
+        paths = (changed,) if changed_paths is None else changed_paths
         mutations.append(
             Mutation(
                 artifact,
@@ -575,7 +776,7 @@ def _walk_seed(
                 _json_pointer(instance_path),
                 keyword,
                 description,
-                frozenset((_json_pointer(declared),)),
+                frozenset(_json_pointer(path) for path in map(declared_path, paths)),
                 (
                     (
                         _schema_pointer(schema_path + (keyword,)),
@@ -696,6 +897,86 @@ def _walk_seed(
                     _replace(instance_path, candidate),
                 )
     if type(value) is dict:
+        if "minProperties" in node:
+            target_size = node["minProperties"] - 1
+            removable = [
+                field for field in value if field not in node.get("required", [])
+            ]
+            if target_size < 0 or len(value) - len(removable) > target_size:
+                exclude(
+                    "minProperties",
+                    "Required properties prevent reducing the object below minProperties.",
+                )
+            else:
+                removed = removable[: len(value) - target_size]
+
+                def remove_optional(
+                    value: Any, fields: tuple[str, ...] = tuple(removed)
+                ) -> Any:
+                    copied = deepcopy(value)
+                    target = _at(copied, instance_path)
+                    for field in fields:
+                        del target[field]
+                    return copied
+
+                add(
+                    "minProperties",
+                    "below object lower bound while retaining required properties",
+                    instance_path + (removed[0],),
+                    remove_optional,
+                )
+        if "maxProperties" in node:
+            property_overflow = deepcopy(value)
+            additions: list[tuple[str, Any]] = []
+            for field, child in node.get("properties", {}).items():
+                if field not in property_overflow:
+                    candidate = _valid_schema_value(root, child)
+                    if candidate is not None:
+                        additions.append((field, candidate))
+                        property_overflow[field] = candidate
+                if len(property_overflow) > node["maxProperties"]:
+                    break
+            additional = node.get("additionalProperties", True)
+            if (
+                len(property_overflow) <= node["maxProperties"]
+                and additional is not False
+            ):
+                candidate = (
+                    _valid_schema_value(root, additional)
+                    if type(additional) is dict
+                    else None
+                )
+                if additional is True:
+                    candidate = None
+                if candidate is not None or additional is True:
+                    field = "task15_added_property"
+                    while field in property_overflow:
+                        field += "_"
+                    additions.append((field, candidate))
+                    property_overflow[field] = candidate
+            if len(property_overflow) <= node["maxProperties"]:
+                closed = node.get("additionalProperties") is False
+                exclude(
+                    "maxProperties",
+                    (
+                        "Closed object has no absent named property that can overflow "
+                        "maxProperties."
+                        if closed
+                        else "No schema-valid absent property was constructible for "
+                        "maxProperties."
+                    ),
+                )
+            else:
+                addition_paths = tuple(
+                    instance_path + (field,) for field, _ in additions
+                )
+                add(
+                    "maxProperties",
+                    "above object upper bound with schema-valid named properties",
+                    addition_paths[0],
+                    _add_properties(instance_path, tuple(additions)),
+                    changed_paths=addition_paths,
+                )
         if node.get("additionalProperties") is False:
             unknown_path = instance_path + ("task15_unknown",)
             add(
@@ -720,6 +1001,7 @@ def _walk_seed(
                     value[field],
                     schema_path + ("properties", field),
                     instance_path + (field,),
+                    active_locations,
                 )
                 mutations.extend(more)
                 exclusions.extend(omitted)
@@ -788,33 +1070,37 @@ def _walk_seed(
                     item,
                     schema_path + ("items",),
                     instance_path + (index,),
+                    active_locations,
                 )
                 mutations.extend(more)
                 exclusions.extend(omitted)
 
+    if "if" in node:
+        branch = "then" if Draft202012Validator(node["if"]).is_valid(value) else "else"
+        if type(node.get(branch)) is dict:
+            more, omitted = _walk_seed(
+                artifact,
+                seed,
+                root,
+                node[branch],
+                value,
+                schema_path + (branch,),
+                instance_path,
+                active_locations,
+            )
+            mutations.extend(more)
+            exclusions.extend(omitted)
     for index, member in enumerate(node.get("allOf", [])):
-        if "if" in member and "then" in member:
-            if not Draft202012Validator(member["if"]).is_valid(value):
-                continue
-            more, omitted = _walk_seed(
-                artifact,
-                seed,
-                root,
-                member["then"],
-                value,
-                schema_path + ("allOf", index, "then"),
-                instance_path,
-            )
-        else:
-            more, omitted = _walk_seed(
-                artifact,
-                seed,
-                root,
-                member,
-                value,
-                schema_path + ("allOf", index),
-                instance_path,
-            )
+        more, omitted = _walk_seed(
+            artifact,
+            seed,
+            root,
+            member,
+            value,
+            schema_path + ("allOf", index),
+            instance_path,
+            active_locations,
+        )
         mutations.extend(more)
         exclusions.extend(omitted)
     if "oneOf" in node:
@@ -833,6 +1119,7 @@ def _walk_seed(
             value,
             schema_path + ("oneOf", branch_index),
             instance_path,
+            active_locations,
         )
         # One `oneOf` removal is conceptual evidence, not three falsely-isolated
         # branch claims.  It must declare every terminal branch context exactly.
@@ -1030,7 +1317,13 @@ def test_schema_complete_seed_inventory_and_runtime_parity() -> None:
     for seed in SEED_VARIANTS:
         _schema(seed.artifact).validate(deepcopy(seed.value))
         _runtime_parse(seed.artifact, deepcopy(seed.value))
-    assert _coverage_keys() == SCHEMA_CONSTRAINTS
+    assert len(MUTATIONS) == 1420
+    assert len(EXCLUSIONS) == 80
+    assert len(SCHEMA_CONSTRAINTS) == 637
+    coverage = _coverage_keys()
+    for artifact in _ARTIFACTS:
+        _assert_draft_coverage(artifact, _schema_data(artifact), coverage)
+    assert coverage == SCHEMA_CONSTRAINTS
     assert all(item.reason for item in EXCLUSIONS)
 
 
@@ -1130,3 +1423,224 @@ def test_canonical_bytes_and_fingerprint_ignore_every_nested_map_key_order(
     assert _nested_key_order_changed(source, reordered)
     assert canonicalize_json(source) == canonicalize_json(reordered)
     assert action_fingerprint(source).digest == action_fingerprint(reordered).digest
+
+
+def test_draft_inventory_fails_closed_for_uncovered_min_properties() -> None:
+    schema = {"type": "object", "minProperties": 1}
+    inventory = _draft_assertion_inventory(schema)
+    assert ("#/minProperties", "minProperties") in inventory
+    with pytest.raises(
+        AssertionError,
+        match=r"uncovered_draft_keyword:#/minProperties:minProperties",
+    ):
+        _assert_draft_coverage("synthetic", schema, set())
+    coverage_without_min = {
+        ("synthetic", pointer, keyword)
+        for pointer, keyword in inventory
+        if keyword != "minProperties"
+    }
+    with pytest.raises(
+        AssertionError,
+        match=r"uncovered_draft_keyword:#/minProperties:minProperties",
+    ):
+        _assert_draft_coverage("synthetic", schema, coverage_without_min)
+
+
+def test_draft_keyword_model_preserves_official_keywords_and_ignores_annotations() -> (
+    None
+):
+    assert (
+        _DRAFT_ASSERTION_KEYWORDS
+        | (_DRAFT_APPLICATOR_KEYWORDS & _DRAFT_VALIDATOR_KEYWORDS)
+        == _DRAFT_VALIDATOR_KEYWORDS - _DRAFT_METADATA_ANNOTATIONS
+    )
+    assert {
+        "minProperties",
+        "maxProperties",
+        "dependentRequired",
+    } <= _DRAFT_ASSERTION_KEYWORDS
+    assert {"$ref", "contains", "oneOf"} <= _DRAFT_APPLICATOR_KEYWORDS
+    schema = {
+        "type": "string",
+        "description": "Draft annotation",
+        "format": "email",
+        "x-example-extension": True,
+    }
+    assert _draft_assertion_inventory(schema) == {("#/type", "type")}
+    _assert_draft_coverage("synthetic", schema, {("synthetic", "#/type", "type")})
+
+
+def test_min_and_max_properties_build_isolated_coverage_or_exclusion() -> None:
+    min_schema = {
+        "type": "object",
+        "required": ["required"],
+        "properties": {
+            "required": {"type": "string"},
+            "optional": {"type": "string"},
+        },
+        "additionalProperties": False,
+        "minProperties": 2,
+    }
+    third_schema: dict[str, Any] = {"enum": ["third"]}
+    max_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "first": {"type": "string"},
+            "second": {"type": "integer", "minimum": 1},
+            "third": third_schema,
+        },
+        "additionalProperties": False,
+        "maxProperties": 2,
+    }
+    cases: list[Mutation] = []
+    exclusions: list[Exclusion] = []
+    for name, schema, value, keyword in (
+        ("min", min_schema, {"required": "ok", "optional": "ok"}, "minProperties"),
+        ("max", max_schema, {"first": "ok", "second": 2}, "maxProperties"),
+    ):
+        seed = SeedVariant("synthetic", name, value)
+        mutations, omitted = _walk_seed("synthetic", seed, schema, schema, value)
+        cases.extend(item for item in mutations if item.keyword == keyword)
+        exclusions.extend(item for item in omitted if item.keyword == keyword)
+    assert not exclusions
+    assert {item.keyword for item in cases} == {"minProperties", "maxProperties"}
+    for case in cases:
+        seed = next(
+            item
+            for item in (
+                SeedVariant("synthetic", "min", {"required": "ok", "optional": "ok"}),
+                SeedVariant("synthetic", "max", {"first": "ok", "second": 2}),
+            )
+            if item.name == case.seed
+        )
+        invalid = case.apply(seed.value)
+        schema = min_schema if case.keyword == "minProperties" else max_schema
+        found = Counter(
+            (
+                _schema_pointer(tuple(error.absolute_schema_path)),
+                error.validator,
+                _json_pointer(tuple(error.absolute_path)),
+            )
+            for error in Draft202012Validator(schema).iter_errors(invalid)
+        )
+        assert found == Counter(case.expected_errors)
+        assert _recursive_diff(seed.value, invalid) == set(case.changed_pointers)
+    max_case = next(item for item in cases if item.keyword == "maxProperties")
+    max_invalid = max_case.apply({"first": "ok", "second": 2})
+    assert max_invalid["third"] == "third"
+    assert Draft202012Validator(third_schema).is_valid(max_invalid["third"])
+    assert max_case.changed_pointers == frozenset({"/third"})
+    assert Counter(
+        error.validator
+        for error in Draft202012Validator(max_schema).iter_errors(max_invalid)
+    ) == Counter({"maxProperties": 1})
+    closed_schema = {
+        "type": "object",
+        "properties": {"fixed": {"const": "fixed"}},
+        "additionalProperties": False,
+        "maxProperties": 1,
+    }
+    _, closed_exclusions = _walk_seed(
+        "synthetic",
+        SeedVariant("synthetic", "closed", {"fixed": "fixed"}),
+        closed_schema,
+        closed_schema,
+        {"fixed": "fixed"},
+    )
+    assert [
+        item.reason for item in closed_exclusions if item.keyword == "maxProperties"
+    ] == ["Closed object has no absent named property that can overflow maxProperties."]
+    coverage = (
+        {
+            ("synthetic", pointer, keyword)
+            for schema in (min_schema, max_schema)
+            for pointer, keyword in _draft_assertion_inventory(schema)
+            if keyword not in {"minProperties", "maxProperties"}
+        }
+        | {
+            ("synthetic", pointer, keyword)
+            for case in cases
+            for pointer, keyword in case.covered_constraints
+        }
+        | {(item.artifact, item.schema_pointer, item.keyword) for item in exclusions}
+    )
+    _assert_draft_coverage("synthetic", min_schema, coverage)
+    _assert_draft_coverage("synthetic", max_schema, coverage)
+
+
+def test_draft_inventory_rejects_recognized_unsupported_assertion() -> None:
+    schema = {
+        "type": "object",
+        "dependentRequired": {"trigger": ["dependent"]},
+    }
+    with pytest.raises(
+        AssertionError,
+        match=r"uncovered_draft_keyword:#/dependentRequired:dependentRequired",
+    ):
+        _assert_draft_coverage("synthetic", schema, set())
+
+
+def test_draft_inventory_walks_escaped_transitive_refs_conditionals_and_oneof() -> None:
+    schema = {
+        "$defs": {
+            "escaped/a~b": {"$ref": "#/$defs/final"},
+            "final": {
+                "allOf": [
+                    {
+                        "if": {"properties": {"kind": {"const": "selected"}}},
+                        "then": {"minProperties": 1},
+                    }
+                ]
+            },
+        },
+        "properties": {
+            "payload": {
+                "oneOf": [
+                    {"$ref": "#/$defs/escaped~1a~0b"},
+                    {"dependentRequired": {"trigger": ["dependent"]}},
+                ]
+            }
+        },
+    }
+    assert _draft_assertion_inventory(schema) == {
+        ("#/$defs/final/allOf/0/then/minProperties", "minProperties"),
+        ("#/properties/payload/oneOf/1/dependentRequired", "dependentRequired"),
+    }
+
+
+def test_draft_inventory_and_mutation_walk_fail_promptly_on_cyclic_local_ref() -> None:
+    schema = {"$defs": {"loop": {"$ref": "#/$defs/loop"}}, "$ref": "#/$defs/loop"}
+    with pytest.raises(AssertionError, match="^cyclic_local_ref$"):
+        _draft_assertion_inventory(schema)
+    with pytest.raises(AssertionError, match="^cyclic_local_ref$"):
+        _walk_seed(
+            "synthetic",
+            SeedVariant("synthetic", "loop", {}),
+            schema,
+            schema,
+            {},
+        )
+
+
+def test_shared_local_ref_reuse_is_not_a_cycle() -> None:
+    schema = {
+        "$defs": {"leaf": {"minProperties": 1}},
+        "type": "object",
+        "properties": {
+            "left": {"$ref": "#/$defs/leaf"},
+            "right": {"$ref": "#/$defs/leaf"},
+        },
+    }
+    assert _draft_assertion_inventory(schema) == {
+        ("#/type", "type"),
+        ("#/$defs/leaf/minProperties", "minProperties"),
+    }
+    mutations, exclusions = _walk_seed(
+        "synthetic",
+        SeedVariant("synthetic", "shared", {"left": {"a": 1}, "right": {"b": 2}}),
+        schema,
+        schema,
+        {"left": {"a": 1}, "right": {"b": 2}},
+    )
+    assert len([item for item in mutations if item.keyword == "minProperties"]) == 2
+    assert not [item for item in exclusions if item.keyword == "minProperties"]
