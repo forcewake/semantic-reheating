@@ -209,9 +209,62 @@ def _parse_reference_destination(text: str, start: int, limit: int) -> tuple[int
     return _parse_bare_destination(text, start, limit)
 
 
-def _is_html_closing_tag(candidate: str) -> bool:
-    name = candidate.removeprefix("/").replace("-", "").replace(":", "")
-    return candidate.startswith("/") and bool(name) and name.isidentifier()
+def _looks_like_html_tag(candidate: str) -> bool:
+    """Recognize bounded HTML-like angle syntax without swallowing paths."""
+    if candidate.startswith(("!", "?")):
+        return True
+
+    index = 1 if candidate.startswith("/") else 0
+    if index >= len(candidate) or candidate[index] not in string.ascii_letters:
+        return False
+    index += 1
+    while index < len(candidate) and candidate[index] in string.ascii_letters + string.digits + "-":
+        index += 1
+
+    if index == len(candidate) or candidate[index] == "/":
+        return index == len(candidate) or index + 1 == len(candidate)
+    if candidate[index] not in " \t\r\n":
+        return False
+
+    while index < len(candidate):
+        while index < len(candidate) and candidate[index] in " \t\r\n":
+            index += 1
+        if index == len(candidate):
+            return True
+        if candidate[index] == "/":
+            return index + 1 == len(candidate)
+
+        attribute_start = index
+        while (
+            index < len(candidate)
+            and candidate[index] in string.ascii_letters + string.digits + "-_:."
+        ):
+            index += 1
+        if index == attribute_start:
+            return False
+        if index == len(candidate) or candidate[index] in " \t\r\n/":
+            continue
+        if candidate[index] != "=":
+            return False
+
+        index += 1
+        if index == len(candidate):
+            return False
+        if candidate[index] in "\"'":
+            quote = candidate[index]
+            index += 1
+            closing = candidate.find(quote, index)
+            if closing == -1:
+                return False
+            index = closing + 1
+        else:
+            value_start = index
+            while index < len(candidate) and candidate[index] not in " \t\r\n<>\"'":
+                index += 1
+            if index == value_start:
+                return False
+
+    return True
 
 
 def _mask_definitions(visible: str) -> tuple[str, dict[str, str]]:
@@ -295,8 +348,8 @@ def _markdown_targets(markdown: str) -> list[str]:
                 parsed = urlsplit(candidate)
                 if (
                     candidate
+                    and not _looks_like_html_tag(candidate)
                     and not any(value in candidate for value in " \t\r\n=<")
-                    and not _is_html_closing_tag(candidate)
                     and (
                         parsed.scheme
                         or candidate.startswith(("/", "."))
@@ -486,10 +539,32 @@ def test_link_parser_rejects_unbalanced_destinations_and_stray_closings() -> Non
             _markdown_targets(source)
 
 
-def test_link_parser_ignores_html_but_collects_local_angle_autolinks() -> None:
-    assert _markdown_targets(
-        "<span class=note>not a link</span> <../contracts/v1/evidence-record.schema.json>"
-    ) == ["../contracts/v1/evidence-record.schema.json"]
+def test_link_parser_distinguishes_html_tags_from_angle_targets() -> None:
+    source = (
+        "<br/>\n"
+        "<br />\n"
+        '<img src="x"/>\n'
+        "<custom-element/>\n"
+        "<span class=note>not a link</span>\n"
+        "</span>\n"
+        "<!-- comment -->\n"
+        "<!DOCTYPE html>\n"
+        "<?instruction?>\n"
+        "<../contracts/v1/evidence-record.schema.json>\n"
+        "<./relative.md>\n"
+        "<contracts/v1/x.json>\n"
+        "<https://example.invalid/x>"
+    )
+    assert _markdown_targets(source) == [
+        "../contracts/v1/evidence-record.schema.json",
+        "./relative.md",
+        "contracts/v1/x.json",
+        "https://example.invalid/x",
+    ]
+
+
+def test_link_parser_ignores_malformed_angle_input_deterministically() -> None:
+    assert _markdown_targets("<unterminated <>") == []
 
 
 def test_current_prompt_assets_have_the_exact_seven_schema_targets() -> None:
@@ -588,6 +663,7 @@ def test_link_validation_rejects_images_autolinks_and_escape_mutations() -> None
     for bad_markdown in (
         "![image](/outside.md)",
         "<../outside.md>",
+        "<https://example.invalid/x>",
         "[bad](file:///outside.md)",
         "[bad](https://example.test/contract.json)",
         "[bad](https://user:password@example.test/contract.json)",
