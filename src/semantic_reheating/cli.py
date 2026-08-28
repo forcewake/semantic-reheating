@@ -106,7 +106,8 @@ def _read_bytes(path: str, limit: int) -> bytes:
     """
     descriptor = -1
     try:
-        if stat.S_ISLNK(os.lstat(path).st_mode):
+        preopen = os.lstat(path)
+        if not stat.S_ISREG(preopen.st_mode):
             raise _CliFailure(EXIT_IO)
         flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -250,7 +251,7 @@ def _write_canonical_stdout(value: dict[str, Any]) -> None:
     remaining = memoryview(payload)
     while remaining:
         written = buffer.write(remaining)
-        if not isinstance(written, int) or not 0 < written <= len(remaining):
+        if type(written) is not int or not 0 < written <= len(remaining):
             raise OSError("stdout write failed")
         remaining = remaining[written:]
     buffer.flush()

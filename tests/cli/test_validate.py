@@ -24,6 +24,11 @@ def _main_in_child(argv: list[str], results: object) -> None:
     results.put((result, stdout.getvalue(), stderr.getvalue()))  # type: ignore[union-attr]
 
 
+def _main_without_nonblock_in_child(argv: list[str], results: object) -> None:
+    delattr(cli.os, "O_NONBLOCK")
+    _main_in_child(argv, results)
+
+
 def _policy() -> dict[str, object]:
     return json.loads(
         (ROOT / "tests/fixtures/contracts/minimal-run-policy.json").read_text()
@@ -253,6 +258,38 @@ def test_validate_rejects_indeterminate_binary_stdout_write(
     assert stderr.getvalue() == "error: internal_error\n"
 
 
+@pytest.mark.parametrize("write_result", [True, False, type("EvilInt", (int,), {})(1)])
+def test_validate_rejects_non_exact_binary_stdout_write_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_result: object
+) -> None:
+    trace = _write_trace(tmp_path / "trace.jsonl", _event())
+    policy = _write_json(tmp_path / "policy.json", _policy())
+
+    class InvalidCountBuffer:
+        def __init__(self) -> None:
+            self.output = bytearray()
+
+        def write(self, data: object) -> object:
+            del data
+            return write_result
+
+        def flush(self) -> None:
+            pass
+
+    class InvalidCountStdout:
+        def __init__(self, buffer: InvalidCountBuffer) -> None:
+            self.buffer = buffer
+
+    buffer = InvalidCountBuffer()
+    stderr = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", InvalidCountStdout(buffer))
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+
+    assert cli.main(["validate", str(trace), "--policy", str(policy)]) == 10
+    assert bytes(buffer.output) == b""
+    assert stderr.getvalue() == "error: internal_error\n"
+
+
 def test_validate_reads_complete_documents_when_os_reads_are_short(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -477,6 +514,35 @@ def test_validate_rejects_a_fifo_without_blocking(
         results.close()
 
 
+def test_validate_rejects_a_fifo_without_nonblock_flag_without_blocking(
+    tmp_path: Path,
+) -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("FIFO promptness probe requires fork")
+    fifo = tmp_path / "trace.fifo"
+    os.mkfifo(fifo)
+    policy = _write_json(tmp_path / "policy.json", _policy())
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    worker = context.Process(
+        target=_main_without_nonblock_in_child,
+        args=(["validate", str(fifo), "--policy", str(policy)], results),
+    )
+    worker.start()
+    try:
+        worker.join(1)
+        assert not worker.is_alive(), (
+            "CLI blocked while opening FIFO without O_NONBLOCK"
+        )
+        assert worker.exitcode == 0
+        assert results.get(timeout=1) == (9, "", "error: io_error\n")
+    finally:
+        if worker.is_alive():
+            worker.terminate()
+        worker.join()
+        results.close()
+
+
 @pytest.mark.parametrize("source_kind", ["directory", "dev_null", "symlink"])
 def test_validate_rejects_non_regular_or_symlinked_trace_inputs(
     tmp_path: Path,
@@ -501,6 +567,33 @@ def test_validate_rejects_non_regular_or_symlinked_trace_inputs(
     assert captured.out == ""
     assert captured.err == "error: io_error\n"
     assert str(source) not in captured.err
+
+
+@pytest.mark.parametrize("source_kind", ["directory", "dev_null", "symlink"])
+def test_validate_rejects_non_regular_or_symlinked_inputs_without_nonblock_flag(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    source_kind: str,
+) -> None:
+    policy = _write_json(tmp_path / "policy.json", _policy())
+    if source_kind == "directory":
+        source = tmp_path / "trace-directory"
+        source.mkdir()
+    elif source_kind == "dev_null":
+        source = Path("/dev/null")
+        if not source.exists():
+            pytest.skip("/dev/null is unavailable")
+    else:
+        target = _write_trace(tmp_path / "valid-target.jsonl", _event())
+        source = tmp_path / "trace-link.jsonl"
+        source.symlink_to(target)
+    monkeypatch.delattr(cli.os, "O_NONBLOCK", raising=False)
+
+    assert cli.main(["validate", str(source), "--policy", str(policy)]) == 9
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: io_error\n"
 
 
 def test_validate_maps_unsafe_policy_and_io_without_leaking_paths(
