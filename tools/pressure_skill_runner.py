@@ -582,31 +582,100 @@ def _signal_process_group(process_group: int, signal_value: signal.Signals) -> N
         pass
 
 
-def _stop_process_group(process_group: int, *, term_sent: bool = False) -> None:
-    """Terminate the fresh selected session even after its leader exits."""
-    if not term_sent:
-        _signal_process_group(process_group, signal.SIGTERM)
-    grace_deadline = time.monotonic() + 0.2
-    while _process_group_exists(process_group) and time.monotonic() < grace_deadline:
-        time.sleep(0.01)
-    if _process_group_exists(process_group):
-        _signal_process_group(process_group, signal.SIGKILL)
-        kill_deadline = time.monotonic() + 0.2
-        while _process_group_exists(process_group) and time.monotonic() < kill_deadline:
-            time.sleep(0.01)
-    if _process_group_exists(process_group):
-        raise PressureProtocolError("pressure_process_group_cleanup_failed")
+def _stop_process_group(process_group: int) -> None:
+    """Begin termination of the fresh selected session before reaping its leader."""
+    _signal_process_group(process_group, signal.SIGTERM)
 
 
 def _cleanup_selected_process(
     process: subprocess.Popen[bytes], process_group: int
 ) -> None:
-    _signal_process_group(process_group, signal.SIGTERM)
+    """Stop the captured session once, then reap its direct leader."""
+    _stop_process_group(process_group)
     try:
         process.wait(timeout=0.2)
     except subprocess.TimeoutExpired as error:
+        _signal_process_group(process_group, signal.SIGKILL)
+        try:
+            process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
         raise PressureProtocolError("pressure_process_group_cleanup_failed") from error
-    _stop_process_group(process_group, term_sent=True)
+    grace_deadline = time.monotonic() + 0.2
+    while _process_group_exists(process_group) and time.monotonic() < grace_deadline:
+        time.sleep(0.01)
+    if _process_group_exists(process_group):
+        _signal_process_group(process_group, signal.SIGKILL)
+    kill_deadline = time.monotonic() + 0.2
+    while _process_group_exists(process_group) and time.monotonic() < kill_deadline:
+        time.sleep(0.01)
+    if _process_group_exists(process_group):
+        raise PressureProtocolError("pressure_process_group_cleanup_failed")
+
+
+def _direct_parent_exited(process_id: int) -> bool:
+    """Observe the leader without reaping its PID before group cleanup."""
+    try:
+        return (
+            os.waitid(
+                os.P_PID,
+                process_id,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+            is not None
+        )
+    except ChildProcessError as error:
+        raise PressureProtocolError("pressure_process_group_cleanup_failed") from error
+
+
+def _read_ready_stream(
+    selector: selectors.BaseSelector,
+    stream: Any,
+    streams: dict[Any, bytearray],
+    maximum: int,
+) -> str | None:
+    chunk = os.read(stream.fileno(), maximum + 1 - len(streams[stream]))
+    if not chunk:
+        selector.unregister(stream)
+        return None
+    streams[stream].extend(chunk)
+    if len(streams[stream]) > maximum:
+        return "pressure_output_too_large"
+    return None
+
+
+def _drain_available_streams(
+    selector: selectors.BaseSelector,
+    streams: dict[Any, bytearray],
+    maximum: int,
+) -> str | None:
+    """Capture every byte already available without waiting on descendants."""
+    while selector.get_map():
+        ready = selector.select(0)
+        if not ready:
+            return None
+        for key, _ in ready:
+            failure = _read_ready_stream(selector, key.fileobj, streams, maximum)
+            if failure is not None:
+                return failure
+    return None
+
+
+def _drain_closed_streams(
+    selector: selectors.BaseSelector,
+    streams: dict[Any, bytearray],
+    maximum: int,
+) -> str | None:
+    """After session cleanup, drain EOF-bound pipes with a short fixed bound."""
+    drain_deadline = time.monotonic() + 0.2
+    while selector.get_map() and time.monotonic() < drain_deadline:
+        for key, _ in selector.select(0.01):
+            failure = _read_ready_stream(selector, key.fileobj, streams, maximum)
+            if failure is not None:
+                return failure
+    if selector.get_map():
+        raise PressureProtocolError("pressure_process_group_cleanup_failed")
+    return None
 
 
 def _run_bounded(
@@ -638,48 +707,30 @@ def _run_bounded(
         for stream in streams:
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ)
-        while selector.get_map():
+        parent_exited = False
+        while not parent_exited:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 failure = "pressure_timeout"
                 break
             for key, _ in selector.select(min(remaining, 0.1)):
-                ready_stream: Any = key.fileobj
-                assert hasattr(ready_stream, "read")
-                chunk = os.read(
-                    ready_stream.fileno(),
-                    maximum + 1 - len(streams[ready_stream]),
-                )
-                if not chunk:
-                    selector.unregister(ready_stream)
-                    continue
-                streams[ready_stream].extend(chunk)
-                if len(streams[ready_stream]) > maximum:
-                    failure = "pressure_output_too_large"
+                failure = _read_ready_stream(selector, key.fileobj, streams, maximum)
+                if failure is not None:
                     break
             if failure is not None:
                 break
+            parent_exited = _direct_parent_exited(process.pid)
+        if failure is None and parent_exited:
+            failure = _drain_available_streams(selector, streams, maximum)
+        cleaned = True
+        _cleanup_selected_process(process, process_group)
+        returncode = process.returncode
         if failure is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                failure = "pressure_timeout"
-            else:
-                try:
-                    process.wait(timeout=remaining)
-                    returncode = process.returncode
-                except subprocess.TimeoutExpired:
-                    failure = "pressure_timeout"
-        if failure is not None:
-            _cleanup_selected_process(process, process_group)
-            cleaned = True
-        else:
-            # Output and the direct return status are complete before normal cleanup.
-            _cleanup_selected_process(process, process_group)
-            cleaned = True
+            failure = _drain_closed_streams(selector, streams, maximum)
     except BaseException:
         if not cleaned:
-            _cleanup_selected_process(process, process_group)
             cleaned = True
+            _cleanup_selected_process(process, process_group)
         raise
     finally:
         selector.close()
