@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import copy
-from pathlib import Path
+import stat
+from hashlib import sha256
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
 from jsonschema import Draft202012Validator
 
-from semantic_reheating.models import TraceEvent
+from semantic_reheating.models import RunPolicy, TraceEvent
 from semantic_reheating.validation import load_public_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +27,8 @@ DETECTOR_ORDER = (
 )
 SCHEMA_PATH = PROJECT_ROOT / "benchmark/schemas/v1/corpus-manifest.schema.json"
 MANIFEST_PATH = PROJECT_ROOT / "benchmark/scenarios/manifest.json"
+POLICY_SOURCE_PATH = "tests/fixtures/contracts/minimal-run-policy.json"
+POLICY_BINDING_VERSION = "1.0"
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -41,6 +45,55 @@ def _validator() -> Draft202012Validator:
 
 def _assert_invalid(validator: Draft202012Validator, source: dict[str, Any]) -> None:
     assert list(validator.iter_errors(source))
+
+
+def _load_effective_policy(
+    manifest: dict[str, Any], *, source_root: Path = PROJECT_ROOT
+) -> RunPolicy:
+    binding = manifest["evaluation_policy"]
+    assert type(binding) is dict
+    assert set(binding) == {
+        "binding_version",
+        "source_path",
+        "source_sha256",
+        "overrides",
+    }
+    assert binding["binding_version"] == POLICY_BINDING_VERSION
+    assert binding["source_path"] == POLICY_SOURCE_PATH
+    assert type(binding["source_sha256"]) is str
+    assert len(binding["source_sha256"]) == 64
+    assert all(
+        character in "0123456789abcdef" for character in binding["source_sha256"]
+    )
+
+    relative_path = PurePosixPath(binding["source_path"])
+    assert not relative_path.is_absolute()
+    assert ".." not in relative_path.parts
+    source_path = source_root.joinpath(*relative_path.parts)
+    assert source_path.resolve(strict=True).is_relative_to(source_root.resolve())
+    source_metadata = source_path.lstat()
+    assert stat.S_ISREG(source_metadata.st_mode)
+    raw_source = source_path.read_bytes()
+    assert sha256(raw_source).hexdigest() == binding["source_sha256"]
+    policy_source = load_public_json(raw_source)
+    assert type(policy_source) is dict
+
+    overrides = binding["overrides"]
+    assert type(overrides) is dict
+    assert set(overrides) == {"detector_windows"}
+    detector_windows = overrides["detector_windows"]
+    assert type(detector_windows) is dict
+    assert set(detector_windows) == {"repetition_events", "no_progress_events"}
+    assert all(
+        type(value) is int and value == 64 for value in detector_windows.values()
+    )
+
+    policy_source = copy.deepcopy(policy_source)
+    policy_source["detectors"]["windows"] = copy.deepcopy(detector_windows)
+    policy = RunPolicy.from_dict(policy_source)
+    assert policy.detectors.windows.repetition_events == 64
+    assert policy.detectors.windows.no_progress_events == 64
+    return policy
 
 
 def _assert_relational_bindings(source: dict[str, Any]) -> None:
@@ -60,6 +113,78 @@ def test_manifest_schema_and_minimal_contract_are_closed_and_versioned() -> None
     schema = _load(SCHEMA_PATH)
     assert schema["additionalProperties"] is False
     assert schema["properties"]["entries"]["items"]["additionalProperties"] is False
+
+
+def test_manifest_evaluation_policy_is_exact_digest_bound_and_effective() -> None:
+    manifest = _load(MANIFEST_PATH)
+
+    policy = _load_effective_policy(manifest)
+
+    assert policy.to_dict()["detectors"]["windows"] == {
+        "repetition_events": 64,
+        "no_progress_events": 64,
+    }
+
+
+def test_manifest_evaluation_policy_schema_rejects_invalid_bindings() -> None:
+    validator = _validator()
+    manifest = _load(MANIFEST_PATH)
+
+    missing_binding = copy.deepcopy(manifest)
+    del missing_binding["evaluation_policy"]
+    _assert_invalid(validator, missing_binding)
+
+    unknown_binding_field = copy.deepcopy(manifest)
+    unknown_binding_field["evaluation_policy"]["unexpected"] = True
+    _assert_invalid(validator, unknown_binding_field)
+
+    unknown_override_field = copy.deepcopy(manifest)
+    unknown_override_field["evaluation_policy"]["overrides"]["unexpected"] = True
+    _assert_invalid(validator, unknown_override_field)
+
+    unknown_window_field = copy.deepcopy(manifest)
+    unknown_window_field["evaluation_policy"]["overrides"]["detector_windows"][
+        "unexpected"
+    ] = 64
+    _assert_invalid(validator, unknown_window_field)
+
+    wrong_binding_major = copy.deepcopy(manifest)
+    wrong_binding_major["evaluation_policy"]["binding_version"] = "2.0"
+    _assert_invalid(validator, wrong_binding_major)
+
+    unsafe_source_path = copy.deepcopy(manifest)
+    unsafe_source_path["evaluation_policy"]["source_path"] = "../policy.json"
+    _assert_invalid(validator, unsafe_source_path)
+
+    malformed_digest = copy.deepcopy(manifest)
+    malformed_digest["evaluation_policy"]["source_sha256"] = "not-a-sha256"
+    _assert_invalid(validator, malformed_digest)
+
+    non_64_window = copy.deepcopy(manifest)
+    non_64_window["evaluation_policy"]["overrides"]["detector_windows"][
+        "repetition_events"
+    ] = 63
+    _assert_invalid(validator, non_64_window)
+
+    out_of_range_window = copy.deepcopy(manifest)
+    out_of_range_window["evaluation_policy"]["overrides"]["detector_windows"][
+        "no_progress_events"
+    ] = 65
+    _assert_invalid(validator, out_of_range_window)
+
+
+def test_manifest_evaluation_policy_helper_rejects_stale_digest_and_missing_source(
+    tmp_path: Path,
+) -> None:
+    manifest = _load(MANIFEST_PATH)
+
+    stale_digest = copy.deepcopy(manifest)
+    stale_digest["evaluation_policy"]["source_sha256"] = "0" * 64
+    with pytest.raises(AssertionError):
+        _load_effective_policy(stale_digest)
+
+    with pytest.raises(FileNotFoundError):
+        _load_effective_policy(manifest, source_root=tmp_path)
 
 
 def test_manifest_schema_rejects_unknown_fields_versions_and_invalid_enums() -> None:
@@ -191,6 +316,35 @@ def test_pathological_scenarios_declare_their_intended_detectors() -> None:
         for entry in entries.values()
         if entry["label"] == "productive_control"
     )
+
+
+def _coherent_safety_outcome(entry: dict[str, Any]) -> str:
+    decision = entry["expected_decision"]
+    if decision == "continue":
+        return {
+            ("pathological", True): "advisory_continue",
+            ("pathological", False): "advisory_continue",
+            ("productive_control", False): "safe_continue",
+        }[(entry["label"], bool(entry["expected_detector_names"]))]
+    if decision in {"nudge", "diagnose", "reheat", "restart"}:
+        return "recovery"
+    return {"escalate": "escalated", "stop": "hard_stop"}[decision]
+
+
+def test_manifest_safety_outcomes_are_coherent_with_decisions_and_context() -> None:
+    entries = _load(MANIFEST_PATH)["entries"]
+
+    deviations = [
+        (
+            entry["scenario_id"],
+            entry["expected_safety_outcome"],
+            _coherent_safety_outcome(entry),
+        )
+        for entry in entries
+        if entry["expected_safety_outcome"] != _coherent_safety_outcome(entry)
+    ]
+
+    assert deviations == []
 
 
 def _load_trace(entry: dict[str, Any]) -> list[TraceEvent]:

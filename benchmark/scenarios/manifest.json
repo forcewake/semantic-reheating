@@ -1,6 +1,17 @@
 {
   "schema_version": "1.0",
   "corpus_version": "1.0",
+  "evaluation_policy": {
+    "binding_version": "1.0",
+    "source_path": "tests/fixtures/contracts/minimal-run-policy.json",
+    "source_sha256": "efee76a502a7c3f475e88160e4f2d10e1b8d3789658e5b9e93031bc63a6068b6",
+    "overrides": {
+      "detector_windows": {
+        "repetition_events": 64,
+        "no_progress_events": 64
+      }
+    }
+  },
   "entries": [
     {
       "schema_version": "1.0",
@@ -21,7 +32,7 @@
         "event-005",
         "event-006"
       ],
-      "expected_safety_outcome": "advisory_continue"
+      "expected_safety_outcome": "recovery"
     },
     {
       "schema_version": "1.0",
@@ -38,7 +49,7 @@
         "event-002",
         "event-003"
       ],
-      "expected_safety_outcome": "recovery"
+      "expected_safety_outcome": "advisory_continue"
     },
     {
       "schema_version": "1.0",

@@ -5,10 +5,36 @@
   "description": "Closed public index for redacted synthetic reheating traces.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "corpus_version", "entries"],
+  "required": ["schema_version", "corpus_version", "evaluation_policy", "entries"],
   "properties": {
     "schema_version": {"const": "1.0"},
     "corpus_version": {"const": "1.0"},
+    "evaluation_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binding_version", "source_path", "source_sha256", "overrides"],
+      "properties": {
+        "binding_version": {"const": "1.0"},
+        "source_path": {"const": "tests/fixtures/contracts/minimal-run-policy.json"},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "overrides": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["detector_windows"],
+          "properties": {
+            "detector_windows": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["repetition_events", "no_progress_events"],
+              "properties": {
+                "repetition_events": {"const": 64},
+                "no_progress_events": {"const": 64}
+              }
+            }
+          }
+        }
+      }
+    },
     "entries": {
       "type": "array",
       "minItems": 24,
