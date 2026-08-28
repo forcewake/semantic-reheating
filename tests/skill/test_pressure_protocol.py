@@ -2230,10 +2230,12 @@ def test_sealed_snapshot_failure_paths_close_the_memfd(
     elif failure == "seal":
         original_fcntl = runner.fcntl.fcntl
 
-        def failed_seal(descriptor: int, command: int, *args: object) -> int:
+        def failed_seal(
+            descriptor: int, command: int, argument: int | bytes = 0
+        ) -> int | bytes:
             if command == runner._F_ADD_SEALS:
                 raise OSError("injected_seal")
-            return original_fcntl(descriptor, command, *args)
+            return original_fcntl(descriptor, command, argument)
 
         monkeypatch.setattr(runner.fcntl, "fcntl", failed_seal)
     elif failure == "read":
