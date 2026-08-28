@@ -54,6 +54,8 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 addopts = "-m 'not pressure_live'"
+# Benchmark is a committed, importable offline replay package used by golden tests.
+pythonpath = ["."]
 markers = [
   "pressure_live: marks tests that require an explicitly selected live pressure environment",
 ]
