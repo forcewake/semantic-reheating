@@ -223,6 +223,14 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         "skills/semantic-reheating/references/stack-receipt.schema.json",
         "skills/semantic-reheating/references/baseline-summary.schema.json",
     }
+    tracked = subprocess.run(
+        ["git", "ls-files", "--cached", "--", *sorted(allowed)],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert set(tracked) == allowed
     untracked = subprocess.run(
         ["git", "ls-files", "--others", "--exclude-standard"],
         cwd=PROJECT_ROOT,
@@ -230,6 +238,7 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         text=True,
         check=True,
     ).stdout.splitlines()
+    assert set(untracked) <= allowed
     staged = subprocess.run(
         ["git", "diff", "--cached", "--name-only"],
         cwd=PROJECT_ROOT,
@@ -237,7 +246,7 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         text=True,
         check=True,
     ).stdout.splitlines()
-    assert set(untracked) | set(staged) == allowed
+    assert set(staged) <= allowed
     unstaged = subprocess.run(
         ["git", "diff", "--name-only"],
         cwd=PROJECT_ROOT,
