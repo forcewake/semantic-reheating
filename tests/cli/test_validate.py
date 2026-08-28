@@ -113,6 +113,23 @@ def test_benchmark_invalid_io_is_sanitized(
     assert captured.err == "error: io_error\n"
 
 
+def test_benchmark_unavailable_loader_failure_is_typed_and_sanitized(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unavailable() -> tuple[type[Exception], object]:
+        raise cli._CliFailure(cli.EXIT_BENCHMARK_UNAVAILABLE)
+
+    monkeypatch.setattr(cli, "_trusted_replay", unavailable)
+
+    assert (
+        cli.main(["benchmark", "benchmark/corpus", "--manifest", "manifest.json"])
+        == cli.EXIT_BENCHMARK_UNAVAILABLE
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: benchmark_unavailable\n"
+
+
 def test_validate_emits_only_canonical_status_record(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

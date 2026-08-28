@@ -483,7 +483,114 @@ def _revision(manifest: dict[str, Any], traces: tuple[_CapturedTrace, ...]) -> s
     return sha256(payload).hexdigest()
 
 
-def validate_result(
+_MANIFEST_ENTRY_KEYS = frozenset(
+    {
+        "schema_version",
+        "scenario_id",
+        "trace_path",
+        "label",
+        "scenario_type",
+        "expected_detector_names",
+        "expected_decision",
+        "expected_evidence_event_ids",
+        "expected_safety_outcome",
+    }
+)
+_ENTRY_STRING_KEYS = frozenset(
+    {
+        "schema_version",
+        "scenario_id",
+        "trace_path",
+        "label",
+        "scenario_type",
+        "expected_decision",
+        "expected_safety_outcome",
+    }
+)
+_ENTRY_LIST_KEYS = frozenset({"expected_detector_names", "expected_evidence_event_ids"})
+_RESULT_BINDING_STRING_KEYS = frozenset(
+    {
+        "scenario_id",
+        "label",
+        "trace_sha256",
+        "expected_decision",
+        "expected_safety_outcome",
+    }
+)
+_RESULT_BINDING_LIST_KEYS = frozenset(
+    {"expected_detector_names", "expected_evidence_event_ids"}
+)
+
+
+def _closed_manifest_entry(value: object) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != _MANIFEST_ENTRY_KEYS:
+        _fail("invalid_schema")
+    if any(type(value[key]) is not str for key in _ENTRY_STRING_KEYS) or any(
+        type(value[key]) is not list
+        or any(type(item) is not str for item in value[key])
+        for key in _ENTRY_LIST_KEYS
+    ):
+        _fail("invalid_schema")
+    return value
+
+
+def _validate_contextual_binding(
+    result: dict[str, Any],
+    records: list[dict[str, Any]],
+    manifest: object,
+    traces: object,
+    policy_sha256: object,
+) -> None:
+    if (
+        type(manifest) is not dict
+        or type(manifest.get("entries")) is not list
+        or type(traces) is not tuple
+        or type(policy_sha256) is not str
+    ):
+        _fail("invalid_schema")
+    entries = manifest["entries"]
+    if (
+        not (len(records) == len(traces) == len(entries))
+        or len(records) > MAX_MANIFEST_ENTRIES
+    ):
+        _fail("invalid_schema")
+    for item, captured, entry in zip(records, traces, entries, strict=True):
+        if type(captured) is not _CapturedTrace or type(captured.raw) is not bytes:
+            _fail("invalid_schema")
+        captured_entry = _closed_manifest_entry(captured.entry)
+        manifest_entry = _closed_manifest_entry(entry)
+        if captured_entry != manifest_entry:
+            _fail("invalid_schema")
+        if any(
+            type(item.get(key)) is not str for key in _RESULT_BINDING_STRING_KEYS
+        ) or any(
+            type(item.get(key)) is not list
+            or any(type(value) is not str for value in item[key])
+            for key in _RESULT_BINDING_LIST_KEYS
+        ):
+            _fail("invalid_schema")
+        if (
+            any(
+                item[key] != manifest_entry[key]
+                for key in (
+                    "scenario_id",
+                    "label",
+                    "expected_detector_names",
+                    "expected_decision",
+                    "expected_evidence_event_ids",
+                    "expected_safety_outcome",
+                )
+            )
+            or item["trace_sha256"] != sha256(captured.raw).hexdigest()
+        ):
+            _fail("invalid_schema")
+    if result.get("corpus_revision") != _revision(manifest, traces):
+        _fail("invalid_schema")
+    if result.get("policy_sha256") != policy_sha256:
+        _fail("invalid_schema")
+
+
+def _validate_result(
     result: object,
     *,
     manifest: dict[str, Any] | None = None,
@@ -556,11 +663,32 @@ def validate_result(
             _fail("invalid_schema")
     except MetricsError:
         _fail("invalid_schema")
-    if manifest is not None and traces is not None:
-        if result.get("corpus_revision") != _revision(manifest, traces):
+    contextual = manifest is not None or traces is not None or policy_sha256 is not None
+    if contextual:
+        if manifest is None or traces is None or policy_sha256 is None:
             _fail("invalid_schema")
-        if policy_sha256 is None or result.get("policy_sha256") != policy_sha256:
-            _fail("invalid_schema")
+        _validate_contextual_binding(result, records, manifest, traces, policy_sha256)
+
+
+def validate_result(
+    result: object,
+    *,
+    manifest: dict[str, Any] | None = None,
+    traces: tuple[_CapturedTrace, ...] | None = None,
+    policy_sha256: str | None = None,
+) -> None:
+    """Validate result relations; contextual inputs are required for provenance."""
+    try:
+        _validate_result(
+            result,
+            manifest=manifest,
+            traces=traces,
+            policy_sha256=policy_sha256,
+        )
+    except BenchmarkError:
+        raise
+    except Exception:  # noqa: BLE001 - untrusted standalone inputs fail closed.
+        _fail("invalid_schema")
 
 
 def replay_result(corpus: Path, manifest_path: Path) -> dict[str, Any]:

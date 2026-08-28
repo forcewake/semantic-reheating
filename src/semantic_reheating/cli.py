@@ -42,6 +42,7 @@ _ERROR_NAMES = {
     EXIT_INCOMPATIBLE_VERSION: "incompatible_version",
     EXIT_UNSAFE_POLICY: "unsafe_policy",
     EXIT_REQUIRED_DETECTOR_UNAVAILABLE: "required_detector_unavailable",
+    EXIT_BENCHMARK_UNAVAILABLE: "benchmark_unavailable",
     EXIT_IO: "io_error",
     EXIT_INTERNAL: "internal_error",
 }
