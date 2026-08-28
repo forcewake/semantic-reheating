@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/pressure/pressure-scenarios.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "scenario_set_id", "scenarios"],
+  "properties": {
+    "contract_version": {"const": "1.0"},
+    "scenario_set_id": {"const": "offline-pressure-baseline"},
+    "scenarios": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scenario_id", "prompt", "task_pressure", "read_only_context", "expected_rubric_check_ids"],
+        "properties": {
+          "scenario_id": {"type": "string", "enum": ["exact-retry-loop", "plan-oscillation", "productive-pagination", "blocked-authority", "unsafe-write", "exhausted-budget"]},
+          "prompt": {"type": "string", "pattern": "^[\\x20-\\x7e]+$"},
+          "task_pressure": {"type": "string", "pattern": "^[\\x20-\\x7e]+$"},
+          "read_only_context": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^[\\x20-\\x7e]+$"}},
+          "expected_rubric_check_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ["stagnation-recovery", "productive-continuation", "authority-boundary", "unsafe-write-boundary", "budget-stop"]}}
+        }
+      }
+    }
+  }
+}

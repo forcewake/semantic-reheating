@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/pressure/baseline-summary.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "mode", "scenario_set_sha256", "rubric_sha256", "stack_config_sha256", "command_sha256", "supports", "outcomes", "budget_consumption"],
+  "properties": {
+    "contract_version": {"const": "1.0"},
+    "mode": {"const": "baseline"},
+    "scenario_set_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "rubric_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "stack_config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "command_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "supports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seed", "decoding", "usage_report", "enforcement"],
+      "properties": {
+        "seed": {"type": "string", "enum": ["supported", "unsupported"]},
+        "decoding": {"type": "string", "enum": ["supported", "unsupported"]},
+        "usage_report": {"type": "string", "enum": ["supported", "unsupported"]},
+        "enforcement": {"type": "string", "enum": ["hard", "reported", "unsupported"]}
+      }
+    },
+    "outcomes": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scenario_id", "outcome_code"],
+        "properties": {
+          "scenario_id": {"type": "string", "enum": ["exact-retry-loop", "plan-oscillation", "productive-pagination", "blocked-authority", "unsafe-write", "exhausted-budget"]},
+          "outcome_code": {"type": "string", "enum": ["pass", "malformed-output", "stagnation-not-reheated", "pagination-not-continued", "authority-not-escalated", "unsafe-write-attempt", "budget-not-stopped"]}
+        }
+      }
+    },
+    "budget_consumption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turns", "tools", "tokens", "elapsed_seconds", "cost"],
+      "properties": {
+        "turns": {"type": "integer", "minimum": 0},
+        "tools": {"type": "integer", "minimum": 0},
+        "tokens": {"type": "integer", "minimum": 0},
+        "elapsed_seconds": {"type": "integer", "minimum": 0},
+        "cost": {"type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$"}
+      }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/pressure/stack-receipt.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "mode", "command_sha256", "stack_metadata", "supports"],
+  "properties": {
+    "contract_version": {"const": "1.0"},
+    "mode": {"const": "baseline"},
+    "command_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "stack_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cli", "framework", "model", "provider", "version", "executable_sha256"],
+      "properties": {
+        "cli": {"type": "string"},
+        "framework": {"type": "string"},
+        "model": {"type": "string"},
+        "provider": {"type": "string"},
+        "version": {"type": "string"},
+        "executable_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "supports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seed", "decoding", "usage_report", "enforcement"],
+      "properties": {
+        "seed": {"type": "string", "enum": ["supported", "unsupported"]},
+        "decoding": {"type": "string", "enum": ["supported", "unsupported"]},
+        "usage_report": {"type": "string", "enum": ["supported", "unsupported"]},
+        "enforcement": {"type": "string", "enum": ["hard", "reported", "unsupported"]}
+      }
+    }
+  }
+}
