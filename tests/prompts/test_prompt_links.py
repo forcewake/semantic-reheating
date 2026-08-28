@@ -209,6 +209,86 @@ def _parse_reference_destination(text: str, start: int, limit: int) -> tuple[int
     return _parse_bare_destination(text, start, limit)
 
 
+def _consume_opaque_html_construct(text: str, start: int) -> int | None:
+    """Return the exclusive end of a bounded opaque HTML construct."""
+    assert text[start] == "<"
+    if text.startswith("<!--", start):
+        end = text.find("-->", start + 4)
+        if end == -1:
+            raise _malformed("unclosed HTML comment")
+        return end + 3
+    if text.startswith("<?", start):
+        end = text.find("?>", start + 2)
+        if end == -1:
+            raise _malformed("unclosed HTML instruction")
+        return end + 2
+    if text.startswith("<![CDATA[", start):
+        end = text.find("]]>", start + 9)
+        if end == -1:
+            raise _malformed("unclosed CDATA section")
+        return end + 3
+    if not text.startswith("<!", start):
+        return None
+
+    quote: str | None = None
+    depth = 1
+    index = start + 2
+    limit = min(len(text), start + _MAX_PROMPT_BYTES)
+    while index < limit:
+        character = text[index]
+        if quote is not None:
+            if character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character == "<":
+            depth += 1
+        elif character == ">":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    raise _malformed("unclosed HTML declaration")
+
+
+def _find_angle_end(text: str, start: int) -> int | None:
+    """Find an angle construct's exclusive end without treating quoted > as close."""
+    assert text[start] == "<"
+    quote: str | None = None
+    index = start + 1
+    limit = min(len(text), start + _MAX_PROMPT_BYTES)
+    while index < limit:
+        character = text[index]
+        if quote is not None:
+            if character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character == ">":
+            return index + 1
+        index += 1
+    return None
+
+
+def _mask_opaque_html(text: str) -> str:
+    """Mask opaque HTML constructs and recognized tags before link parsing."""
+    characters = list(text)
+    index = 0
+    while index < len(text):
+        if text[index] == "<":
+            end = _consume_opaque_html_construct(text, index)
+            if end is None:
+                end = _find_angle_end(text, index)
+                if end is None or not _looks_like_html_tag(text[index + 1 : end - 1]):
+                    index += 1
+                    continue
+            _mask_range(characters, index, end)
+            index = end
+            continue
+        index += 1
+    return "".join(characters)
+
+
 def _looks_like_html_tag(candidate: str) -> bool:
     """Recognize bounded HTML-like angle syntax without swallowing paths."""
     if candidate.startswith(("!", "?")):
@@ -304,7 +384,7 @@ def _mask_definitions(visible: str) -> tuple[str, dict[str, str]]:
 def _markdown_targets(markdown: str) -> list[str]:
     """Extract local targets with a bounded, escape-aware Markdown scanner."""
     assert len(markdown.encode("utf-8")) <= _MAX_PROMPT_BYTES, "prompt exceeds 64KiB"
-    visible, definitions = _mask_definitions(_mask_code(markdown))
+    visible, definitions = _mask_definitions(_mask_opaque_html(_mask_code(markdown)))
     targets: list[str] = []
     index = 0
     while index < len(visible):
@@ -342,13 +422,19 @@ def _markdown_targets(markdown: str) -> list[str]:
         if character == "]":
             raise _malformed("stray closing bracket")
         if character == "<":
-            end = visible.find(">", index + 1)
-            if end != -1:
-                candidate = visible[index + 1 : end]
+            opaque_end = _consume_opaque_html_construct(visible, index)
+            if opaque_end is not None:
+                index = opaque_end
+                continue
+            end = _find_angle_end(visible, index)
+            if end is not None:
+                candidate = visible[index + 1 : end - 1]
+                if _looks_like_html_tag(candidate):
+                    index = end
+                    continue
                 parsed = urlsplit(candidate)
                 if (
                     candidate
-                    and not _looks_like_html_tag(candidate)
                     and not any(value in candidate for value in " \t\r\n=<")
                     and (
                         parsed.scheme
@@ -359,7 +445,7 @@ def _markdown_targets(markdown: str) -> list[str]:
                     )
                 ):
                     targets.append(candidate)
-                    index = end + 1
+                    index = end
                     continue
         index += 1
     # Definitions are destinations too. Preserve them even when unused, so a
@@ -565,6 +651,44 @@ def test_link_parser_distinguishes_html_tags_from_angle_targets() -> None:
 
 def test_link_parser_ignores_malformed_angle_input_deterministically() -> None:
     assert _markdown_targets("<unterminated <>") == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "<!-- <file:///etc/passwd> -->",
+        "<!DOCTYPE <file:///etc/passwd>>",
+        "<?instruction <file:///etc/passwd>?>",
+    ),
+)
+def test_link_parser_skips_opaque_html_constructs_without_reparsing_contents(
+    source: str,
+) -> None:
+    assert _markdown_targets(source) == []
+
+
+def test_link_parser_skips_opaque_html_comments_cdata_and_tags() -> None:
+    local = "../contracts/v1/evidence-record.schema.json"
+    source = (
+        f"<!-- [ordinary]({local}) <{local}> -->\n"
+        f"<!-- multiline\n[comment]({local})\n<{local}>\n-->\n"
+        f"<![CDATA[[cdata]({local}) <{local}>]]>\n"
+        f'<span title=">" data-link="[nested]({local}) <{local}>">'
+    )
+    assert _markdown_targets(source) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "<!-- <file:///etc/passwd>",
+        "<?instruction <file:///etc/passwd>",
+        "<!DOCTYPE <file:///etc/passwd>",
+    ),
+)
+def test_link_parser_rejects_unterminated_opaque_html_constructs(source: str) -> None:
+    with pytest.raises(AssertionError, match="malformed_markdown_link"):
+        _markdown_targets(source)
 
 
 def test_current_prompt_assets_have_the_exact_seven_schema_targets() -> None:
