@@ -4,6 +4,7 @@ import json
 import re
 import unicodedata
 from copy import deepcopy
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -101,8 +102,18 @@ def _prompt_paths() -> list[Path]:
 
 def _read_prompt(path: Path) -> str:
     data = path.read_bytes()
-    assert not data.startswith(b"\xef\xbb\xbf"), f"{path.name} has a UTF-8 BOM"
-    assert b"\r" not in data, f"{path.name} must use LF only"
+    invalid_byte = next(
+        (
+            (offset, value)
+            for offset, value in enumerate(data)
+            if value != 0x0A and not 0x20 <= value <= 0x7E
+        ),
+        None,
+    )
+    if invalid_byte is not None:
+        raise AssertionError(
+            f"unsafe_prompt_byte at byte {invalid_byte[0]}: 0x{invalid_byte[1]:02X}"
+        )
     assert data.endswith(b"\n"), f"{path.name} must end with one final LF"
     assert data.strip(), f"{path.name} is empty"
     assert len(data) <= 64 * 1024, f"{path.name} exceeds 64 KiB"
@@ -160,10 +171,16 @@ def _records(text: str) -> list[tuple[str, dict[str, Any]]]:
     return parsed
 
 
-def _schema_for(kind: str) -> dict[str, Any]:
-    from semantic_reheating.validation import PUBLIC_CONTRACT_SCHEMAS
+def _runtime_module(name: str) -> Any:
+    """Import untyped runtime-only test dependencies without widening mypy scope."""
+    return import_module(name)
 
-    return json.loads((PROJECT_ROOT / PUBLIC_CONTRACT_SCHEMAS[kind]).read_text())
+
+def _schema_for(kind: str) -> dict[str, Any]:
+    validation = _runtime_module("semantic_reheating.validation")
+    return json.loads(
+        (PROJECT_ROOT / validation.PUBLIC_CONTRACT_SCHEMAS[kind]).read_text()
+    )
 
 
 def _assert_schema_shape(schema: dict[str, Any], value: Any) -> None:
@@ -186,13 +203,11 @@ def _assert_schema_shape(schema: dict[str, Any], value: Any) -> None:
 
 
 def _runtime_validate(kind: str, value: dict[str, Any]) -> None:
-    from semantic_reheating.validation import validate_public_artifact
-
-    assert validate_public_artifact(kind, value) == value
+    validation = _runtime_module("semantic_reheating.validation")
+    assert validation.validate_public_artifact(kind, value) == value
     if kind == "decision_envelope":
-        from semantic_reheating.models import DecisionEnvelope
-
-        assert DecisionEnvelope.from_dict(value).to_dict() == value
+        models = _runtime_module("semantic_reheating.models")
+        assert models.DecisionEnvelope.from_dict(value).to_dict() == value
 
 
 def _validate_record(kind: str, value: dict[str, Any]) -> None:
@@ -307,12 +322,34 @@ def test_prompt_assets_are_utf8_bounded_and_structured(path: Path) -> None:
     _validate_common_prompt(path.name, _read_prompt(path))
 
 
-def test_read_prompt_rejects_non_ascii_confusables(tmp_path: Path) -> None:
+def test_read_prompt_rejects_non_ascii_bytes_before_decoding(tmp_path: Path) -> None:
     prompt = tmp_path / "prompt.md"
     for confusable in ("а", "α", "ａ"):
         prompt.write_text(f"Operational English {confusable}.\n", encoding="utf-8")
-        with pytest.raises(AssertionError, match=r"non_ascii_prompt_content.*U\+"):
+        with pytest.raises(AssertionError, match=r"unsafe_prompt_byte at byte \d+: 0x"):
             _read_prompt(prompt)
+
+
+@pytest.mark.parametrize("source_path", _prompt_paths(), ids=lambda path: path.name)
+def test_read_prompt_rejects_every_non_lf_control_byte_before_decoding(
+    tmp_path: Path, source_path: Path
+) -> None:
+    prompt = tmp_path / "prompt.md"
+    controls = tuple(byte for byte in range(0x20) if byte != 0x0A) + (0x7F,)
+    assert len(controls) == 32
+    original = source_path.read_bytes()
+    assert original.endswith(b"\n")
+    assert _read_prompt(source_path)
+    for control in controls:
+        prompt.write_bytes(original[:-1] + bytes((control,)) + b"\n")
+        with pytest.raises(
+            AssertionError,
+            match=rf"unsafe_prompt_byte at byte \d+: 0x{control:02X}",
+        ) as raised:
+            _read_prompt(prompt)
+        assert str(raised.value) == (
+            f"unsafe_prompt_byte at byte {len(original) - 1}: 0x{control:02X}"
+        )
 
 
 @pytest.mark.parametrize("path", _prompt_paths(), ids=lambda path: path.name)
@@ -324,9 +361,9 @@ def test_prompt_record_inventory_is_exact_and_examples_validate_schema_and_runti
     for label, value in records:
         kind = RECORD_KIND[label]
         schema = _schema_for(kind)
-        from semantic_reheating.validation import PUBLIC_CONTRACT_SCHEMAS
+        validation = _runtime_module("semantic_reheating.validation")
 
-        schema_name = Path(PUBLIC_CONTRACT_SCHEMAS[kind]).name
+        schema_name = Path(validation.PUBLIC_CONTRACT_SCHEMAS[kind]).name
         assert re.search(
             rf"### Structured record: {label}\n.*?\]\(\.\./contracts/v1/{re.escape(schema_name)}\)",
             _section(_read_prompt(path), "Output contract"),
@@ -536,7 +573,7 @@ def test_bounded_reheating_has_only_the_exact_strict_annealing_nonclaim() -> Non
 @pytest.mark.parametrize("path", _prompt_paths(), ids=lambda path: path.name)
 def test_prompt_hygiene_is_public_and_non_secret(path: Path) -> None:
     text = _read_prompt(path).lower()
-    forbidden = (
+    forbidden: tuple[str, ...] = (
         ".hermes",
         "/home/",
         "private chat",
@@ -570,11 +607,11 @@ def _closed_nested_objects(
 
 
 def _assert_rejected_by_schema_and_runtime(kind: str, invalid: dict[str, Any]) -> None:
-    from semantic_reheating.validation import ContractValidationError
+    validation = _runtime_module("semantic_reheating.validation")
 
     with pytest.raises(ValidationError):
         Draft202012Validator(_schema_for(kind)).validate(invalid)
-    with pytest.raises(ContractValidationError):
+    with pytest.raises(validation.ContractValidationError):
         _runtime_validate(kind, invalid)
 
 

@@ -4,6 +4,8 @@ import os
 import re
 import stat
 import string
+import sys
+from collections import Counter
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -251,8 +253,8 @@ def _consume_opaque_html_construct(text: str, start: int) -> int | None:
     raise _malformed("unclosed HTML declaration")
 
 
-def _find_angle_end(text: str, start: int) -> int | None:
-    """Find an angle construct's exclusive end without treating quoted > as close."""
+def _find_angle_end(text: str, start: int) -> int:
+    """Consume one generic angle construct without retrying nested starts."""
     assert text[start] == "<"
     quote: str | None = None
     index = start + 1
@@ -260,14 +262,16 @@ def _find_angle_end(text: str, start: int) -> int | None:
     while index < limit:
         character = text[index]
         if quote is not None:
-            if character == quote:
+            if character == quote and not _is_escaped(text, index):
                 quote = None
         elif character in "\"'":
             quote = character
+        elif character == "<" and not _is_escaped(text, index):
+            raise _malformed("nested generic angle construct")
         elif character == ">":
             return index + 1
         index += 1
-    return None
+    raise _malformed("unclosed generic angle construct")
 
 
 def _mask_opaque_html(text: str) -> str:
@@ -298,7 +302,10 @@ def _looks_like_html_tag(candidate: str) -> bool:
     if index >= len(candidate) or candidate[index] not in string.ascii_letters:
         return False
     index += 1
-    while index < len(candidate) and candidate[index] in string.ascii_letters + string.digits + "-":
+    while (
+        index < len(candidate)
+        and candidate[index] in string.ascii_letters + string.digits + "-"
+    ):
         index += 1
 
     if index == len(candidate) or candidate[index] == "/":
@@ -517,8 +524,13 @@ def _validate_links(
         assert stat.S_ISREG(target_stat.st_mode), target
         if separator:
             target_text = target_path.read_text(encoding="utf-8")
-            headings = {_slug(value) for value in HEADING.findall(target_text)}
-            assert fragment in headings, target
+            heading_counts = Counter(
+                _slug(value) for value in HEADING.findall(target_text)
+            )
+            if heading_counts[fragment] == 0:
+                raise AssertionError(f"missing fragment: {fragment!r}")
+            if heading_counts[fragment] != 1:
+                raise AssertionError(f"ambiguous fragment: {fragment!r}")
 
 
 def _reject_fifo_consumption(monkeypatch: pytest.MonkeyPatch, fifo: Path) -> None:
@@ -649,8 +661,72 @@ def test_link_parser_distinguishes_html_tags_from_angle_targets() -> None:
     ]
 
 
-def test_link_parser_ignores_malformed_angle_input_deterministically() -> None:
-    assert _markdown_targets("<unterminated <>") == []
+@pytest.mark.parametrize("source", ("<unterminated", "<unterminated <>"))
+def test_link_parser_rejects_malformed_angle_input_deterministically(
+    source: str,
+) -> None:
+    with pytest.raises(AssertionError, match="malformed_markdown_link"):
+        _markdown_targets(source)
+
+
+def test_link_parser_stops_after_one_generic_scan_for_malformed_nested_angle_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = _find_angle_end
+
+    def counted_angle_end(text: str, start: int) -> int:
+        nonlocal calls
+        calls += 1
+        return original(text, start)
+
+    monkeypatch.setattr(sys.modules[__name__], "_find_angle_end", counted_angle_end)
+    with pytest.raises(AssertionError, match="malformed_markdown_link"):
+        _markdown_targets("<a<a>")
+    assert calls <= 1
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "<" * 65535 + ">",
+        "<a" * 32767 + "<>",
+    ),
+    ids=("run", "viable-looking-nested-starts"),
+)
+def test_link_parser_rejects_64kib_malformed_nested_angles_after_one_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    calls = 0
+    original = _find_angle_end
+
+    def counted_angle_end(text: str, start: int) -> int:
+        nonlocal calls
+        calls += 1
+        return original(text, start)
+
+    monkeypatch.setattr(sys.modules[__name__], "_find_angle_end", counted_angle_end)
+    with pytest.raises(AssertionError, match="malformed_markdown_link"):
+        _markdown_targets(source)
+    assert calls == 1
+
+
+def test_link_parser_scans_many_short_valid_angle_constructs_linearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = _find_angle_end
+    source = "<br/>" * (60 * 1024 // len("<br/>"))
+
+    def counted_angle_end(text: str, start: int) -> int:
+        nonlocal calls
+        calls += 1
+        return original(text, start)
+
+    monkeypatch.setattr(sys.modules[__name__], "_find_angle_end", counted_angle_end)
+    assert _markdown_targets(source) == []
+    assert calls == source.count("<")
 
 
 @pytest.mark.parametrize(
@@ -778,6 +854,25 @@ def test_link_validation_resolves_collapsed_and_shortcut_references(
         "![alt][SAFE ID] ![Safe ID][] ![safe id]\n"
     )
     _validate_links(prompt, markdown, root)
+
+
+def test_link_validation_accepts_unique_and_rejects_ambiguous_or_missing_fragments(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "pack"
+    prompt_dir = root / "prompts"
+    contract_dir = root / "contracts"
+    prompt_dir.mkdir(parents=True)
+    contract_dir.mkdir()
+    target = contract_dir / "safe.md"
+    target.write_text("# Unique heading\n# Duplicate\n# duplicate\n", encoding="utf-8")
+    prompt = prompt_dir / "notice.md"
+
+    _validate_links(prompt, "[safe](../contracts/safe.md#unique-heading)\n", root)
+    with pytest.raises(AssertionError, match="ambiguous fragment"):
+        _validate_links(prompt, "[bad](../contracts/safe.md#duplicate)\n", root)
+    with pytest.raises(AssertionError, match="missing fragment"):
+        _validate_links(prompt, "[bad](../contracts/safe.md#absent)\n", root)
 
 
 def test_link_validation_rejects_images_autolinks_and_escape_mutations() -> None:
