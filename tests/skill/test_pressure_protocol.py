@@ -477,9 +477,7 @@ def test_cgroup_launch_record_is_unlinked_and_secret_never_reaches_service_argv(
     context = runner._CgroupContext(
         systemd_run="/usr/bin/systemd-run",
         systemctl="/usr/bin/systemctl",
-        helper_path="/private/helper.py",
-        helper_sha256="1" * 64,
-        helper_identity=(1, 1),
+        helper_snapshot=runner._SealedSnapshot(-1, "/proc/1/fd/3", "1" * 64, 1),
         python_path="/private/python",
         python_sha256="2" * 64,
         python_identity=(2, 2),
@@ -511,6 +509,9 @@ def test_cgroup_launch_record_is_unlinked_and_secret_never_reaches_service_argv(
                     tmp_path,
                     runner.time.monotonic() + 1,
                     context=context,
+                    selected_snapshot=runner._SealedSnapshot(
+                        -1, "/proc/1/fd/4", "3" * 64, 1
+                    ),
                     environment={
                         **runner._MINIMAL_SELECTED_ENV,
                         "PRESSURE_SECRET": secret,
@@ -527,6 +528,9 @@ def test_cgroup_launch_record_is_unlinked_and_secret_never_reaches_service_argv(
                 tmp_path,
                 runner.time.monotonic() + 1,
                 context=context,
+                selected_snapshot=runner._SealedSnapshot(
+                    -1, "/proc/1/fd/4", "3" * 64, 1
+                ),
                 environment={**runner._MINIMAL_SELECTED_ENV, "PRESSURE_SECRET": secret},
                 run_fd=run_fd,
                 launch_name="launch-1.json",
@@ -1655,7 +1659,7 @@ def test_trusted_interpreter_digest_rejects_mutable_or_unexpected_ownership(
         runner._trusted_interpreter_digest(candidate, 1024)
 
 
-def test_trusted_interpreter_digest_resolves_only_final_private_venv_link(
+def test_trusted_interpreter_digest_rejects_private_venv_link(
     tmp_path: Path,
 ) -> None:
     target = tmp_path / "python-real"
@@ -1664,13 +1668,10 @@ def test_trusted_interpreter_digest_resolves_only_final_private_venv_link(
     venv_python = tmp_path / "python"
     venv_python.symlink_to(target)
 
-    resolved, _digest, identity = runner._trusted_interpreter_digest(venv_python, 1024)
-    assert resolved == str(target)
-    assert identity == (target.stat().st_dev, target.stat().st_ino)
     with pytest.raises(
         runner.PressureProtocolError, match="pressure_cgroup_unavailable"
     ):
-        runner._trusted_private_digest(venv_python, 1024)
+        runner._trusted_interpreter_digest(venv_python, 1024)
 
 
 def _pid_is_live(pid: int) -> bool:
@@ -2112,3 +2113,291 @@ def test_schema_byte_bindings_are_reported_and_stale_summary_is_rejected(
         runner.PressureProtocolError, match="pressure_invalid_public_contract"
     ):
         runner.sanitize_projection(stale)
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="Linux sealed-descriptor test"
+)
+def test_sealed_snapshot_is_immutable_and_executes_original_source_after_mutation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "selected"
+    source.write_text("#!/bin/sh\nprintf original\n", encoding="ascii")
+    source.chmod(0o700)
+
+    snapshot = runner._capture_sealed_snapshot(source, 1024)
+    try:
+        assert snapshot.sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
+        with pytest.raises(OSError):
+            os.write(snapshot.fd, b"x")
+        with pytest.raises(OSError):
+            os.ftruncate(snapshot.fd, 0)
+        with pytest.raises(OSError):
+            runner.fcntl.fcntl(snapshot.fd, runner._F_ADD_SEALS, 0x10)
+        source.write_text("#!/bin/sh\nprintf replaced\n", encoding="ascii")
+        source.chmod(0o700)
+        completed = subprocess.run(
+            [snapshot.proc_path], check=True, capture_output=True, text=True
+        )
+        assert completed.stdout == "original"
+        assert runner._sealed_snapshot_digest(snapshot.proc_path) == snapshot.sha256
+    finally:
+        snapshot.close()
+
+
+def test_resolve_executable_returns_sealed_original_after_source_swap(
+    tmp_path: Path,
+) -> None:
+    selected = tmp_path / "selected"
+    original = b"#!/bin/sh\nprintf original\n"
+    selected.write_bytes(original)
+    selected.chmod(0o700)
+
+    snapshot = runner._resolve_executable(
+        [str(selected)], hashlib.sha256(original).hexdigest()
+    )
+    try:
+        selected.write_text("#!/bin/sh\nprintf swapped\n", encoding="ascii")
+        selected.chmod(0o700)
+        assert (
+            subprocess.run(
+                [snapshot.proc_path], check=True, capture_output=True, text=True
+            ).stdout
+            == "original"
+        )
+    finally:
+        snapshot.close()
+
+
+def test_deadline_covers_selected_snapshot_before_cgroup_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    _install_config(
+        tmp_path,
+        fake,
+        caps={
+            "turns": 9,
+            "tools": 9,
+            "tokens": 99,
+            "elapsed_seconds": 1,
+            "cost": "9.0",
+        },
+    )
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "_worktree_roots", lambda repo: (repo.resolve(),))
+    clock = [0.0]
+    cgroup_calls = [0]
+
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock[0])
+
+    def delayed_resolve(_argv: list[str], _digest: str) -> runner._SealedSnapshot:
+        clock[0] += 10
+        return runner._SealedSnapshot(-1, "/proc/1/fd/3", "0" * 64, 0)
+
+    monkeypatch.setattr(runner, "_resolve_executable", delayed_resolve)
+    monkeypatch.setattr(
+        runner,
+        "_build_cgroup_context",
+        lambda *_args: cgroup_calls.__setitem__(0, cgroup_calls[0] + 1),
+    )
+    with pytest.raises(runner.PressureProtocolError, match="pressure_timeout"):
+        runner.run_baseline(PROJECT_ROOT)
+    assert cgroup_calls == [0]
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="Linux descriptor accounting required"
+)
+@pytest.mark.parametrize("failure", ("write", "seal", "read", "hash"))
+def test_sealed_snapshot_failure_paths_close_the_memfd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    source = tmp_path / "selected"
+    source.write_bytes(b"#!/bin/sh\nexit 0\n")
+    source.chmod(0o700)
+    before = len(os.listdir("/proc/self/fd"))
+
+    if failure == "write":
+        monkeypatch.setattr(
+            runner,
+            "_write_all",
+            lambda *_args: (_ for _ in ()).throw(
+                runner.PressureProtocolError("injected_write")
+            ),
+        )
+    elif failure == "seal":
+        original_fcntl = runner.fcntl.fcntl
+
+        def failed_seal(descriptor: int, command: int, *args: object) -> int:
+            if command == runner._F_ADD_SEALS:
+                raise OSError("injected_seal")
+            return original_fcntl(descriptor, command, *args)
+
+        monkeypatch.setattr(runner.fcntl, "fcntl", failed_seal)
+    elif failure == "read":
+        monkeypatch.setattr(
+            runner,
+            "_read_descriptor_bytes",
+            lambda *_args: (_ for _ in ()).throw(
+                runner.PressureProtocolError("injected_read")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            runner,
+            "_sha256",
+            lambda *_args: (_ for _ in ()).throw(
+                runner.PressureProtocolError("injected_hash")
+            ),
+        )
+
+    for _ in range(2):
+        with pytest.raises(
+            runner.PressureProtocolError, match="pressure_cgroup_unavailable"
+        ):
+            runner._capture_sealed_snapshot(source, 1024)
+        assert len(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="Linux descriptor accounting required"
+)
+def test_cgroup_context_closes_helper_snapshot_after_post_capture_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = len(os.listdir("/proc/self/fd"))
+    monkeypatch.setattr(
+        runner,
+        "_trusted_interpreter_digest",
+        lambda *_args: (_ for _ in ()).throw(
+            runner.PressureProtocolError("injected_interpreter")
+        ),
+    )
+
+    with pytest.raises(runner.PressureProtocolError, match="injected_interpreter"):
+        runner._build_cgroup_context(runner.time.monotonic() + 1, tmp_path)
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="Linux descriptor accounting required"
+)
+def test_state_root_closes_all_resources_after_close_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    child_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    source = tmp_path / "selected"
+    source.write_bytes(b"#!/bin/sh\nexit 0\n")
+    source.chmod(0o700)
+    snapshot = runner._capture_sealed_snapshot(source, 1024)
+    snapshot_fd = snapshot.fd
+    state_root = runner._StateRoot(
+        fd=root_fd, path=tmp_path, children=[child_fd], snapshots=[snapshot]
+    )
+    original_close = os.close
+
+    def close_then_fail(descriptor: int) -> None:
+        original_close(descriptor)
+        if descriptor in {snapshot_fd, child_fd}:
+            raise OSError("injected_close")
+
+    monkeypatch.setattr(runner.os, "close", close_then_fail)
+    with pytest.raises(OSError, match="injected_close"):
+        state_root.close()
+    for descriptor in (root_fd, child_fd, snapshot_fd):
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    assert state_root.fd == -1
+    assert state_root.children == []
+    assert state_root.snapshots == []
+    state_root.close()
+
+
+def test_system_python_final_symlink_resolves_to_root_owned_target() -> None:
+    lexical = runner._SYSTEM_PYTHON_PATH
+    assert lexical.is_symlink()
+    resolved, digest, identity = runner._trusted_interpreter_digest(
+        lexical, 64 * 1024 * 1024
+    )
+    target = lexical.resolve(strict=True)
+    target_metadata = target.lstat()
+    assert resolved == str(target)
+    assert target_metadata.st_uid == 0
+    assert identity == (target_metadata.st_dev, target_metadata.st_ino)
+    assert digest == hashlib.sha256(target.read_bytes()).hexdigest()
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="Linux sealed-descriptor test"
+)
+def test_sealed_elf_snapshot_executes_after_source_swap(tmp_path: Path) -> None:
+    selected = tmp_path / "selected"
+    selected.write_bytes(Path("/bin/true").read_bytes())
+    selected.chmod(0o700)
+    snapshot = runner._capture_sealed_snapshot(selected, 64 * 1024 * 1024)
+    try:
+        selected.write_text("#!/bin/sh\nexit 99\n", encoding="ascii")
+        selected.chmod(0o700)
+        assert subprocess.run([snapshot.proc_path], check=False).returncode == 0
+        assert runner._sealed_snapshot_digest(snapshot.proc_path) == snapshot.sha256
+    finally:
+        snapshot.close()
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="Linux sealed-descriptor test"
+)
+def test_sealed_helper_executes_captured_source_not_mutated_path(
+    tmp_path: Path,
+) -> None:
+    helper_source = tmp_path / "helper.py"
+    helper_source.write_bytes(Path(runner.__file__).read_bytes())
+    selected = tmp_path / "selected"
+    selected.write_text("#!/bin/sh\nprintf sealed-helper\n", encoding="ascii")
+    selected.chmod(0o700)
+    helper_snapshot = runner._capture_sealed_snapshot(
+        helper_source, runner._MAX_HELPER_BYTES
+    )
+    selected_snapshot = runner._capture_sealed_snapshot(selected, 1024)
+    try:
+        python_path, python_sha256, _identity = runner._trusted_interpreter_digest(
+            runner._SYSTEM_PYTHON_PATH, 64 * 1024 * 1024
+        )
+        launch = {
+            "argv": [str(selected)],
+            "environment": dict(runner._MINIMAL_SELECTED_ENV),
+            "environment_names": sorted(runner._MINIMAL_SELECTED_ENV),
+            "helper_sha256": helper_snapshot.sha256,
+            "python_sha256": python_sha256,
+            "run_dev": tmp_path.stat().st_dev,
+            "run_ino": tmp_path.stat().st_ino,
+            "selected_path": selected_snapshot.proc_path,
+            "selected_sha256": selected_snapshot.sha256,
+            "selected_size": selected_snapshot.size,
+        }
+        launch_path = tmp_path / "launch.json"
+        launch_path.write_bytes(runner._canonical_bytes(launch))
+        launch_path.chmod(0o600)
+        helper_source.write_text("raise SystemExit(99)\n", encoding="ascii")
+        completed = subprocess.run(
+            [
+                python_path,
+                helper_snapshot.proc_path,
+                "--pressure-cgroup-helper",
+                str(launch_path),
+            ],
+            cwd=tmp_path,
+            env=dict(runner._MINIMAL_SELECTED_ENV),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0
+        assert completed.stdout == "sealed-helper"
+        assert not launch_path.exists()
+    finally:
+        selected_snapshot.close()
+        helper_snapshot.close()

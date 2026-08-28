@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import fcntl
 import hashlib
 import json
 import math
@@ -64,7 +66,18 @@ _FORBIDDEN_SELECTED_ENV = frozenset(
 )
 _SYSTEMD_RUN_PATH = Path("/usr/bin/systemd-run")
 _SYSTEMCTL_PATH = Path("/usr/bin/systemctl")
+_SYSTEM_PYTHON_PATH = Path("/usr/bin/python3")
 _CGROUP_STOP_SECONDS = 0.4
+# Linux fcntl/memfd constants. Python 3.11 in this environment lacks os.memfd_create.
+_MFD_CLOEXEC = 0x1
+_MFD_ALLOW_SEALING = 0x2
+_F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+_F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+_F_SEAL_SEAL = getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+_F_SEAL_SHRINK = getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+_F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 0x0004)
+_F_SEAL_WRITE = getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+_REQUIRED_SEALS = _F_SEAL_SEAL | _F_SEAL_SHRINK | _F_SEAL_GROW | _F_SEAL_WRITE
 
 
 @dataclass
@@ -74,12 +87,34 @@ class _StateRoot:
     fd: int
     path: Path
     children: list[int] = field(default_factory=list)
+    snapshots: list[_SealedSnapshot] = field(default_factory=list)
 
     def close(self) -> None:
-        for child in reversed(self.children):
-            os.close(child)
-        self.children.clear()
-        os.close(self.fd)
+        """Release every retained capability, preserving the first close failure."""
+        failure: OSError | None = None
+        snapshots, self.snapshots = self.snapshots, []
+        for snapshot in reversed(snapshots):
+            try:
+                snapshot.close()
+            except OSError as error:
+                if failure is None:
+                    failure = error
+        children, self.children = self.children, []
+        for child in reversed(children):
+            try:
+                os.close(child)
+            except OSError as error:
+                if failure is None:
+                    failure = error
+        descriptor, self.fd = self.fd, -1
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if failure is None:
+                    failure = error
+        if failure is not None:
+            raise failure
 
     def is_relative_to(self, other: Path) -> bool:
         return self.path.is_relative_to(other)
@@ -87,13 +122,11 @@ class _StateRoot:
 
 @dataclass(frozen=True)
 class _CgroupContext:
-    """Baseline-scoped, hash-pinned inputs for transient cgroup services."""
+    """Baseline-scoped, sealed inputs for transient cgroup services."""
 
     systemd_run: str
     systemctl: str
-    helper_path: str
-    helper_sha256: str
-    helper_identity: tuple[int, int]
+    helper_snapshot: _SealedSnapshot
     python_path: str
     python_sha256: str
     python_identity: tuple[int, int]
@@ -106,6 +139,121 @@ class PressureProtocolError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+@dataclass
+class _SealedSnapshot:
+    """An immutable Linux memfd retained by the runner until all services exit."""
+
+    fd: int
+    proc_path: str
+    sha256: str
+    size: int
+
+    def close(self) -> None:
+        descriptor, self.fd = self.fd, -1
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _memfd_create(name: str) -> int:
+    """Use libc directly because this Python omits os.memfd_create."""
+    if sys.platform != "linux" or not Path("/proc/self/fd").is_dir():
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        create = library.memfd_create
+        create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+        create.restype = ctypes.c_int
+        descriptor = create(name.encode("ascii"), _MFD_CLOEXEC | _MFD_ALLOW_SEALING)
+    except (AttributeError, OSError, UnicodeEncodeError) as error:
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+    if descriptor < 0:
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    return descriptor
+
+
+def _read_descriptor_bytes(descriptor: int, maximum: int) -> bytes:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size < 0
+        or metadata.st_size > maximum
+    ):
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = metadata.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(64 * 1024, remaining))
+        if not chunk:
+            raise PressureProtocolError("pressure_cgroup_unavailable")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.fstat(descriptor).st_size != metadata.st_size:
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return b"".join(chunks)
+
+
+def _capture_sealed_snapshot(path: Path, maximum: int) -> _SealedSnapshot:
+    """Descriptor-capture validated source bytes into a fully sealed anonymous file."""
+    data = _safe_regular_bytes(path, maximum)
+    descriptor = _memfd_create("pressure-snapshot")
+    try:
+        _write_all(descriptor, data)
+        os.fchmod(descriptor, 0o500)
+        fcntl.fcntl(descriptor, _F_ADD_SEALS, _REQUIRED_SEALS)
+        if fcntl.fcntl(descriptor, _F_GET_SEALS) != _REQUIRED_SEALS:
+            raise OSError("memfd seals incomplete")
+        sealed = _read_descriptor_bytes(descriptor, maximum)
+        if sealed != data:
+            raise OSError("memfd bytes changed")
+        return _SealedSnapshot(
+            fd=descriptor,
+            proc_path=f"/proc/{os.getpid()}/fd/{descriptor}",
+            sha256=_sha256(sealed),
+            size=len(sealed),
+        )
+    except (OSError, ValueError, PressureProtocolError) as error:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+
+
+def _open_sealed_snapshot(path: str, maximum: int) -> tuple[int, str]:
+    """Open and authenticate a retained memfd via its proc descriptor path."""
+    if not re.fullmatch(r"/proc/[1-9][0-9]*/fd/[0-9]+", path):
+        raise PressureProtocolError("pressure_cgroup_launch_invalid")
+    descriptor = -1
+    try:
+        # /proc/<pid>/fd/N is necessarily a symlink; authenticate its opened target.
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+        if not target.startswith("/memfd:pressure-snapshot"):
+            raise OSError("not a pressure memfd")
+        if fcntl.fcntl(descriptor, _F_GET_SEALS) != _REQUIRED_SEALS:
+            raise OSError("memfd seals incomplete")
+        raw = _read_descriptor_bytes(descriptor, maximum)
+    except (OSError, ValueError, PressureProtocolError) as error:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise PressureProtocolError("pressure_cgroup_launch_invalid") from error
+    return descriptor, _sha256(raw)
+
+
+def _sealed_snapshot_digest(path: str) -> str:
+    """Testable helper-side authentication primitive for a sealed snapshot."""
+    descriptor, digest = _open_sealed_snapshot(path, 64 * 1024 * 1024)
+    try:
+        return digest
+    finally:
+        os.close(descriptor)
 
 
 def _sha256(data: bytes) -> str:
@@ -696,7 +844,8 @@ def _validate_config(config: dict[str, Any], config_raw: bytes) -> dict[str, Any
     }
 
 
-def _resolve_executable(argv: list[str], expected_hash: str) -> tuple[str, str]:
+def _resolve_executable(argv: list[str], expected_hash: str) -> _SealedSnapshot:
+    """Capture the selected executable once; later execution never follows its path."""
     selected = argv[0]
     resolved = (
         Path(selected)
@@ -705,11 +854,15 @@ def _resolve_executable(argv: list[str], expected_hash: str) -> tuple[str, str]:
     )
     if not resolved or not resolved.is_file():
         raise PressureProtocolError("pressure_executable_missing")
-    binary = resolved.resolve(strict=True)
-    digest = _sha256(_safe_regular_bytes(binary, 64 * 1024 * 1024))
-    if digest != expected_hash:
+    try:
+        binary = resolved.resolve(strict=True)
+    except OSError as error:
+        raise PressureProtocolError("pressure_executable_missing") from error
+    snapshot = _capture_sealed_snapshot(binary, 64 * 1024 * 1024)
+    if snapshot.sha256 != expected_hash:
+        snapshot.close()
         raise PressureProtocolError("pressure_executable_fingerprint_mismatch")
-    return str(binary), digest
+    return snapshot
 
 
 def _public_paths(repo_root: Path) -> dict[str, Path]:
@@ -1231,15 +1384,23 @@ def _context_client_environment(context: _CgroupContext) -> dict[str, str]:
 def _systemd_cgroup_preflight(
     deadline: float, cwd: Path, client_environment: tuple[tuple[str, str], ...]
 ) -> tuple[str, str]:
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
     systemd_run = _trusted_system_binary(_SYSTEMD_RUN_PATH)
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
     systemctl = _trusted_system_binary(_SYSTEMCTL_PATH)
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
     try:
         controllers = Path("/sys/fs/cgroup/cgroup.controllers").read_text(
             encoding="ascii"
         )
     except OSError as error:
         raise PressureProtocolError("pressure_cgroup_unavailable") from error
-    if not controllers.strip() or time.monotonic() >= deadline:
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
+    if not controllers.strip():
         raise PressureProtocolError("pressure_cgroup_unavailable")
     try:
         stdout, _stderr, returncode = _run_bounded(
@@ -1249,7 +1410,11 @@ def _systemd_cgroup_preflight(
             maximum=128,
             env=dict(client_environment),
         )
-    except (OSError, PressureProtocolError) as error:
+    except PressureProtocolError as error:
+        if error.code == "pressure_timeout":
+            raise
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+    except OSError as error:
         raise PressureProtocolError("pressure_cgroup_unavailable") from error
     if returncode != 0 or stdout.strip() not in {b"running", b"degraded"}:
         raise PressureProtocolError("pressure_cgroup_unavailable")
@@ -1331,42 +1496,44 @@ def _trusted_private_digest(
 def _trusted_interpreter_digest(
     path: Path, maximum: int
 ) -> tuple[str, str, tuple[int, int]]:
-    """Accept a pinned root system interpreter or private venv interpreter."""
+    """Accept only a root-owned immutable system interpreter (or venv link to one)."""
     return _trusted_digest(
         path,
         maximum,
-        allowed_uids=frozenset({0, os.getuid()}),
+        allowed_uids=frozenset({0}),
         allow_final_symlink=True,
     )
 
 
 def _build_cgroup_context(deadline: float, cwd: Path) -> _CgroupContext:
-    """Do the one baseline-wide cgroup probe and pin helper execution inputs."""
-    client_environment = _systemd_client_environment()
-    systemd_run, systemctl = _systemd_cgroup_preflight(
-        deadline, cwd, client_environment
-    )
-    if time.monotonic() >= deadline:
-        raise PressureProtocolError("pressure_timeout")
-    helper_path, helper_sha256, helper_identity = _trusted_private_digest(
-        Path(__file__), _MAX_HELPER_BYTES
-    )
-    python_path, python_sha256, python_identity = _trusted_interpreter_digest(
-        Path(sys.executable), 64 * 1024 * 1024
-    )
-    if time.monotonic() >= deadline:
-        raise PressureProtocolError("pressure_timeout")
-    return _CgroupContext(
-        systemd_run=systemd_run,
-        systemctl=systemctl,
-        helper_path=helper_path,
-        helper_sha256=helper_sha256,
-        helper_identity=helper_identity,
-        python_path=python_path,
-        python_sha256=python_sha256,
-        python_identity=python_identity,
-        client_environment=client_environment,
-    )
+    """Seal the helper and pin a root interpreter before the single cgroup probe."""
+    helper_snapshot = _capture_sealed_snapshot(Path(__file__), _MAX_HELPER_BYTES)
+    try:
+        if time.monotonic() >= deadline:
+            raise PressureProtocolError("pressure_timeout")
+        python_path, python_sha256, python_identity = _trusted_interpreter_digest(
+            _SYSTEM_PYTHON_PATH, 64 * 1024 * 1024
+        )
+        if time.monotonic() >= deadline:
+            raise PressureProtocolError("pressure_timeout")
+        client_environment = _systemd_client_environment()
+        systemd_run, systemctl = _systemd_cgroup_preflight(
+            deadline, cwd, client_environment
+        )
+        if time.monotonic() >= deadline:
+            raise PressureProtocolError("pressure_timeout")
+        return _CgroupContext(
+            systemd_run=systemd_run,
+            systemctl=systemctl,
+            helper_snapshot=helper_snapshot,
+            python_path=python_path,
+            python_sha256=python_sha256,
+            python_identity=python_identity,
+            client_environment=client_environment,
+        )
+    except BaseException:
+        helper_snapshot.close()
+        raise
 
 
 def _assert_context_identity(
@@ -1410,6 +1577,9 @@ def _safe_private_launch(path: Path) -> dict[str, Any]:
         "python_sha256",
         "run_dev",
         "run_ino",
+        "selected_path",
+        "selected_sha256",
+        "selected_size",
     }
     if (
         type(value) is not dict
@@ -1438,20 +1608,26 @@ def _safe_private_launch(path: Path) -> dict[str, Any]:
         )
         or type(value["run_dev"]) is not int
         or type(value["run_ino"]) is not int
+        or type(value["selected_path"]) is not str
+        or re.fullmatch(r"/proc/[1-9][0-9]*/fd/[0-9]+", value["selected_path"]) is None
+        or type(value["selected_sha256"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["selected_sha256"]) is None
+        or type(value["selected_size"]) is not int
+        or value["selected_size"] < 0
+        or value["selected_size"] > 64 * 1024 * 1024
     ):
         raise PressureProtocolError("pressure_cgroup_launch_invalid")
     return value
 
 
 def _cgroup_helper(launch_path: str) -> None:
-    """Exec the selected hash-pinned executable after deleting its secret record."""
+    """Authenticate sealed helper/selected memfds, then exec exactly selected bytes."""
+    selected_fd = -1
     try:
         launch = _safe_private_launch(Path(launch_path))
-        _helper_path, helper_sha256, _helper_identity = _trusted_private_digest(
-            Path(__file__), _MAX_HELPER_BYTES
-        )
+        helper_sha256 = _sealed_snapshot_digest(str(Path(__file__)))
         _python_path, python_sha256, _python_identity = _trusted_interpreter_digest(
-            Path(sys.executable), 64 * 1024 * 1024
+            _SYSTEM_PYTHON_PATH, 64 * 1024 * 1024
         )
         if (
             helper_sha256 != launch["helper_sha256"]
@@ -1466,8 +1642,16 @@ def _cgroup_helper(launch_path: str) -> None:
             os.fchdir(run_fd)
         finally:
             os.close(run_fd)
-        os.execve(launch["argv"][0], launch["argv"], launch["environment"])
+        selected_fd, selected_sha256 = _open_sealed_snapshot(
+            launch["selected_path"], launch["selected_size"]
+        )
+        if selected_sha256 != launch["selected_sha256"]:
+            raise PressureProtocolError("pressure_cgroup_launch_invalid")
+        os.set_inheritable(selected_fd, True)
+        os.execve(f"/proc/self/fd/{selected_fd}", launch["argv"], launch["environment"])
     except (OSError, ValueError, TypeError, PressureProtocolError, SystemExit):
+        if selected_fd >= 0:
+            os.close(selected_fd)
         os._exit(126)
 
 
@@ -1546,6 +1730,7 @@ def _run_selected_cgroup(
     deadline: float,
     *,
     context: _CgroupContext,
+    selected_snapshot: _SealedSnapshot,
     environment: dict[str, str],
     run_fd: int,
     launch_name: str,
@@ -1554,23 +1739,21 @@ def _run_selected_cgroup(
 ) -> tuple[bytes, bytes, int]:
     """Contain one selected execution in a transient user service cgroup v2."""
     _assert_context_identity(
-        context.helper_path,
-        context.helper_identity,
-        allowed_uids=frozenset({os.getuid()}),
-    )
-    _assert_context_identity(
         context.python_path,
         context.python_identity,
-        allowed_uids=frozenset({0, os.getuid()}),
+        allowed_uids=frozenset({0}),
     )
     launch = {
         "argv": argv,
         "environment": environment,
         "environment_names": sorted(environment),
-        "helper_sha256": context.helper_sha256,
+        "helper_sha256": context.helper_snapshot.sha256,
         "python_sha256": context.python_sha256,
         "run_dev": os.fstat(run_fd).st_dev,
         "run_ino": os.fstat(run_fd).st_ino,
+        "selected_path": selected_snapshot.proc_path,
+        "selected_sha256": selected_snapshot.sha256,
+        "selected_size": selected_snapshot.size,
     }
     _write_private_at(run_fd, launch_name, _canonical_bytes(launch))
     run_path = _fd_path(run_fd)
@@ -1591,7 +1774,7 @@ def _run_selected_cgroup(
         "--service-type=exec",
         "--",
         context.python_path,
-        context.helper_path,
+        context.helper_snapshot.proc_path,
         "--pressure-cgroup-helper",
         str(launch_path),
     ]
@@ -1700,9 +1883,6 @@ def _run_bounded(
 def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]:
     """Run the selected stack while all private I/O is descriptor-relative."""
     repo_root = _repo_root(repo)
-    if any(repo_root.rglob("SKILL.md")):
-        raise PressureProtocolError("pressure_skill_not_absent")
-    protocol = load_public_protocol(repo_root)
     try:
         config, raw_config = _load_json_at(state_root.fd, _PRIVATE_CONFIG_NAME)
     except PressureProtocolError as error:
@@ -1713,17 +1893,33 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
         raise
     validated = _validate_config(config, raw_config)
     config = validated["config"]
+    baseline_started = time.monotonic()
+    deadline = baseline_started + config["caps"]["elapsed_seconds"]
+    if any(repo_root.rglob("SKILL.md")):
+        raise PressureProtocolError("pressure_skill_not_absent")
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
+    protocol = load_public_protocol(repo_root)
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
     argv = config["command_argv"]
-    executable, executable_hash = _resolve_executable(argv, config["executable_sha256"])
+    selected_snapshot = _resolve_executable(argv, config["executable_sha256"])
+    state_root.snapshots.append(selected_snapshot)
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
     command_hash = _sha256(
-        _canonical_bytes({"argv": argv, "executable_sha256": executable_hash})
+        _canonical_bytes({"argv": argv, "executable_sha256": selected_snapshot.sha256})
     )
     selected_environment = _selected_environment(config["environment_allowlist"])
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
     run_name = "run-" + command_hash[:12]
     run_fd = _create_run_directory(state_root.fd, run_name)
     state_root.children.append(run_fd)
     run_path = _fd_path(run_fd)
     run_cwd = str(run_path)
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
     outcomes: list[dict[str, str]] = []
     evidence_entries: list[dict[str, str]] = []
     total_counts: dict[str, int] = {
@@ -1733,9 +1929,10 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
         "elapsed_seconds": 0,
     }
     total_cost = Decimal(0)
-    baseline_started = time.monotonic()
-    deadline = baseline_started + config["caps"]["elapsed_seconds"]
     cgroup_context = _build_cgroup_context(deadline, Path(run_cwd))
+    helper_snapshot = getattr(cgroup_context, "helper_snapshot", None)
+    if isinstance(helper_snapshot, _SealedSnapshot):
+        state_root.snapshots.append(helper_snapshot)
     for position, scenario in enumerate(protocol["scenarios"]["scenarios"], start=1):
         if time.monotonic() >= deadline:
             raise PressureProtocolError("pressure_timeout")
@@ -1750,9 +1947,7 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
             + "\n"
             + scenario["task_pressure"]
         )
-        expanded = [
-            executable if index == 0 else part for index, part in enumerate(argv)
-        ]
+        expanded = list(argv)
         expanded = [
             prompt
             if part == "{prompt}"
@@ -1768,6 +1963,7 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
                 Path(run_cwd),
                 deadline,
                 context=cgroup_context,
+                selected_snapshot=selected_snapshot,
                 environment=selected_environment,
                 run_fd=run_fd,
                 launch_name=f"launch-{position}.json",
