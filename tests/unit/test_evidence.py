@@ -22,7 +22,7 @@ def _fixture(name: str) -> dict[str, object]:
 
 
 def test_public_outcome_and_evidence_models_roundtrip_minimal_fixtures() -> None:
-    from semantic_reheating.evidence import EvidenceRecord, RecoveryOutcome
+    from semantic_reheating import EvidenceRecord, RecoveryOutcome
 
     outcome_source = _fixture("minimal-recovery-outcome.json")
     evidence_source = _fixture("minimal-evidence-record.json")
@@ -52,7 +52,7 @@ def test_evidence_record_chosen_policy_exactly_matches_decision_policy_vocabular
 def test_record_outcome_marks_host_denial_as_avoiding_repetition_when_constrained() -> (
     None
 ):
-    from semantic_reheating.evidence import RecoveryOutcome, record_outcome
+    from semantic_reheating import RecoveryOutcome, record_outcome
     from semantic_reheating.models import DecisionEnvelope
 
     decision_source = _fixture("minimal-decision-envelope.json")

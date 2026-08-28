@@ -604,3 +604,163 @@ def test_analyze_rejects_over_limit_trace_and_invalid_policy() -> None:
     with pytest.raises(ControllerError) as caught:
         analyze([event], object())
     assert caught.value.code == "invalid_run_policy"
+
+
+def test_root_public_api_has_the_closed_deterministic_surface() -> None:
+    import semantic_reheating
+    from semantic_reheating import (
+        ControllerError,
+        Decision,
+        DecisionEnvelope,
+        EvidenceError,
+        EvidenceRecord,
+        RecoveryInstruction,
+        RecoveryOutcome,
+        RunPolicy,
+        SemanticDetector,
+        TraceEvent,
+        analyze,
+        build_recovery_instruction,
+        record_outcome,
+    )
+
+    assert semantic_reheating.__all__ == (
+        "ControllerError",
+        "Decision",
+        "DecisionEnvelope",
+        "EvidenceError",
+        "EvidenceRecord",
+        "RecoveryInstruction",
+        "RecoveryOutcome",
+        "RunPolicy",
+        "SemanticDetector",
+        "TraceEvent",
+        "__version__",
+        "analyze",
+        "build_recovery_instruction",
+        "record_outcome",
+    )
+    assert semantic_reheating.__version__ == "0.1.0"
+    assert all(
+        getattr(semantic_reheating, name) is value
+        for name, value in {
+            "ControllerError": ControllerError,
+            "Decision": Decision,
+            "DecisionEnvelope": DecisionEnvelope,
+            "EvidenceError": EvidenceError,
+            "EvidenceRecord": EvidenceRecord,
+            "RecoveryInstruction": RecoveryInstruction,
+            "RecoveryOutcome": RecoveryOutcome,
+            "RunPolicy": RunPolicy,
+            "SemanticDetector": SemanticDetector,
+            "TraceEvent": TraceEvent,
+            "analyze": analyze,
+            "build_recovery_instruction": build_recovery_instruction,
+            "record_outcome": record_outcome,
+        }.items()
+    )
+    assert "PolicySelection" not in semantic_reheating.__all__
+    assert "RecoveryPolicy" not in semantic_reheating.__all__
+    assert not any(
+        name.startswith("_") and name != "__version__"
+        for name in semantic_reheating.__all__
+    )
+
+
+def test_root_api_builds_redacted_deterministic_recovery_evidence() -> None:
+    from semantic_reheating import (
+        Decision,
+        DecisionEnvelope,
+        EvidenceRecord,
+        RecoveryInstruction,
+        RecoveryOutcome,
+        RunPolicy,
+        TraceEvent,
+        analyze,
+        build_recovery_instruction,
+        record_outcome,
+    )
+
+    secret = "raw-payload=secret-must-not-leak"
+    trace = [
+        _event(1, "tool_call", payload={"action": "read", "raw": secret}),
+        _event(2, "tool_result", payload={"result": "same"}, parent_event_id="event-1"),
+        _event(
+            3, "acceptance_check", payload={"check": "done"}, acceptance_delta="none"
+        ),
+        _event(4, "tool_call", payload={"action": "read", "raw": secret}),
+        _event(5, "tool_result", payload={"result": "same"}, parent_event_id="event-4"),
+        _event(
+            6, "acceptance_check", payload={"check": "done"}, acceptance_delta="none"
+        ),
+    ]
+    policy = _policy()
+    assert all(type(event) is TraceEvent for event in trace)
+    assert type(policy) is RunPolicy
+
+    decision = analyze(trace, policy)
+    instruction = build_recovery_instruction(decision)
+    assert decision.decision is Decision.REHEAT
+    assert instruction is not None
+
+    outcome_source = _fixture("minimal-recovery-outcome.json")
+    outcome_source["run_id"] = "run-controller"
+    outcome_source["instruction_id"] = instruction.to_dict()["instruction_id"]
+    outcome = RecoveryOutcome.from_dict(outcome_source)
+    evidence = record_outcome(decision, outcome)
+
+    decision_data = decision.to_dict()
+    instruction_data = instruction.to_dict()
+    outcome_data = outcome.to_dict()
+    evidence_data = evidence.to_dict()
+    assert DecisionEnvelope.from_dict(decision_data).to_dict() == decision_data
+    assert RecoveryInstruction.from_dict(instruction_data).to_dict() == instruction_data
+    assert RecoveryOutcome.from_dict(outcome_data).to_dict() == outcome_data
+    assert EvidenceRecord.from_dict(evidence_data).to_dict() == evidence_data
+    assert (decision.run_id, instruction_data["run_id"], evidence.run_id) == (
+        "run-controller",
+        "run-controller",
+        "run-controller",
+    )
+    assert evidence.actual_counters.to_dict() == outcome_source["consumed_counters"]
+    assert evidence.new_evidence_refs == ("evidence-002",)
+    assert evidence.trigger.reason_code == "signals_agree"
+    assert (
+        tuple(item.finding_id for item in decision.confidence.contributing_findings)
+        == evidence.trigger.finding_ids
+    )
+    first = json.dumps(
+        [decision_data, instruction_data, evidence_data],
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    replay = analyze(trace, policy)
+    replay_instruction = build_recovery_instruction(replay)
+    assert replay_instruction is not None
+    replay_evidence = record_outcome(replay, RecoveryOutcome.from_dict(outcome_source))
+    second = json.dumps(
+        [
+            replay.to_dict(),
+            replay_instruction.to_dict(),
+            replay_evidence.to_dict(),
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    assert first == second
+    assert secret not in first.decode()
+
+
+def test_root_api_hard_risk_stop_does_not_build_an_instruction() -> None:
+    from semantic_reheating import Decision, analyze, build_recovery_instruction
+
+    decision = analyze(
+        [
+            _event(1, "tool_call", effect_class="unknown", payload={"action": "write"}),
+            _event(2, "tool_call", effect_class="unknown", payload={"action": "write"}),
+        ],
+        _policy(),
+    )
+
+    assert decision.decision is Decision.STOP
+    assert build_recovery_instruction(decision) is None
