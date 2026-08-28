@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import re
 import stat
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -318,6 +319,215 @@ def _reader_rejects_in_child(root: str, trace_path: str, results: object) -> Non
         results.put(True)  # type: ignore[union-attr]
     else:
         results.put(False)  # type: ignore[union-attr]
+
+
+def _reader_rejects_fifo_swap_without_nonblocking_in_child(
+    base: str, results: object
+) -> None:
+    """Exercise the real blocking FIFO race in an isolated process."""
+    import corpus_support as child_corpus_support
+
+    root = Path(base) / "corpus"
+    candidate = root / "sample.jsonl"
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.mkdir()
+    candidate.write_bytes(b"{}\n")
+    delattr(child_corpus_support.os, "O_NONBLOCK")
+
+    def replace_with_fifo(path: Path) -> None:
+        path.unlink()
+        os.mkfifo(path)
+
+    try:
+        child_corpus_support.read_corpus(
+            ("benchmark/corpus/sample.jsonl",),
+            root=root,
+            before_open=replace_with_fifo,
+        )
+    except AssertionError as error:
+        results.put(str(error))  # type: ignore[union-attr]
+    else:
+        results.put("accepted")  # type: ignore[union-attr]
+
+
+def _reader_rejects_fifo_root_without_nonblocking_in_child(
+    base: str, results: object
+) -> None:
+    import corpus_support as child_corpus_support
+
+    root = Path(base) / "corpus"
+    holder = Path(base) / "original-root"
+    root.mkdir()
+    root.rename(holder)
+    delattr(child_corpus_support.os, "O_NONBLOCK")
+    os.mkfifo(root)
+    try:
+        child_corpus_support.read_corpus(("benchmark/corpus/sample.jsonl",), root=root)
+    except AssertionError as error:
+        results.put(str(error))  # type: ignore[union-attr]
+    else:
+        results.put("accepted")  # type: ignore[union-attr]
+
+
+def _assert_prompt_unsafe_child(
+    target: Callable[[str, object], None], base: Path
+) -> None:
+    results = multiprocessing.Queue()
+    process = multiprocessing.Process(target=target, args=(str(base), results))
+    try:
+        process.start()
+        process.join(timeout=1)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1)
+            pytest.fail(
+                "safe corpus reader blocked after a missing O_NONBLOCK FIFO swap"
+            )
+        assert process.exitcode == 0
+        assert results.get(timeout=1) == "unsafe corpus input"
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1)
+        results.close()
+        results.join_thread()
+
+
+def test_safe_corpus_reader_rejects_missing_nonblocking_before_fifo_swap_blocks(
+    tmp_path: Path,
+) -> None:
+    for attempt in range(3):
+        _assert_prompt_unsafe_child(
+            _reader_rejects_fifo_swap_without_nonblocking_in_child,
+            tmp_path / str(attempt),
+        )
+
+
+def test_safe_corpus_reader_rejects_fifo_root_when_nonblocking_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    _assert_prompt_unsafe_child(
+        _reader_rejects_fifo_root_without_nonblocking_in_child, tmp_path
+    )
+
+
+@pytest.mark.parametrize("capability", ("O_NONBLOCK", "O_NOFOLLOW", "O_DIRECTORY"))
+def test_safe_corpus_reader_rejects_missing_descriptor_flags_before_open_or_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capability: str
+) -> None:
+    root, trace_path = _write_corpus_trace(tmp_path, "sample.jsonl", b"{}\n")
+    real_open = corpus_support.os.open
+    original_supports_dir_fd = corpus_support.os.supports_dir_fd
+    callbacks = 0
+    opens = 0
+
+    def tracking_open(*args: Any, **kwargs: Any) -> int:
+        nonlocal opens
+        opens += 1
+        return real_open(*args, **kwargs)
+
+    def callback(_: Path) -> None:
+        nonlocal callbacks
+        callbacks += 1
+
+    monkeypatch.setattr(corpus_support.os, "open", tracking_open)
+    monkeypatch.setattr(
+        corpus_support.os,
+        "supports_dir_fd",
+        original_supports_dir_fd | {tracking_open},
+    )
+    monkeypatch.delattr(corpus_support.os, capability)
+
+    with pytest.raises(AssertionError, match="unsafe corpus input"):
+        read_corpus((trace_path,), root=root, before_open=callback)
+
+    assert opens == 0
+    assert callbacks == 0
+
+
+@pytest.mark.parametrize("missing", ("open", "stat"))
+def test_safe_corpus_reader_rejects_missing_dir_fd_support_before_open_or_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    root, trace_path = _write_corpus_trace(tmp_path, "sample.jsonl", b"{}\n")
+    real_open = corpus_support.os.open
+    original_supports_dir_fd = corpus_support.os.supports_dir_fd
+    callbacks = 0
+    opens = 0
+
+    def tracking_open(*args: Any, **kwargs: Any) -> int:
+        nonlocal opens
+        opens += 1
+        return real_open(*args, **kwargs)
+
+    def callback(_: Path) -> None:
+        nonlocal callbacks
+        callbacks += 1
+
+    supports_dir_fd = set(original_supports_dir_fd)
+    supports_dir_fd.discard(real_open if missing == "open" else corpus_support.os.stat)
+    if missing == "stat":
+        supports_dir_fd.add(tracking_open)
+    monkeypatch.setattr(corpus_support.os, "open", tracking_open)
+    monkeypatch.setattr(
+        corpus_support.os, "supports_dir_fd", frozenset(supports_dir_fd)
+    )
+
+    with pytest.raises(AssertionError, match="unsafe corpus input"):
+        read_corpus((trace_path,), root=root, before_open=callback)
+
+    assert opens == 0
+    assert callbacks == 0
+
+
+@pytest.mark.parametrize("capability", ("O_NONBLOCK", "O_NOFOLLOW", "O_DIRECTORY"))
+def test_safe_corpus_reader_rejects_unusable_descriptor_flags_before_open_or_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capability: str
+) -> None:
+    root, trace_path = _write_corpus_trace(tmp_path, "sample.jsonl", b"{}\n")
+    real_open = corpus_support.os.open
+    original_supports_dir_fd = corpus_support.os.supports_dir_fd
+    callbacks = 0
+    opens = 0
+
+    def tracking_open(*args: Any, **kwargs: Any) -> int:
+        nonlocal opens
+        opens += 1
+        return real_open(*args, **kwargs)
+
+    def callback(_: Path) -> None:
+        nonlocal callbacks
+        callbacks += 1
+
+    monkeypatch.setattr(corpus_support.os, "open", tracking_open)
+    monkeypatch.setattr(
+        corpus_support.os,
+        "supports_dir_fd",
+        original_supports_dir_fd | {tracking_open},
+    )
+    monkeypatch.setattr(corpus_support.os, capability, True)
+
+    with pytest.raises(AssertionError, match="unsafe corpus input"):
+        read_corpus((trace_path,), root=root, before_open=callback)
+
+    assert opens == 0
+    assert callbacks == 0
+
+
+def test_small_public_reader_rejects_missing_capabilities_before_metadata_or_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "small.json"
+    path.write_bytes(b"{}")
+
+    def unexpected_lstat(_: Path) -> os.stat_result:
+        pytest.fail("small reader inspected metadata before capability preflight")
+
+    monkeypatch.delattr(corpus_support.os, "O_NONBLOCK")
+    monkeypatch.setattr(Path, "lstat", unexpected_lstat)
+
+    with pytest.raises(AssertionError, match="unsafe corpus input"):
+        read_small_public_file(path)
 
 
 def test_safe_corpus_reader_returns_bounded_immutable_lines(tmp_path: Path) -> None:

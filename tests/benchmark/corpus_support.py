@@ -76,6 +76,18 @@ def _unsafe() -> NoReturn:
     raise AssertionError("unsafe corpus input")
 
 
+def _require_descriptor_capabilities() -> None:
+    """Reject platforms lacking every descriptor safety primitive this reader uses."""
+    if os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd:
+        _unsafe()
+    try:
+        flags = (os.O_NONBLOCK, os.O_NOFOLLOW, os.O_DIRECTORY)
+    except AttributeError:
+        _unsafe()
+    if any(type(flag) is not int or flag <= 0 for flag in flags):
+        _unsafe()
+
+
 def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return left.st_dev == right.st_dev and left.st_ino == right.st_ino
 
@@ -104,8 +116,6 @@ def _open_root(root: Path) -> tuple[int, os.stat_result]:
     This fail-closed capability check is test evidence only; Task14 needs a
     production ingestion implementation rather than a path-based fallback.
     """
-    if os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd:
-        _unsafe()
     fd = -1
     accepted = False
     try:
@@ -113,8 +123,9 @@ def _open_root(root: Path) -> tuple[int, os.stat_result]:
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
             _unsafe()
         flags = os.O_RDONLY
-        flags |= getattr(os, "O_DIRECTORY", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= os.O_NONBLOCK
+        flags |= os.O_DIRECTORY
+        flags |= os.O_NOFOLLOW
         fd = os.open(root, flags)
         during = os.fstat(fd)
         if not stat.S_ISDIR(during.st_mode) or not _same_identity(before, during):
@@ -132,8 +143,8 @@ def _open_root(root: Path) -> tuple[int, os.stat_result]:
 
 def _open_readonly(path: Path) -> int:
     flags = os.O_RDONLY
-    flags |= getattr(os, "O_NONBLOCK", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= os.O_NONBLOCK
+    flags |= os.O_NOFOLLOW
     try:
         return os.open(path, flags)
     except (OSError, ValueError):
@@ -144,6 +155,7 @@ def read_small_public_file(
     path: Path, *, max_bytes: int = MAX_SMALL_PUBLIC_BYTES
 ) -> bytes:
     """Read a small trusted JSON asset only after an explicit byte-size cap."""
+    _require_descriptor_capabilities()
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ValueError("small-file limit must be a positive built-in integer")
     try:
@@ -200,8 +212,8 @@ def _read_trace(
     if before_open is not None:
         before_open(callback_path)
     flags = os.O_RDONLY
-    flags |= getattr(os, "O_NONBLOCK", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= os.O_NONBLOCK
+    flags |= os.O_NOFOLLOW
     try:
         fd = os.open(name, flags, dir_fd=root_fd)
     except (OSError, ValueError):
@@ -273,6 +285,7 @@ def read_corpus(
     This helper is test-data validation evidence only; production ingestion needs
     its own trust-boundary implementation.
     """
+    _require_descriptor_capabilities()
     if type(limits) is not CorpusLimits:
         raise ValueError("corpus limits must be CorpusLimits")
     if budget is None:
