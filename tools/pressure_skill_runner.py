@@ -12,15 +12,18 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from jsonschema import Draft202012Validator
+if __name__ != "__main__" or "--pressure-cgroup-helper" not in sys.argv:
+    from jsonschema import Draft202012Validator
 
 MAX_PUBLIC_BYTES = 64 * 1024
+_MAX_HELPER_BYTES = 128 * 1024
 MAX_CAPTURE_BYTES = 8 * 1024
 WORKTREE_DISCOVERY_TIMEOUT_SECONDS = 2
 MAX_COST_INTEGRAL_DIGITS = 12
@@ -43,6 +46,25 @@ _MINIMAL_SELECTED_ENV = {
     "LC_ALL": "C",
     "PYTHONIOENCODING": "utf-8",
 }
+_FORBIDDEN_SELECTED_ENV = frozenset(
+    {
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "NOTIFY_SOCKET",
+        "LISTEN_FDS",
+        "LISTEN_PID",
+        "INVOCATION_ID",
+        "JOURNAL_STREAM",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+    }
+)
+_SYSTEMD_RUN_PATH = Path("/usr/bin/systemd-run")
+_SYSTEMCTL_PATH = Path("/usr/bin/systemctl")
+_CGROUP_STOP_SECONDS = 0.4
 
 
 @dataclass
@@ -61,6 +83,21 @@ class _StateRoot:
 
     def is_relative_to(self, other: Path) -> bool:
         return self.path.is_relative_to(other)
+
+
+@dataclass(frozen=True)
+class _CgroupContext:
+    """Baseline-scoped, hash-pinned inputs for transient cgroup services."""
+
+    systemd_run: str
+    systemctl: str
+    helper_path: str
+    helper_sha256: str
+    helper_identity: tuple[int, int]
+    python_path: str
+    python_sha256: str
+    python_identity: tuple[int, int]
+    client_environment: tuple[tuple[str, str], ...]
 
 
 class PressureProtocolError(RuntimeError):
@@ -180,6 +217,52 @@ def _safe_regular_bytes(path: Path, maximum: int) -> bytes:
         if len(data) > maximum:
             raise PressureProtocolError("pressure_file_too_large")
         return data
+    finally:
+        os.close(descriptor)
+
+
+def _safe_regular_sha256(path: Path, maximum: int) -> str:
+    """Hash a regular file from one descriptor without materializing its bytes."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise PressureProtocolError("pressure_file_missing") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise PressureProtocolError("pressure_unsafe_file")
+    if metadata.st_nlink != 1:
+        raise PressureProtocolError("pressure_hardlink_forbidden")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        opened_snapshot = _snapshot(opened)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened_snapshot != _snapshot(metadata)
+        ):
+            raise PressureProtocolError("pressure_unsafe_file")
+        if opened.st_size > maximum:
+            raise PressureProtocolError("pressure_file_too_large")
+        digest = hashlib.sha256()
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        try:
+            path_after = path.lstat()
+        except FileNotFoundError as error:
+            raise PressureProtocolError("pressure_unsafe_file") from error
+        if (
+            _snapshot(after) != opened_snapshot
+            or _snapshot(path_after) != opened_snapshot
+            or remaining != 0
+        ):
+            raise PressureProtocolError("pressure_unsafe_file")
+        return digest.hexdigest()
     finally:
         os.close(descriptor)
 
@@ -543,6 +626,7 @@ def _validate_config(config: dict[str, Any], config_raw: bytes) -> dict[str, Any
             for name in environment_allowlist
         )
         or len(set(environment_allowlist)) != len(environment_allowlist)
+        or bool(set(environment_allowlist) & _FORBIDDEN_SELECTED_ENV)
     ):
         raise PressureProtocolError("pressure_invalid_config")
     metadata = config["stack_metadata"]
@@ -1107,6 +1191,431 @@ def _drain_closed_streams(
     return None
 
 
+def _trusted_system_binary(path: Path) -> str:
+    """Accept only a non-link, root-owned, non-writable systemd client."""
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+    if (
+        not path.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+    if resolved != path:
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    return str(path)
+
+
+def _systemd_client_environment() -> tuple[tuple[str, str], ...]:
+    """Only the user-manager bus locator crosses into trusted systemd clients."""
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+    for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
+    return tuple(sorted(environment.items()))
+
+
+def _context_client_environment(context: _CgroupContext) -> dict[str, str]:
+    return dict(context.client_environment)
+
+
+def _systemd_cgroup_preflight(
+    deadline: float, cwd: Path, client_environment: tuple[tuple[str, str], ...]
+) -> tuple[str, str]:
+    systemd_run = _trusted_system_binary(_SYSTEMD_RUN_PATH)
+    systemctl = _trusted_system_binary(_SYSTEMCTL_PATH)
+    try:
+        controllers = Path("/sys/fs/cgroup/cgroup.controllers").read_text(
+            encoding="ascii"
+        )
+    except OSError as error:
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+    if not controllers.strip() or time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    try:
+        stdout, _stderr, returncode = _run_bounded(
+            [systemctl, "--user", "is-system-running"],
+            cwd,
+            deadline,
+            maximum=128,
+            env=dict(client_environment),
+        )
+    except (OSError, PressureProtocolError) as error:
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+    if returncode != 0 or stdout.strip() not in {b"running", b"degraded"}:
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    return systemd_run, systemctl
+
+
+def _lexically_safe_path(path: Path, *, allow_final_symlink: bool) -> None:
+    """Reject link traversal, except for a deliberately resolved venv executable."""
+    if not path.is_absolute():
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    current = Path(path.anchor)
+    parts = path.parts[1:]
+    try:
+        for index, component in enumerate(parts):
+            current /= component
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode) and (
+                not allow_final_symlink or index != len(parts) - 1
+            ):
+                raise PressureProtocolError("pressure_cgroup_unavailable")
+    except OSError as error:
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+
+
+def _trusted_digest(
+    path: Path,
+    maximum: int,
+    *,
+    allowed_uids: frozenset[int],
+    allow_final_symlink: bool,
+) -> tuple[str, str, tuple[int, int]]:
+    """Descriptor-hash a non-writable executable and pin its resolved identity."""
+    try:
+        _lexically_safe_path(path, allow_final_symlink=allow_final_symlink)
+        resolved = path.resolve(strict=True)
+        _lexically_safe_path(resolved, allow_final_symlink=False)
+        metadata = resolved.lstat()
+    except OSError as error:
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+    if (
+        not resolved.is_absolute()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid not in allowed_uids
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    try:
+        digest = _safe_regular_sha256(resolved, maximum)
+    except PressureProtocolError as error:
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+    try:
+        current = resolved.lstat()
+    except OSError as error:
+        raise PressureProtocolError("pressure_cgroup_unavailable") from error
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_uid not in allowed_uids
+        or current.st_nlink != 1
+        or stat.S_IMODE(current.st_mode) & 0o022
+        or (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
+    ):
+        raise PressureProtocolError("pressure_cgroup_unavailable")
+    return str(resolved), digest, (metadata.st_dev, metadata.st_ino)
+
+
+def _trusted_private_digest(
+    path: Path, maximum: int
+) -> tuple[str, str, tuple[int, int]]:
+    """Accept only the current user's non-writable, non-linked helper module."""
+    return _trusted_digest(
+        path,
+        maximum,
+        allowed_uids=frozenset({os.getuid()}),
+        allow_final_symlink=False,
+    )
+
+
+def _trusted_interpreter_digest(
+    path: Path, maximum: int
+) -> tuple[str, str, tuple[int, int]]:
+    """Accept a pinned root system interpreter or private venv interpreter."""
+    return _trusted_digest(
+        path,
+        maximum,
+        allowed_uids=frozenset({0, os.getuid()}),
+        allow_final_symlink=True,
+    )
+
+
+def _build_cgroup_context(deadline: float, cwd: Path) -> _CgroupContext:
+    """Do the one baseline-wide cgroup probe and pin helper execution inputs."""
+    client_environment = _systemd_client_environment()
+    systemd_run, systemctl = _systemd_cgroup_preflight(
+        deadline, cwd, client_environment
+    )
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
+    helper_path, helper_sha256, helper_identity = _trusted_private_digest(
+        Path(__file__), _MAX_HELPER_BYTES
+    )
+    python_path, python_sha256, python_identity = _trusted_interpreter_digest(
+        Path(sys.executable), 64 * 1024 * 1024
+    )
+    if time.monotonic() >= deadline:
+        raise PressureProtocolError("pressure_timeout")
+    return _CgroupContext(
+        systemd_run=systemd_run,
+        systemctl=systemctl,
+        helper_path=helper_path,
+        helper_sha256=helper_sha256,
+        helper_identity=helper_identity,
+        python_path=python_path,
+        python_sha256=python_sha256,
+        python_identity=python_identity,
+        client_environment=client_environment,
+    )
+
+
+def _assert_context_identity(
+    path: str, identity: tuple[int, int], *, allowed_uids: frozenset[int]
+) -> None:
+    try:
+        metadata = Path(path).lstat()
+    except OSError as error:
+        raise PressureProtocolError("pressure_cgroup_launch_invalid") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid not in allowed_uids
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (metadata.st_dev, metadata.st_ino) != identity
+    ):
+        raise PressureProtocolError("pressure_cgroup_launch_invalid")
+
+
+def _safe_private_launch(path: Path) -> dict[str, Any]:
+    """Helper-side read: a one-shot private launch record has no shell surface."""
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+        ):
+            raise PressureProtocolError("pressure_cgroup_launch_invalid")
+        raw = _safe_regular_bytes(path, MAX_PUBLIC_BYTES)
+        path.unlink()
+    except (OSError, PressureProtocolError) as error:
+        raise PressureProtocolError("pressure_cgroup_launch_invalid") from error
+    value = _strict_json_loads(raw)
+    expected = {
+        "argv",
+        "environment",
+        "environment_names",
+        "helper_sha256",
+        "python_sha256",
+        "run_dev",
+        "run_ino",
+    }
+    if (
+        type(value) is not dict
+        or set(value) != expected
+        or type(value["argv"]) is not list
+        or not value["argv"]
+        or any(type(item) is not str or not item for item in value["argv"])
+        or type(value["environment"]) is not dict
+        or type(value["environment_names"]) is not list
+        or value["environment_names"] != sorted(value["environment"])
+        or any(
+            type(key) is not str or _ENV_NAME_PATTERN.fullmatch(key) is None
+            for key in value["environment_names"]
+        )
+        or set(value["environment"]) != set(value["environment_names"])
+        or any(
+            type(key) is not str or type(item) is not str
+            for key, item in value["environment"].items()
+        )
+        or not set(_MINIMAL_SELECTED_ENV).issubset(value["environment"])
+        or any(key in _FORBIDDEN_SELECTED_ENV for key in value["environment"])
+        or any(
+            type(value[name]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", value[name]) is None
+            for name in ("helper_sha256", "python_sha256")
+        )
+        or type(value["run_dev"]) is not int
+        or type(value["run_ino"]) is not int
+    ):
+        raise PressureProtocolError("pressure_cgroup_launch_invalid")
+    return value
+
+
+def _cgroup_helper(launch_path: str) -> None:
+    """Exec the selected hash-pinned executable after deleting its secret record."""
+    try:
+        launch = _safe_private_launch(Path(launch_path))
+        _helper_path, helper_sha256, _helper_identity = _trusted_private_digest(
+            Path(__file__), _MAX_HELPER_BYTES
+        )
+        _python_path, python_sha256, _python_identity = _trusted_interpreter_digest(
+            Path(sys.executable), 64 * 1024 * 1024
+        )
+        if (
+            helper_sha256 != launch["helper_sha256"]
+            or python_sha256 != launch["python_sha256"]
+        ):
+            raise PressureProtocolError("pressure_cgroup_launch_invalid")
+        current = os.stat(".")
+        if (current.st_dev, current.st_ino) != (launch["run_dev"], launch["run_ino"]):
+            raise PressureProtocolError("pressure_cgroup_launch_invalid")
+        run_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchdir(run_fd)
+        finally:
+            os.close(run_fd)
+        os.execve(launch["argv"][0], launch["argv"], launch["environment"])
+    except (OSError, ValueError, TypeError, PressureProtocolError, SystemExit):
+        os._exit(126)
+
+
+def _unit_name(command_hash: str, run_fd: int, position: int) -> str:
+    inode = os.fstat(run_fd).st_ino
+    return (
+        f"semantic-reheating-{command_hash[:12]}-{inode:x}-{os.getpid():x}-{position}"
+    )
+
+
+def _unit_collected(
+    context: _CgroupContext, unit: str, cwd: Path, deadline: float
+) -> bool:
+    probe_deadline = min(deadline, time.monotonic() + _CGROUP_STOP_SECONDS)
+    if probe_deadline <= time.monotonic():
+        return False
+    try:
+        stdout, _stderr, returncode = _run_bounded(
+            [
+                context.systemctl,
+                "--user",
+                "show",
+                unit,
+                "--property=LoadState",
+                "--value",
+            ],
+            cwd,
+            probe_deadline,
+            maximum=128,
+            env=_context_client_environment(context),
+        )
+    except (OSError, PressureProtocolError):
+        return False
+    return returncode == 0 and stdout.strip() == b"not-found"
+
+
+def _cleanup_cgroup_unit(context: _CgroupContext, unit: str, cwd: Path) -> None:
+    """Force every cgroup member out and require systemd to collect the unit."""
+    cleanup_deadline = time.monotonic() + _CGROUP_STOP_SECONDS
+    for action in (
+        ["kill", "--kill-whom=all", unit],
+        ["stop", unit],
+        ["reset-failed", unit],
+    ):
+        if cleanup_deadline <= time.monotonic():
+            break
+        try:
+            _run_bounded(
+                [context.systemctl, "--user", *action],
+                cwd,
+                cleanup_deadline,
+                maximum=128,
+                env=_context_client_environment(context),
+            )
+        except (OSError, PressureProtocolError):
+            pass
+    while time.monotonic() < cleanup_deadline:
+        if _unit_collected(context, unit, cwd, cleanup_deadline):
+            return
+        time.sleep(0.02)
+    raise PressureProtocolError("pressure_cgroup_cleanup_failed")
+
+
+def _unlink_private_at(directory: int, name: str) -> None:
+    try:
+        os.unlink(_private_name(name), dir_fd=directory)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise PressureProtocolError("pressure_cgroup_launch_invalid") from error
+
+
+def _run_selected_cgroup(
+    argv: list[str],
+    cwd: Path,
+    deadline: float,
+    *,
+    context: _CgroupContext,
+    environment: dict[str, str],
+    run_fd: int,
+    launch_name: str,
+    command_hash: str,
+    position: int,
+) -> tuple[bytes, bytes, int]:
+    """Contain one selected execution in a transient user service cgroup v2."""
+    _assert_context_identity(
+        context.helper_path,
+        context.helper_identity,
+        allowed_uids=frozenset({os.getuid()}),
+    )
+    _assert_context_identity(
+        context.python_path,
+        context.python_identity,
+        allowed_uids=frozenset({0, os.getuid()}),
+    )
+    launch = {
+        "argv": argv,
+        "environment": environment,
+        "environment_names": sorted(environment),
+        "helper_sha256": context.helper_sha256,
+        "python_sha256": context.python_sha256,
+        "run_dev": os.fstat(run_fd).st_dev,
+        "run_ino": os.fstat(run_fd).st_ino,
+    }
+    _write_private_at(run_fd, launch_name, _canonical_bytes(launch))
+    run_path = _fd_path(run_fd)
+    launch_path = run_path / launch_name
+    unit = _unit_name(command_hash, run_fd, position)
+    service_argv = [
+        context.systemd_run,
+        "--user",
+        "--pipe",
+        "--wait",
+        "--collect",
+        "--quiet",
+        f"--unit={unit}",
+        "--property=KillMode=control-group",
+        "--property=TimeoutStopSec=200ms",
+        "--property=SendSIGKILL=yes",
+        f"--working-directory={run_path}",
+        "--service-type=exec",
+        "--",
+        context.python_path,
+        context.helper_path,
+        "--pressure-cgroup-helper",
+        str(launch_path),
+    ]
+    try:
+        stdout, stderr, returncode = _run_bounded(
+            service_argv,
+            cwd,
+            deadline,
+            env=_context_client_environment(context),
+            trusted_collected_service=True,
+        )
+    except BaseException as error:
+        try:
+            _cleanup_cgroup_unit(context, unit, cwd)
+        except PressureProtocolError as cleanup_error:
+            raise cleanup_error from error
+        raise
+    finally:
+        _unlink_private_at(run_fd, launch_name)
+    if returncode != 0:
+        _cleanup_cgroup_unit(context, unit, cwd)
+    return stdout, stderr, returncode
+
+
 def _run_bounded(
     argv: list[str],
     cwd: Path | str,
@@ -1115,6 +1624,7 @@ def _run_bounded(
     *,
     env: dict[str, str],
     pass_fds: tuple[int, ...] = (),
+    trusted_collected_service: bool = False,
 ) -> tuple[bytes, bytes, int]:
     """Capture bounded output and terminate every member of the selected session."""
     maximum = MAX_CAPTURE_BYTES if maximum is None else maximum
@@ -1159,8 +1669,12 @@ def _run_bounded(
             parent_exited = _direct_parent_exited(process.pid)
         if failure is None and parent_exited:
             failure = _drain_available_streams(selector, streams, maximum)
-        cleaned = True
-        _cleanup_selected_process(process, process_group)
+        if trusted_collected_service and parent_exited:
+            process.wait(timeout=0)
+            cleaned = True
+        else:
+            cleaned = True
+            _cleanup_selected_process(process, process_group)
         returncode = process.returncode
         if failure is None:
             failure = _drain_closed_streams(selector, streams, maximum)
@@ -1208,7 +1722,8 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
     run_name = "run-" + command_hash[:12]
     run_fd = _create_run_directory(state_root.fd, run_name)
     state_root.children.append(run_fd)
-    run_cwd = f"/proc/self/fd/{run_fd}"
+    run_path = _fd_path(run_fd)
+    run_cwd = str(run_path)
     outcomes: list[dict[str, str]] = []
     evidence_entries: list[dict[str, str]] = []
     total_counts: dict[str, int] = {
@@ -1220,6 +1735,7 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
     total_cost = Decimal(0)
     baseline_started = time.monotonic()
     deadline = baseline_started + config["caps"]["elapsed_seconds"]
+    cgroup_context = _build_cgroup_context(deadline, Path(run_cwd))
     for position, scenario in enumerate(protocol["scenarios"]["scenarios"], start=1):
         if time.monotonic() >= deadline:
             raise PressureProtocolError("pressure_timeout")
@@ -1247,12 +1763,16 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
         ]
         try:
             _assert_run_directory(state_root.fd, run_name, run_fd)
-            stdout, stderr, returncode = _run_bounded(
+            stdout, stderr, returncode = _run_selected_cgroup(
                 expanded,
-                run_cwd,
+                Path(run_cwd),
                 deadline,
-                env=selected_environment,
-                pass_fds=(run_fd,),
+                context=cgroup_context,
+                environment=selected_environment,
+                run_fd=run_fd,
+                launch_name=f"launch-{position}.json",
+                command_hash=command_hash,
+                position=position,
             )
             _assert_run_directory(state_root.fd, run_name, run_fd)
         except PressureProtocolError as error:
@@ -1381,3 +1901,9 @@ def run_baseline(repo: Path) -> dict[str, Any]:
         return _run_baseline_in_state(repo_root, state_root)
     finally:
         state_root.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--pressure-cgroup-helper":
+        _cgroup_helper(sys.argv[2])
+    raise SystemExit(126)

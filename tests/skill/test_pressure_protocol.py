@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -82,6 +83,15 @@ if mode == 'orphan-success':
     with __import__('pathlib').Path(os.environ['PRESSURE_CHILD_PID_FILE']).open('a', encoding='ascii') as receipt:
         receipt.write(str(child.pid) + '\\n')
     null.close()
+if mode in {'setsid-success', 'setsid-ignore-term-success'}:
+    child_code = 'import time; time.sleep(30)'
+    if mode == 'setsid-ignore-term-success':
+        child_code = 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'
+    null = open(os.devnull, 'wb')
+    child = __import__('subprocess').Popen([sys.executable, '-c', child_code], stdin=null, stdout=null, stderr=null, start_new_session=True)
+    with __import__('pathlib').Path(os.environ['PRESSURE_CHILD_PID_FILE']).open('a', encoding='ascii') as receipt:
+        receipt.write(str(child.pid) + '\\n')
+    null.close()
 if mode in {'inherited-stdio-success', 'inherited-stdio-ignore-term-success'}:
     child_code = 'import time; time.sleep(30)'
     if mode == 'inherited-stdio-ignore-term-success':
@@ -137,7 +147,8 @@ def _install_config(state_home: Path, fake_cli: Path, **changes: Any) -> Path:
             "turns": 9,
             "tools": 9,
             "tokens": 99,
-            "elapsed_seconds": 1,
+            # Non-deadline fixture: six real transient services include systemd overhead.
+            "elapsed_seconds": 4,
             "cost": "9.0",
         },
         "enforcement": {
@@ -237,6 +248,8 @@ def test_private_state_environment_contract_rejects_relative_fallback_and_names(
         ["bad-name"],
         ["A=BAD"],
         ["A\u0000BAD"],
+        ["DBUS_SESSION_BUS_ADDRESS"],
+        ["LD_PRELOAD"],
     ):
         invalid = copy.deepcopy(valid)
         invalid["environment_allowlist"] = names
@@ -427,6 +440,103 @@ def test_missing_allowlisted_environment_fails_before_selected_popen(
     ) as error:
         runner.run_baseline(PROJECT_ROOT)
     assert "PRESSURE_REQUIRED_SECRET" not in str(error.value)
+
+
+def test_selected_stack_fails_closed_before_exec_when_cgroup_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    _install_config(tmp_path, fake)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "_worktree_roots", lambda repo: (repo.resolve(),))
+    monkeypatch.setattr(runner, "_SYSTEMD_RUN_PATH", tmp_path / "missing-systemd-run")
+    monkeypatch.setattr(
+        runner.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("selected Popen")
+        ),
+    )
+
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_cgroup_unavailable"
+    ):
+        runner.run_baseline(PROJECT_ROOT)
+
+
+@pytest.mark.parametrize("failure", (False, True))
+def test_cgroup_launch_record_is_unlinked_and_secret_never_reaches_service_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: bool
+) -> None:
+    """The cgroup service receives only a private launch-record path, never its secret."""
+    run_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    seen_argv: list[str] = []
+    cleanup_calls = [0]
+    secret = "do-not-put-this-in-systemd-argv"
+    context = runner._CgroupContext(
+        systemd_run="/usr/bin/systemd-run",
+        systemctl="/usr/bin/systemctl",
+        helper_path="/private/helper.py",
+        helper_sha256="1" * 64,
+        helper_identity=(1, 1),
+        python_path="/private/python",
+        python_sha256="2" * 64,
+        python_identity=(2, 2),
+        client_environment=(("LANG", "C"),),
+    )
+
+    def fake_bounded(
+        argv: list[str], _cwd: Path, _deadline: float, **_kwargs: object
+    ) -> tuple[bytes, bytes, int]:
+        seen_argv.extend(argv)
+        if failure:
+            raise runner.PressureProtocolError("pressure_timeout")
+        return b"", b"", 0
+
+    monkeypatch.setattr(
+        runner, "_assert_context_identity", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(runner, "_run_bounded", fake_bounded)
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_cgroup_unit",
+        lambda *_args, **_kwargs: cleanup_calls.__setitem__(0, 1),
+    )
+    try:
+        if failure:
+            with pytest.raises(runner.PressureProtocolError, match="pressure_timeout"):
+                runner._run_selected_cgroup(
+                    ["/private/selected", secret],
+                    tmp_path,
+                    runner.time.monotonic() + 1,
+                    context=context,
+                    environment={
+                        **runner._MINIMAL_SELECTED_ENV,
+                        "PRESSURE_SECRET": secret,
+                    },
+                    run_fd=run_fd,
+                    launch_name="launch-1.json",
+                    command_hash="a" * 64,
+                    position=1,
+                )
+            assert cleanup_calls == [1]
+        else:
+            runner._run_selected_cgroup(
+                ["/private/selected", secret],
+                tmp_path,
+                runner.time.monotonic() + 1,
+                context=context,
+                environment={**runner._MINIMAL_SELECTED_ENV, "PRESSURE_SECRET": secret},
+                run_fd=run_fd,
+                launch_name="launch-1.json",
+                command_hash="a" * 64,
+                position=1,
+            )
+        assert secret not in seen_argv
+        assert not (tmp_path / "launch-1.json").exists()
+    finally:
+        os.close(run_fd)
 
 
 @pytest.mark.pressure_live
@@ -1380,7 +1490,17 @@ def test_baseline_deadline_is_shared_and_uses_runner_measured_time(
 ) -> None:
     fake = tmp_path / "fake_cli.py"
     _write_fake_cli(fake)
-    _install_config(tmp_path, fake)
+    _install_config(
+        tmp_path,
+        fake,
+        caps={
+            "turns": 9,
+            "tools": 9,
+            "tokens": 99,
+            "elapsed_seconds": 1,
+            "cost": "9.0",
+        },
+    )
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     clock = [0.0]
     calls = [0]
@@ -1388,14 +1508,12 @@ def test_baseline_deadline_is_shared_and_uses_runner_measured_time(
     def fake_monotonic() -> float:
         return clock[0]
 
-    def fake_run(
+    def fake_selected(
         argv: list[str],
-        _cwd: Path | str,
+        _cwd: Path,
         _deadline: float,
-        maximum: int = runner.MAX_CAPTURE_BYTES,
         **_kwargs: object,
     ) -> tuple[bytes, bytes, int]:
-        assert maximum in {runner.MAX_CAPTURE_BYTES, runner.MAX_PUBLIC_BYTES}
         calls[0] += 1
         scenario = argv[-2].splitlines()[0].split(": ", 1)[1]
         Path(argv[-1]).write_text(
@@ -1421,12 +1539,30 @@ def test_baseline_deadline_is_shared_and_uses_runner_measured_time(
             0,
         )
 
+    context = object()
+    preflight_calls = [0]
+
+    def fake_context(_deadline: float, _cwd: Path) -> object:
+        preflight_calls[0] += 1
+        return context
+
+    def selected_with_context(
+        argv: list[str],
+        cwd: Path,
+        deadline: float,
+        **kwargs: object,
+    ) -> tuple[bytes, bytes, int]:
+        assert kwargs["context"] is context
+        return fake_selected(argv, cwd, deadline, **kwargs)
+
     monkeypatch.setattr(runner.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(runner, "_run_bounded", fake_run)
+    monkeypatch.setattr(runner, "_build_cgroup_context", fake_context)
+    monkeypatch.setattr(runner, "_run_selected_cgroup", selected_with_context)
     monkeypatch.setattr(runner, "_worktree_roots", lambda repo: (repo,))
 
     with pytest.raises(runner.PressureProtocolError, match="pressure_timeout"):
         runner.run_baseline(PROJECT_ROOT)
+    assert preflight_calls == [1]
     assert calls[0] == 4
 
 
@@ -1481,6 +1617,60 @@ def test_safe_regular_bytes_rejects_mixed_same_inode_same_size_read(
         replaced_stat.st_size,
     ) == (original_stat.st_dev, original_stat.st_ino, original_stat.st_size)
     assert candidate.read_bytes() == after
+
+
+def test_trusted_interpreter_digest_accepts_root_owned_system_binary() -> None:
+    """Interpreter policy deliberately permits immutable root-owned system Python."""
+    candidate = Path("/usr/bin/systemctl")
+    resolved, digest, identity = runner._trusted_interpreter_digest(
+        candidate, 8 * 1024 * 1024
+    )
+
+    assert resolved == str(candidate)
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    assert identity == (candidate.stat().st_dev, candidate.stat().st_ino)
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_cgroup_unavailable"
+    ):
+        runner._trusted_private_digest(candidate, 8 * 1024 * 1024)
+
+
+def test_trusted_interpreter_digest_rejects_mutable_or_unexpected_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "private-python"
+    candidate.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    candidate.chmod(0o775)
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_cgroup_unavailable"
+    ):
+        runner._trusted_interpreter_digest(candidate, 1024)
+
+    candidate.chmod(0o700)
+    current_uid = os.getuid()
+    monkeypatch.setattr(runner.os, "getuid", lambda: current_uid + 1)
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_cgroup_unavailable"
+    ):
+        runner._trusted_interpreter_digest(candidate, 1024)
+
+
+def test_trusted_interpreter_digest_resolves_only_final_private_venv_link(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "python-real"
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    target.chmod(0o700)
+    venv_python = tmp_path / "python"
+    venv_python.symlink_to(target)
+
+    resolved, _digest, identity = runner._trusted_interpreter_digest(venv_python, 1024)
+    assert resolved == str(target)
+    assert identity == (target.stat().st_dev, target.stat().st_ino)
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_cgroup_unavailable"
+    ):
+        runner._trusted_private_digest(venv_python, 1024)
 
 
 def _pid_is_live(pid: int) -> bool:
@@ -1672,6 +1862,39 @@ def test_normal_exit_reaps_child_left_in_selected_process_group(
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+@pytest.mark.parametrize("mode", ("setsid-success", "setsid-ignore-term-success"))
+def test_selected_stack_reaps_setsids_that_escape_process_group_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """A selected stack can detach its session; a process group cannot contain it."""
+    fake = tmp_path / "fake_cli.py"
+    child_pid = tmp_path / "children.pid"
+    _write_fake_cli(fake)
+    _install_config(
+        tmp_path,
+        fake,
+        environment_allowlist=["PRESSURE_FAKE_MODE", "PRESSURE_CHILD_PID_FILE"],
+    )
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", mode)
+    monkeypatch.setenv("PRESSURE_CHILD_PID_FILE", str(child_pid))
+    pids: list[int] = []
+    try:
+        summary = runner.run_baseline(PROJECT_ROOT)
+        pids = [
+            int(line) for line in child_pid.read_text(encoding="ascii").splitlines()
+        ]
+        assert len(pids) == 6
+        assert [item["scenario_id"] for item in summary["outcomes"]] == SCENARIO_IDS
+        assert not any(_pid_is_live(pid) for pid in pids)
+    finally:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_fewer_than_six_scenarios_fails_closed(
