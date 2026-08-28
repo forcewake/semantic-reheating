@@ -18,11 +18,13 @@ EXPECTED_PROMPTS = {
     "verify-or-stop.md",
 }
 INLINE_LINK = re.compile(
-    r"!?\[[^]\n]*\]\(\s*(?:<([^>\n]+)>|([^\s)]+))(?:\s+[^)]*)?\s*\)"
+    r"(?<!\\)!?\[[^]\n]*\]\(\s*(?:<([^>\n]+)>|([^\s)]+))(?:\s+[^)]*)?\s*\)"
 )
 REFERENCE_DEFINITION = re.compile(
-    r"^\s*\[([^]\n]+)\]:\s*(?:<([^>\n]+)>|(\S+))(?:\s+.*)?$", re.MULTILINE
+    r"^[ \t]*\[([^]\n]+)\]:[ \t]*(?:<([^>\n]+)>|(\S+))(?:[ \t]+.*)?$", re.MULTILINE
 )
+REFERENCE_USAGE = re.compile(r"(?<!\\)!?\[([^]\n]+)\]\[([^]\n]*)\]")
+SHORTCUT_REFERENCE = re.compile(r"(?<!\\)!?\[([^]\n]+)\]")
 ANGLE_AUTOLINK = re.compile(r"<([^ <>\n]+)>")
 FENCED_CODE = re.compile(r"^```[^\n]*\n.*?^```\s*$", re.MULTILINE | re.DOTALL)
 INLINE_CODE = re.compile(r"`[^`]*`")
@@ -33,27 +35,50 @@ def _without_code_spans(markdown: str) -> str:
     return INLINE_CODE.sub("", FENCED_CODE.sub("", markdown))
 
 
+def _reference_label(label: str) -> str:
+    return " ".join(label.split()).casefold()
+
+
+def _mask_matches(text: str, matches: list[re.Match[str]]) -> str:
+    masked = list(text)
+    for match in matches:
+        masked[match.start() : match.end()] = " " * (match.end() - match.start())
+    return "".join(masked)
+
+
 def _markdown_targets(markdown: str) -> list[str]:
     """Extract every local Markdown destination after excluding code samples."""
     visible = _without_code_spans(markdown)
-    definitions = {
-        match.group(1).strip().casefold(): match.group(2) or match.group(3)
-        for match in REFERENCE_DEFINITION.finditer(visible)
-    }
-    targets: list[str] = []
-    for match in INLINE_LINK.finditer(visible):
-        targets.append(match.group(1) or match.group(2))
-    targets.extend(ANGLE_AUTOLINK.findall(visible))
-    # Definitions are destinations too. Preserve source order, including unused
-    # definitions, so a hidden unsafe destination cannot be silently ignored.
-    targets.extend(
-        match.group(2) or match.group(3)
-        for match in REFERENCE_DEFINITION.finditer(visible)
+    definition_matches = list(REFERENCE_DEFINITION.finditer(visible))
+    definitions: dict[str, str] = {}
+    for match in definition_matches:
+        label = _reference_label(match.group(1))
+        assert label not in definitions, f"duplicate reference definition: {label!r}"
+        definitions[label] = match.group(2) or match.group(3)
+
+    non_definitions = _mask_matches(visible, definition_matches)
+    inline_matches = list(INLINE_LINK.finditer(non_definitions))
+    targets = [match.group(1) or match.group(2) for match in inline_matches]
+    without_inline_links = _mask_matches(non_definitions, inline_matches)
+    targets.extend(ANGLE_AUTOLINK.findall(without_inline_links))
+    without_autolinks = _mask_matches(
+        without_inline_links, list(ANGLE_AUTOLINK.finditer(without_inline_links))
     )
-    for usage in re.finditer(r"(?<!!)\[[^]\n]+\]\[([^]\n]+)\]", visible):
-        label = usage.group(1).strip().casefold()
-        assert label in definitions, f"unresolved reference usage: {usage.group(0)!r}"
-    return targets
+
+    reference_matches = list(REFERENCE_USAGE.finditer(without_autolinks))
+    for match in reference_matches:
+        label = _reference_label(match.group(2) or match.group(1))
+        assert label in definitions, f"unresolved reference usage: {match.group(0)!r}"
+    without_reference_usages = _mask_matches(without_autolinks, reference_matches)
+    for match in SHORTCUT_REFERENCE.finditer(without_reference_usages):
+        label = _reference_label(match.group(1))
+        assert label in definitions, f"unresolved reference usage: {match.group(0)!r}"
+
+    # Definitions are destinations too. Preserve them even when unused, so a
+    # hidden unsafe destination cannot be silently ignored. Deduplicate because
+    # each resolved destination needs one lexical safety check.
+    targets.extend(definitions.values())
+    return list(dict.fromkeys(targets))
 
 
 def _slug(heading: str) -> str:
@@ -179,6 +204,77 @@ def test_link_parser_ignores_code_spans_and_captures_all_markdown_link_forms() -
         "unsafe-autolink.md",
         "unsafe-reference.md",
     ]
+
+
+def test_link_parser_resolves_full_collapsed_shortcut_and_image_references() -> None:
+    source = (
+        "[ Schema   ID ]: ../contracts/v1/evidence-record.schema.json\n"
+        "[full][schema id] ![image][SCHEMA ID]\n"
+        "[Schema ID][] ![Schema ID][]\n"
+        "[schema id] ![schema id]\n"
+    )
+    assert _markdown_targets(source) == ["../contracts/v1/evidence-record.schema.json"]
+
+
+def test_link_parser_rejects_missing_or_ambiguous_reference_labels() -> None:
+    for source, reviewer_string in (
+        ("[broken][missing]", "unresolved reference usage: '[broken][missing]'"),
+        ("[broken][]", "unresolved reference usage: '[broken][]'"),
+        ("[missing]", "unresolved reference usage: '[missing]'"),
+        (
+            "[duplicate]: safe.md\n[ DUPLICATE ]: other.md",
+            "duplicate reference definition: 'duplicate'",
+        ),
+    ):
+        with pytest.raises(AssertionError, match=re.escape(reviewer_string)):
+            _markdown_targets(source)
+
+
+def test_link_parser_does_not_reparse_definitions_or_inline_links_as_shortcuts() -> (
+    None
+):
+    source = (
+        "[definition]: ../contracts/v1/evidence-record.schema.json\n"
+        "[inline](../contracts/v1/evidence-record.schema.json)\n"
+        "![image](../contracts/v1/evidence-record.schema.json)\n"
+        "`[missing]` and \\[ignored]\n"
+        "```md\n[also missing][]\n```\n"
+        "[definition][]\n"
+    )
+    assert _markdown_targets(source) == ["../contracts/v1/evidence-record.schema.json"]
+
+
+def test_link_validation_rejects_unresolved_full_collapsed_and_shortcut_references() -> (
+    None
+):
+    prompt = PROMPTS_DIR / "detection-notice.md"
+    valid = prompt.read_text(encoding="utf-8")
+    for usage, reviewer_string in (
+        ("[broken][missing]", "unresolved reference usage: '[broken][missing]'"),
+        ("[broken][]", "unresolved reference usage: '[broken][]'"),
+        ("[missing]", "unresolved reference usage: '[missing]'"),
+    ):
+        with pytest.raises(AssertionError, match=re.escape(reviewer_string)):
+            _validate_links(prompt, f"{valid}\n{usage}\n")
+
+
+def test_link_validation_resolves_collapsed_and_shortcut_references(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "pack"
+    prompt_dir = root / "prompts"
+    contract_dir = root / "contracts"
+    prompt_dir.mkdir(parents=True)
+    contract_dir.mkdir()
+    target = contract_dir / "safe.json"
+    target.write_text("# Contract\n", encoding="utf-8")
+    prompt = prompt_dir / "notice.md"
+    markdown = (
+        "[ Safe   ID ]: ../contracts/safe.json#contract\n"
+        "[full][safe id] [safe id][] [Safe ID]\n"
+        "![alt][SAFE ID] ![Safe ID][] ![safe id]\n"
+    )
+    _validate_links(prompt, markdown, root)
 
 
 def test_link_validation_rejects_images_autolinks_and_escape_mutations() -> None:

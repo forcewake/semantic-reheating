@@ -106,7 +106,20 @@ def _read_prompt(path: Path) -> str:
     assert data.endswith(b"\n"), f"{path.name} must end with one final LF"
     assert data.strip(), f"{path.name} is empty"
     assert len(data) <= 64 * 1024, f"{path.name} exceeds 64 KiB"
-    return data.decode("utf-8")
+    text = data.decode("utf-8")
+    non_ascii = next(
+        (
+            (offset, character)
+            for offset, character in enumerate(text)
+            if not character.isascii()
+        ),
+        None,
+    )
+    assert non_ascii is None, (
+        f"non_ascii_prompt_content at character {non_ascii[0]}: "
+        f"U+{ord(non_ascii[1]):04X}"
+    )
+    return text
 
 
 def _sections(text: str) -> list[str]:
@@ -294,6 +307,14 @@ def test_prompt_assets_are_utf8_bounded_and_structured(path: Path) -> None:
     _validate_common_prompt(path.name, _read_prompt(path))
 
 
+def test_read_prompt_rejects_non_ascii_confusables(tmp_path: Path) -> None:
+    prompt = tmp_path / "prompt.md"
+    for confusable in ("а", "α", "ａ"):
+        prompt.write_text(f"Operational English {confusable}.\n", encoding="utf-8")
+        with pytest.raises(AssertionError, match=r"non_ascii_prompt_content.*U\+"):
+            _read_prompt(prompt)
+
+
 @pytest.mark.parametrize("path", _prompt_paths(), ids=lambda path: path.name)
 def test_prompt_record_inventory_is_exact_and_examples_validate_schema_and_runtime(
     path: Path,
@@ -457,6 +478,12 @@ def _validate_annealing_hygiene(text: str) -> None:
         assert _section(text, section_name).count(exact) == 1
     assert text.count(exact) == len(required_sections)
     remaining = text.replace(exact, "")
+    non_ascii = next(
+        (character for character in remaining if not character.isascii()), None
+    )
+    assert non_ascii is None, (
+        f"residual annealing text contains non-ASCII content: U+{ord(non_ascii):04X}"
+    )
     assert not any(
         unicodedata.category(character) in {"Cc", "Cf"}
         and character not in {"\n", "\t"}
@@ -492,6 +519,9 @@ def test_bounded_reheating_has_only_the_exact_strict_annealing_nonclaim() -> Non
         f"{text}\nSemantic reheating is simu**lated annealing**.\n",
         f"{text}\nSemantic reheating is simulated <em>annealing</em>.\n",
         f"{text}\nSemantic reheating is simulated\u200bannealing.\n",
+        f"{text}\nSemantic reheating is simulated аnnealing.\n",
+        f"{text}\nSemantic reheating is simulated αnnealing.\n",
+        f"{text}\nSemantic reheating is simulated ａnnealing.\n",
         f"{text}\nSemantic reheating equals simulated annealing.\n",
         f"{text}\nSemantic reheating is equivalent to simulated annealing.\n",
         f"{text}\n{exact}\n",
