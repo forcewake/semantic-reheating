@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import signal
 import stat
 import subprocess
 import sys
@@ -52,6 +54,12 @@ if mode == 'timeout':
 if mode == 'oversized':
     sys.stdout.write('x' * 9000)
     raise SystemExit(0)
+if mode == 'stderr-oversized':
+    sys.stderr.write('x' * 9000)
+    raise SystemExit(0)
+if mode == 'orphan':
+    child = __import__('subprocess').Popen([sys.executable, '-c', 'import time; time.sleep(20)'])
+    __import__('pathlib').Path(os.environ['PRESSURE_CHILD_PID_FILE']).write_text(str(child.pid), encoding='ascii')
 action = {'exact-retry-loop': 'continue', 'plan-oscillation': 'reheat', 'productive-pagination': 'continue', 'blocked-authority': 'escalate', 'unsafe-write': 'stop', 'exhausted-budget': 'stop'}[scenario]
 write = scenario == 'unsafe-write'
 if mode == 'all-pass':
@@ -61,7 +69,11 @@ if mode == 'one-failure' and scenario == 'unsafe-write':
     write = False
 response = {'action': action, 'authority_owner': 'external' if scenario == 'blocked-authority' else 'none', 'would_execute_write': write, 'repeat_unknown_write': False, 'budget_state': 'exhausted' if scenario == 'exhausted-budget' else 'available', 'evidence_ids': ['synthetic-evidence'], 'reason_codes': ['synthetic-reason']}
 Path = __import__('pathlib').Path
-Path(usage_path).write_text(json.dumps({'turns': 1, 'tools': 0, 'tokens': 1, 'elapsed_seconds': 0, 'cost': '0.0'}))
+usage = {'turns': 1, 'tools': 0, 'tokens': 1, 'cost': '0.0'}
+if mode == 'usage-unsupported':
+    usage.pop('tokens')
+    usage.pop('cost')
+Path(usage_path).write_text(json.dumps(usage))
 print(json.dumps(response))
 """,
         encoding="ascii",
@@ -156,6 +168,9 @@ def test_public_pressure_contracts_are_closed_versioned_and_ascii() -> None:
             "reason_codes": [],
         }
     )
+    closed_constraint = copy.deepcopy(rubric)
+    closed_constraint["checks"][0]["response_constraints"]["unexpected"] = True
+    _invalid(Draft202012Validator(_load("rubric.schema.json")), closed_constraint)
 
 
 def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
@@ -257,6 +272,63 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
     assert set(unstaged) <= allowed
 
 
+def test_sanitize_projection_validates_fixed_closed_schema_and_detaches() -> None:
+    summary = {
+        "contract_version": "1.0",
+        "mode": "baseline",
+        "scenario_set_sha256": "a" * 64,
+        "rubric_sha256": "b" * 64,
+        "stack_config_sha256": "c" * 64,
+        "command_sha256": "d" * 64,
+        "supports": {
+            "seed": "unsupported",
+            "decoding": "unsupported",
+            "usage_report": {
+                key: "supported"
+                for key in ("turns", "tools", "tokens", "elapsed_seconds", "cost")
+            },
+            "enforcement": {
+                "turns": "reported",
+                "tools": "reported",
+                "tokens": "reported",
+                "elapsed_seconds": "hard",
+                "cost": "reported",
+            },
+        },
+        "outcomes": [
+            {"scenario_id": scenario_id, "outcome_code": "pass"}
+            for scenario_id in SCENARIO_IDS
+        ],
+        "budget_consumption": {
+            "turns": 0,
+            "tools": 0,
+            "tokens": 0,
+            "elapsed_seconds": 0,
+            "cost": "0",
+        },
+        "private_transcript_receipt": {"name": "receipt-1.json", "sha256": "e" * 64},
+    }
+    projection = runner.sanitize_projection(summary)
+    assert projection == json.loads(json.dumps(projection))
+    assert "credential" not in json.dumps(projection)
+    for mutation in (
+        lambda value: value.update(outcomes=[]),
+        lambda value: value.update(contract_version="2.0"),
+        lambda value: value.pop("command_sha256"),
+        lambda value: value["outcomes"][0].update(
+            outcome_code="credential=do-not-leak"
+        ),
+        lambda value: value.update(private_path="/private/env/credential"),
+        lambda value: value["outcomes"][0].update(content="credential=do-not-leak"),
+    ):
+        invalid = copy.deepcopy(summary)
+        mutation(invalid)
+        with pytest.raises(
+            runner.PressureProtocolError, match="pressure_invalid_public_contract"
+        ):
+            runner.sanitize_projection(invalid)
+
+
 def test_future_projection_schemas_reject_unknown_major_and_missing_bindings() -> None:
     stack_receipt = {
         "contract_version": "1.0",
@@ -273,8 +345,17 @@ def test_future_projection_schemas_reject_unknown_major_and_missing_bindings() -
         "supports": {
             "seed": "unsupported",
             "decoding": "unsupported",
-            "usage_report": "supported",
-            "enforcement": "reported",
+            "usage_report": {
+                key: "supported"
+                for key in ("turns", "tools", "tokens", "elapsed_seconds", "cost")
+            },
+            "enforcement": {
+                "turns": "reported",
+                "tools": "reported",
+                "tokens": "reported",
+                "elapsed_seconds": "hard",
+                "cost": "reported",
+            },
         },
     }
     baseline = {
@@ -312,6 +393,9 @@ def test_future_projection_schemas_reject_unknown_major_and_missing_bindings() -
         missing = copy.deepcopy(value)
         del missing["command_sha256"]
         _invalid(validator, missing)
+        inconsistent: Any = copy.deepcopy(value)
+        inconsistent["supports"]["usage_report"]["tokens"] = "unsupported"
+        _invalid(validator, inconsistent)
 
 
 @pytest.mark.parametrize(
@@ -332,6 +416,63 @@ def test_future_projection_schemas_reject_unknown_major_and_missing_bindings() -
             "pressure_invalid_config",
         ),
         ({"executable_sha256": "0" * 64}, "pressure_executable_fingerprint_mismatch"),
+        (
+            {
+                "caps": {
+                    "turns": 9,
+                    "tools": 9,
+                    "tokens": 99,
+                    "elapsed_seconds": 1,
+                    "cost": "NaN",
+                }
+            },
+            "pressure_invalid_config",
+        ),
+        (
+            {
+                "usage_report": {
+                    "turns": True,
+                    "tools": True,
+                    "tokens": False,
+                    "elapsed_seconds": True,
+                    "cost": True,
+                }
+            },
+            "pressure_invalid_config",
+        ),
+        (
+            {
+                "usage_report": {
+                    "turns": True,
+                    "tools": True,
+                    "tokens": True,
+                    "elapsed_seconds": False,
+                    "cost": True,
+                }
+            },
+            "pressure_invalid_config",
+        ),
+        (
+            {
+                "enforcement": {
+                    "turns": "hard",
+                    "tools": "reported",
+                    "tokens": "reported",
+                    "elapsed_seconds": "hard",
+                    "cost": "reported",
+                }
+            },
+            "pressure_invalid_config",
+        ),
+        ({"command_argv": ["/bin/true"]}, "pressure_invalid_config"),
+        (
+            {"command_argv": ["python", "{prompt}", "{prompt}", "{usage_file}"]},
+            "pressure_invalid_config",
+        ),
+        (
+            {"command_argv": ["python", "prefix{prompt}", "{usage_file}"]},
+            "pressure_invalid_config",
+        ),
     ],
 )
 def test_selected_stack_rejects_missing_metadata_caps_and_bad_hash(
@@ -364,6 +505,65 @@ def test_selected_stack_rejects_aggregate_budget_overrun(
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     with pytest.raises(runner.PressureProtocolError, match="pressure_budget_exceeded"):
         runner.run_baseline(PROJECT_ROOT)
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"turns": True, "tools": 0, "tokens": 0, "cost": "0"},
+        {"turns": 0, "tools": 0, "tokens": 0, "cost": "NaN"},
+        {"turns": 0, "tools": 0, "tokens": 0, "cost": "Infinity"},
+        {"turns": 0, "tools": 0, "tokens": 0, "cost": "0", "unexpected": 0},
+        {"turns": 0, "tools": 0, "tokens": 0},
+    ],
+)
+def test_usage_rejects_non_finite_boolean_and_non_exact_cli_keys(
+    usage: dict[str, object],
+) -> None:
+    caps = {"turns": 9, "tools": 9, "tokens": 9, "elapsed_seconds": 1, "cost": "9"}
+    support = {
+        "turns": True,
+        "tools": True,
+        "tokens": True,
+        "elapsed_seconds": True,
+        "cost": True,
+    }
+
+    with pytest.raises(runner.PressureProtocolError, match="pressure_invalid_usage"):
+        runner._usage(usage, caps, support)
+
+
+def test_usage_support_is_per_dimension_and_never_fabricated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    _install_config(
+        tmp_path,
+        fake,
+        usage_report={
+            "turns": True,
+            "tools": True,
+            "tokens": False,
+            "elapsed_seconds": True,
+            "cost": False,
+        },
+        enforcement={
+            "turns": "reported",
+            "tools": "reported",
+            "tokens": "unsupported",
+            "elapsed_seconds": "hard",
+            "cost": "unsupported",
+        },
+    )
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", "usage-unsupported")
+    summary = runner.run_baseline(PROJECT_ROOT)
+    assert summary["supports"]["usage_report"]["tokens"] == "unsupported"
+    assert summary["supports"]["usage_report"]["elapsed_seconds"] == "supported"
+    assert summary["supports"]["enforcement"]["elapsed_seconds"] == "hard"
+    assert summary["budget_consumption"]["tokens"] == "unsupported"
+    assert summary["budget_consumption"]["cost"] == "unsupported"
 
 
 @pytest.mark.parametrize("mode", ["all-pass", "one-failure"])
@@ -419,6 +619,71 @@ def test_state_root_rejects_any_registered_git_worktree(
         runner._state_root(PROJECT_ROOT)
 
 
+def test_runtime_outcome_uses_public_response_constraints() -> None:
+    protocol = runner.load_public_protocol(PROJECT_ROOT)
+    rubric = copy.deepcopy(protocol["rubric"])
+    scenario = protocol["scenarios"]["scenarios"][0]
+    check = next(
+        item for item in rubric["checks"] if item["check_id"] == "stagnation-recovery"
+    )
+    check["response_constraints"]["authority_owner"] = ["external"]
+    check["failure_code"] = "constraint-policy-violation"
+    response = {
+        "action": "reheat",
+        "authority_owner": "none",
+        "would_execute_write": False,
+        "repeat_unknown_write": False,
+        "budget_state": "available",
+        "evidence_ids": [],
+        "reason_codes": [],
+    }
+    assert (
+        runner._response_outcome(scenario, response, rubric)
+        == "constraint-policy-violation"
+    )
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "field", "allowed", "response_value"),
+    [
+        ("blocked-authority", "authority_owner", ["external"], "none"),
+        ("unsafe-write", "would_execute_write", [True], False),
+        ("exhausted-budget", "budget_state", ["available"], "exhausted"),
+    ],
+)
+def test_runtime_outcome_uses_each_public_constraint_failure_code(
+    scenario_id: str, field: str, allowed: list[object], response_value: object
+) -> None:
+    protocol = runner.load_public_protocol(PROJECT_ROOT)
+    rubric = copy.deepcopy(protocol["rubric"])
+    scenario = next(
+        item
+        for item in protocol["scenarios"]["scenarios"]
+        if item["scenario_id"] == scenario_id
+    )
+    check = next(
+        item
+        for item in rubric["checks"]
+        if item["check_id"] == scenario["expected_rubric_check_ids"][0]
+    )
+    check["response_constraints"][field] = allowed
+    check["failure_code"] = f"public-{field}-failure"
+    response: dict[str, object] = {
+        "action": "escalate" if scenario_id == "blocked-authority" else "stop",
+        "authority_owner": "external" if scenario_id == "blocked-authority" else "none",
+        "would_execute_write": False,
+        "repeat_unknown_write": False,
+        "budget_state": "exhausted"
+        if scenario_id == "exhausted-budget"
+        else "available",
+        "evidence_ids": [],
+        "reason_codes": [],
+    }
+    response[field] = response_value
+
+    assert runner._response_outcome(scenario, response, rubric) == check["failure_code"]
+
+
 def test_runtime_outcome_uses_public_rubric_check_policy() -> None:
     protocol = runner.load_public_protocol(PROJECT_ROOT)
     rubric = copy.deepcopy(protocol["rubric"])
@@ -448,9 +713,36 @@ def test_runtime_outcome_uses_public_rubric_check_policy() -> None:
     )
 
 
+def test_selected_stack_streams_only_bounded_output_without_subprocess_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    _install_config(tmp_path, fake)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", "oversized")
+    monkeypatch.setattr(runner, "MAX_CAPTURE_BYTES", 17)
+    monkeypatch.setattr(runner, "_worktree_roots", lambda repo: (repo,))
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unbounded run")
+        ),
+    )
+    with pytest.raises(runner.PressureProtocolError, match="pressure_output_too_large"):
+        runner.run_baseline(PROJECT_ROOT)
+    state_root = tmp_path / "semantic-reheating" / "pressure-baselines"
+    assert all(len(path.read_bytes()) <= 18 for path in state_root.rglob("*.bin"))
+
+
 @pytest.mark.parametrize(
     "mode, code",
-    [("oversized", "pressure_output_too_large"), ("timeout", "pressure_timeout")],
+    [
+        ("oversized", "pressure_output_too_large"),
+        ("stderr-oversized", "pressure_output_too_large"),
+        ("timeout", "pressure_timeout"),
+    ],
 )
 def test_selected_stack_bounds_output_and_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, code: str
@@ -462,6 +754,101 @@ def test_selected_stack_bounds_output_and_timeout(
     monkeypatch.setenv("PRESSURE_FAKE_MODE", mode)
     with pytest.raises(runner.PressureProtocolError, match=code):
         runner.run_baseline(PROJECT_ROOT)
+
+
+def test_baseline_deadline_is_shared_and_uses_runner_measured_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    _install_config(tmp_path, fake)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    clock = [0.0]
+    calls = [0]
+
+    def fake_monotonic() -> float:
+        return clock[0]
+
+    def fake_run(
+        argv: list[str], _cwd: Path, _deadline: float
+    ) -> tuple[bytes, bytes, int]:
+        calls[0] += 1
+        scenario = argv[-2].splitlines()[0].split(": ", 1)[1]
+        Path(argv[-1]).write_text(
+            json.dumps({"turns": 1, "tools": 0, "tokens": 1, "cost": "0.0"}),
+            encoding="ascii",
+        )
+        clock[0] += 0.3
+        return (
+            json.dumps(
+                {
+                    "action": "reheat"
+                    if scenario != "productive-pagination"
+                    else "continue",
+                    "authority_owner": "none",
+                    "would_execute_write": False,
+                    "repeat_unknown_write": False,
+                    "budget_state": "available",
+                    "evidence_ids": [],
+                    "reason_codes": [],
+                }
+            ).encode(),
+            b"",
+            0,
+        )
+
+    monkeypatch.setattr(runner.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(runner, "_run_bounded", fake_run)
+
+    with pytest.raises(runner.PressureProtocolError, match="pressure_timeout"):
+        runner.run_baseline(PROJECT_ROOT)
+    assert calls[0] == 4
+
+
+def test_safe_regular_bytes_rejects_same_inode_size_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "public.json"
+    candidate.write_bytes(b'{"trusted":true}')
+    original_read = runner.os.read
+    changed = [False]
+
+    def raced_read(descriptor: int, maximum: int) -> bytes:
+        data = original_read(descriptor, maximum)
+        if not changed[0]:
+            changed[0] = True
+            candidate.write_bytes(b"")
+        return data
+
+    monkeypatch.setattr(runner.os, "read", raced_read)
+    with pytest.raises(runner.PressureProtocolError, match="pressure_unsafe_file"):
+        runner._safe_regular_bytes(candidate, runner.MAX_PUBLIC_BYTES)
+
+
+def test_timeout_kills_child_left_in_selected_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    child_pid = tmp_path / "child.pid"
+    _write_fake_cli(fake)
+    _install_config(tmp_path, fake)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", "orphan")
+    monkeypatch.setenv("PRESSURE_CHILD_PID_FILE", str(child_pid))
+
+    with pytest.raises(runner.PressureProtocolError, match="pressure_timeout"):
+        runner.run_baseline(PROJECT_ROOT)
+    pid = int(child_pid.read_text(encoding="ascii"))
+    try:
+        os.kill(pid, 0)
+        pytest.fail("selected stack left a live child process")
+    except ProcessLookupError:
+        pass
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def test_fewer_than_six_scenarios_fails_closed(

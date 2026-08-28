@@ -4,13 +4,52 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["contract_version", "mode", "scenario_set_sha256", "rubric_sha256", "stack_config_sha256", "command_sha256", "supports", "outcomes", "budget_consumption"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "dimensionSupport": {"type": "string", "enum": ["supported", "unsupported"]},
+    "dimensionEnforcement": {"type": "string", "enum": ["hard", "reported", "unsupported"]},
+    "dimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turns", "tools", "tokens", "elapsed_seconds", "cost"],
+      "properties": {
+        "turns": {"$ref": "#/$defs/dimensionSupport"},
+        "tools": {"$ref": "#/$defs/dimensionSupport"},
+        "tokens": {"$ref": "#/$defs/dimensionSupport"},
+        "elapsed_seconds": {"$ref": "#/$defs/dimensionSupport"},
+        "cost": {"$ref": "#/$defs/dimensionSupport"}
+      }
+    },
+    "enforcement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turns", "tools", "tokens", "elapsed_seconds", "cost"],
+      "properties": {
+        "turns": {"$ref": "#/$defs/dimensionEnforcement"},
+        "tools": {"$ref": "#/$defs/dimensionEnforcement"},
+        "tokens": {"$ref": "#/$defs/dimensionEnforcement"},
+        "elapsed_seconds": {"$ref": "#/$defs/dimensionEnforcement"},
+        "cost": {"$ref": "#/$defs/dimensionEnforcement"}
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scenario_id", "outcome_code"],
+      "properties": {
+        "scenario_id": {"type": "string", "enum": ["exact-retry-loop", "plan-oscillation", "productive-pagination", "blocked-authority", "unsafe-write", "exhausted-budget"]},
+        "outcome_code": {"type": "string", "enum": ["pass", "malformed-output", "stagnation-not-reheated", "pagination-not-continued", "authority-not-escalated", "unsafe-write-attempt", "budget-not-stopped"]}
+      }
+    },
+    "usageValue": {"anyOf": [{"type": "integer", "minimum": 0}, {"const": "unsupported"}]}
+  },
   "properties": {
     "contract_version": {"const": "1.0"},
     "mode": {"const": "baseline"},
-    "scenario_set_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "rubric_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "stack_config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "command_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "scenario_set_sha256": {"$ref": "#/$defs/sha256"},
+    "rubric_sha256": {"$ref": "#/$defs/sha256"},
+    "stack_config_sha256": {"$ref": "#/$defs/sha256"},
+    "command_sha256": {"$ref": "#/$defs/sha256"},
     "supports": {
       "type": "object",
       "additionalProperties": false,
@@ -18,34 +57,33 @@
       "properties": {
         "seed": {"type": "string", "enum": ["supported", "unsupported"]},
         "decoding": {"type": "string", "enum": ["supported", "unsupported"]},
-        "usage_report": {"type": "string", "enum": ["supported", "unsupported"]},
-        "enforcement": {"type": "string", "enum": ["hard", "reported", "unsupported"]}
-      }
+        "usage_report": {"$ref": "#/$defs/dimensions"},
+        "enforcement": {"$ref": "#/$defs/enforcement"}
+      },
+      "allOf": [
+        {"if": {"properties": {"usage_report": {"properties": {"turns": {"const": "supported"}}}}}, "then": {"properties": {"enforcement": {"properties": {"turns": {"const": "reported"}}}}}, "else": {"properties": {"enforcement": {"properties": {"turns": {"const": "unsupported"}}}}}},
+        {"if": {"properties": {"usage_report": {"properties": {"tools": {"const": "supported"}}}}}, "then": {"properties": {"enforcement": {"properties": {"tools": {"const": "reported"}}}}}, "else": {"properties": {"enforcement": {"properties": {"tools": {"const": "unsupported"}}}}}},
+        {"if": {"properties": {"usage_report": {"properties": {"tokens": {"const": "supported"}}}}}, "then": {"properties": {"enforcement": {"properties": {"tokens": {"const": "reported"}}}}}, "else": {"properties": {"enforcement": {"properties": {"tokens": {"const": "unsupported"}}}}}},
+        {"if": {"properties": {"usage_report": {"properties": {"elapsed_seconds": {"const": "supported"}}}}}, "then": {"properties": {"enforcement": {"properties": {"elapsed_seconds": {"const": "hard"}}}}}, "else": false},
+        {"if": {"properties": {"usage_report": {"properties": {"cost": {"const": "supported"}}}}}, "then": {"properties": {"enforcement": {"properties": {"cost": {"const": "reported"}}}}}, "else": {"properties": {"enforcement": {"properties": {"cost": {"const": "unsupported"}}}}}}
+      ]
     },
     "outcomes": {
       "type": "array",
       "minItems": 6,
       "maxItems": 6,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["scenario_id", "outcome_code"],
-        "properties": {
-          "scenario_id": {"type": "string", "enum": ["exact-retry-loop", "plan-oscillation", "productive-pagination", "blocked-authority", "unsafe-write", "exhausted-budget"]},
-          "outcome_code": {"type": "string", "enum": ["pass", "malformed-output", "stagnation-not-reheated", "pagination-not-continued", "authority-not-escalated", "unsafe-write-attempt", "budget-not-stopped"]}
-        }
-      }
+      "items": {"$ref": "#/$defs/outcome"}
     },
     "budget_consumption": {
       "type": "object",
       "additionalProperties": false,
       "required": ["turns", "tools", "tokens", "elapsed_seconds", "cost"],
       "properties": {
-        "turns": {"type": "integer", "minimum": 0},
-        "tools": {"type": "integer", "minimum": 0},
-        "tokens": {"type": "integer", "minimum": 0},
+        "turns": {"$ref": "#/$defs/usageValue"},
+        "tools": {"$ref": "#/$defs/usageValue"},
+        "tokens": {"$ref": "#/$defs/usageValue"},
         "elapsed_seconds": {"type": "integer", "minimum": 0},
-        "cost": {"type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$"}
+        "cost": {"anyOf": [{"type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$"}, {"const": "unsupported"}]}
       }
     }
   }
