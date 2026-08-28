@@ -321,6 +321,158 @@ def test_analyze_hard_budget_stop_dominates_recovery_and_records_exact_event() -
     assert envelope.evidence_event_ids[0] == "event-7"
 
 
+@pytest.mark.parametrize(
+    "dimension", ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost")
+)
+def test_analyze_keeps_equal_whole_run_budget_breach_after_later_reset(
+    dimension: str,
+) -> None:
+    from semantic_reheating.controller import analyze
+    from semantic_reheating.models import Decision
+
+    policy = _policy()
+    limit = policy.budgets.whole_run.to_dict()
+    breach = {field: 0 for field in limit}
+    breach[dimension] = limit[dimension]
+    envelope = analyze(
+        [
+            _event(1, "budget", event_id="first-breach", budget_counters=breach),
+            _event(
+                2,
+                "budget",
+                event_id="later-reset",
+                budget_counters={field: 0 for field in limit},
+            ),
+        ],
+        policy,
+    )
+
+    assert envelope.decision is Decision.STOP
+    assert envelope.confidence.score == 1.0
+    assert envelope.reason_codes == ("budget_limit_reached",)
+    assert envelope.evidence_event_ids == ("first-breach",)
+    assert [
+        (item.finding_class.value, item.score, item.weight, item.weighted_score)
+        for item in envelope.confidence.contributing_findings
+    ] == [("budget", 1.0, 0.1, 0.1)]
+
+
+def test_analyze_selects_earliest_hard_budget_breach_deterministically() -> None:
+    from semantic_reheating.controller import _hard_budget_finding, analyze
+    from semantic_reheating.models import Decision
+
+    policy = _policy()
+    limit = policy.budgets.whole_run.to_dict()
+    below = {field: 0 for field in limit}
+    below["turns"] = limit["turns"] - 1
+    first_breach = {field: 0 for field in limit}
+    first_breach["turns"] = limit["turns"]
+    later_breach = {field: 0 for field in limit}
+    later_breach["tokens"] = limit["tokens"] + 1
+    envelope = analyze(
+        [
+            _event(1, "budget", event_id="below-limit", budget_counters=below),
+            _event(2, "budget", event_id="first-breach", budget_counters=first_breach),
+            _event(3, "budget", event_id="later-breach", budget_counters=later_breach),
+        ],
+        policy,
+    )
+
+    assert envelope.decision is Decision.STOP
+    hard_budget = _hard_budget_finding(
+        (
+            _event(1, "budget", event_id="below-limit", budget_counters=below),
+            _event(2, "budget", event_id="first-breach", budget_counters=first_breach),
+            _event(3, "budget", event_id="later-breach", budget_counters=later_breach),
+        ),
+        policy,
+    )
+    assert hard_budget is not None
+    assert hard_budget["event_ids"] == ["first-breach"]
+
+
+def test_analyze_does_not_synthesize_hard_budget_for_nonmonotonic_below_limits() -> (
+    None
+):
+    from semantic_reheating.controller import _hard_budget_finding, analyze
+
+    policy = _policy()
+    limit = policy.budgets.whole_run.to_dict()
+    below = {field: 0 for field in limit}
+    below["turns"] = limit["turns"] - 1
+    analyze(
+        [
+            _event(1, "budget", budget_counters=below),
+            _event(
+                2,
+                "budget",
+                budget_counters={field: 0 for field in limit},
+            ),
+            _event(3, "budget", budget_counters=below),
+        ],
+        policy,
+    )
+
+    assert (
+        _hard_budget_finding(
+            (
+                _event(1, "budget", budget_counters=below),
+                _event(2, "budget", budget_counters={field: 0 for field in limit}),
+                _event(3, "budget", budget_counters=below),
+            ),
+            policy,
+        )
+        is None
+    )
+
+
+def test_analyze_prior_hard_budget_breach_dominates_later_reheating_signals() -> None:
+    from semantic_reheating.controller import analyze, build_recovery_instruction
+    from semantic_reheating.models import Decision
+
+    policy = _policy()
+    limit = policy.budgets.whole_run.to_dict()
+    breach = {field: 0 for field in limit}
+    breach["turns"] = limit["turns"]
+    envelope = analyze(
+        [
+            _event(1, "budget", event_id="first-breach", budget_counters=breach),
+            _event(2, "tool_call", payload={"action": "read"}),
+            _event(
+                3, "tool_result", payload={"result": "same"}, parent_event_id="event-2"
+            ),
+            _event(
+                4,
+                "acceptance_check",
+                payload={"check": "done"},
+                acceptance_delta="none",
+            ),
+            _event(5, "tool_call", payload={"action": "read"}),
+            _event(
+                6, "tool_result", payload={"result": "same"}, parent_event_id="event-5"
+            ),
+            _event(
+                7,
+                "acceptance_check",
+                payload={"check": "done"},
+                acceptance_delta="none",
+            ),
+            _event(
+                8,
+                "budget",
+                event_id="later-reset",
+                budget_counters={field: 0 for field in limit},
+            ),
+        ],
+        policy,
+    )
+
+    assert envelope.decision is Decision.STOP
+    assert envelope.confidence.score == 1.0
+    assert envelope.evidence_event_ids[0] == "first-breach"
+    assert build_recovery_instruction(envelope) is None
+
+
 @pytest.mark.parametrize("effect_class", ("non_idempotent_write", "unknown"))
 def test_analyze_repeated_risky_call_stops_without_result(effect_class: str) -> None:
     from semantic_reheating.controller import analyze

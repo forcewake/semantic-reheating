@@ -256,26 +256,23 @@ def _synthetic_finding(
 def _hard_budget_finding(
     trace: tuple[TraceEvent, ...], policy: RunPolicy
 ) -> dict[str, Any] | None:
-    latest = next(
-        (event for event in reversed(trace) if event.budget_counters is not None), None
-    )
-    if latest is None:
-        return None
-    counters = latest.budget_counters
     limit = policy.budgets.whole_run
-    if not any(
-        getattr(counters, field) >= getattr(limit, field)
-        for field in ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost")
-    ):
-        return None
-    return _synthetic_finding(
-        detector_name="hard_budget",
-        finding_class="budget",
-        run_id=latest.run_id,
-        event_ids=(latest.event_id,),
-        reason_code="budget_limit_reached",
-        explanation="A declared whole-run budget limit was reached.",
-    )
+    for event in trace:
+        counters = event.budget_counters
+        if counters is None or not any(
+            getattr(counters, field) >= getattr(limit, field)
+            for field in ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost")
+        ):
+            continue
+        return _synthetic_finding(
+            detector_name="hard_budget",
+            finding_class="budget",
+            run_id=event.run_id,
+            event_ids=(event.event_id,),
+            reason_code="budget_limit_reached",
+            explanation="A declared whole-run budget limit was reached.",
+        )
+    return None
 
 
 def _call_identity(event: TraceEvent) -> tuple[str, str] | None:
