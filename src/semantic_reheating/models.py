@@ -128,7 +128,9 @@ def _trace_validator() -> Draft202012Validator:
     global _TRACE_VALIDATOR
     if _TRACE_VALIDATOR is None:
         try:
-            schema_resource = resources.files("semantic_reheating").joinpath(_TRACE_SCHEMA_PATH)
+            schema_resource = resources.files("semantic_reheating").joinpath(
+                _TRACE_SCHEMA_PATH
+            )
             schema_bytes = (
                 schema_resource.read_bytes()
                 if schema_resource.is_file()
@@ -193,7 +195,9 @@ class BudgetCounters:
         elapsed_seconds: Any,
         cost: Any,
     ) -> None:
-        if any(type(value) is not int or value < 0 for value in (turns, tool_calls, tokens)):
+        if any(
+            type(value) is not int or value < 0 for value in (turns, tool_calls, tokens)
+        ):
             raise ModelValidationError("invalid_budget_counters")
         if any(
             not (
@@ -290,8 +294,12 @@ class TraceEvent:
             state_fingerprint=value.get("state_fingerprint"),
             error_fingerprint=value.get("error_fingerprint"),
             acceptance_delta=value.get("acceptance_delta"),
-            evidence_refs=tuple(value["evidence_refs"]) if "evidence_refs" in value else None,
-            budget_counters=BudgetCounters.from_dict(counters) if counters is not None else None,
+            evidence_refs=tuple(value["evidence_refs"])
+            if "evidence_refs" in value
+            else None,
+            budget_counters=BudgetCounters.from_dict(counters)
+            if counters is not None
+            else None,
             expected_state_change=value.get("expected_state_change"),
             _source=_freeze(value),
         )
@@ -493,14 +501,29 @@ class RunPolicy:
                 signals["minimum_count"],
                 signals["budget_can_substitute"],
             ),
-            recovery_ladder=RecoveryLadder(**{name: _stage(ladder[name]) for name in (
-                "nudge", "diagnose", "reheat", "restart", "escalate", "stop"
-            )}),
-            budgets=PolicyBudgets(_budget(budgets["per_intervention"]), _budget(budgets["whole_run"])),
+            recovery_ladder=RecoveryLadder(
+                **{
+                    name: _stage(ladder[name])
+                    for name in (
+                        "nudge",
+                        "diagnose",
+                        "reheat",
+                        "restart",
+                        "escalate",
+                        "stop",
+                    )
+                }
+            ),
+            budgets=PolicyBudgets(
+                _budget(budgets["per_intervention"]), _budget(budgets["whole_run"])
+            ),
             max_recovery_episodes=value["max_recovery_episodes"],
             max_reentry_depth=value["max_reentry_depth"],
             side_effect_rules=SideEffectRules(
-                tuple(EffectClass(item) for item in rules["automatic_repeat_allowed_effect_classes"]),
+                tuple(
+                    EffectClass(item)
+                    for item in rules["automatic_repeat_allowed_effect_classes"]
+                ),
                 rules["automatic_unconfirmed_non_idempotent_repeat"],
                 rules["unknown_treated_as_repeatable"],
             ),
@@ -556,6 +579,8 @@ class ContributingFinding:
     finding_class: FindingClass
     matched: bool
     score: int | float
+    weight: int | float
+    weighted_score: int | float
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,6 +641,8 @@ class DecisionEnvelope:
                         finding_class=FindingClass(item["finding_class"]),
                         matched=item["matched"],
                         score=item["score"],
+                        weight=item["weight"],
+                        weighted_score=item["weighted_score"],
                     )
                     for item in confidence["contributing_findings"]
                 ),

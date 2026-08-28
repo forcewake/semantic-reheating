@@ -42,10 +42,16 @@ def test_source_checkout_falls_back_to_authoritative_contracts() -> None:
     assert not schema_path.is_file()
     fixture_data = json.loads(
         (
-            PROJECT_ROOT / "tests" / "fixtures" / "contracts" / "minimal-run-policy.json"
+            PROJECT_ROOT
+            / "tests"
+            / "fixtures"
+            / "contracts"
+            / "minimal-run-policy.json"
         ).read_text()
     )
-    assert validation.validate_public_artifact("run_policy", fixture_data) == fixture_data
+    assert (
+        validation.validate_public_artifact("run_policy", fixture_data) == fixture_data
+    )
 
 
 def test_wheel_packages_authoritative_schemas_and_validates_outside_checkout(
@@ -81,7 +87,9 @@ def test_wheel_packages_authoritative_schemas_and_validates_outside_checkout(
         for packaged_path in packaged_schema_paths:
             info = archive.getinfo(packaged_path)
             assert (info.external_attr >> 16) & 0o170000 != 0o120000
-            authoritative_path = PROJECT_ROOT / "contracts" / "v1" / Path(packaged_path).name
+            authoritative_path = (
+                PROJECT_ROOT / "contracts" / "v1" / Path(packaged_path).name
+            )
             assert archive.read(packaged_path) == authoritative_path.read_bytes()
 
     target = tmp_path / "isolated-wheel"
@@ -100,18 +108,38 @@ def test_wheel_packages_authoritative_schemas_and_validates_outside_checkout(
         text=True,
     )
     fixtures = {
-        kind: json.loads((PROJECT_ROOT / "tests" / "fixtures" / "contracts" / name).read_text())
+        kind: json.loads(
+            (PROJECT_ROOT / "tests" / "fixtures" / "contracts" / name).read_text()
+        )
         for kind, name in ARTIFACTS.items()
     }
     model_fixtures = {
         "trace_event": json.loads(
-            (PROJECT_ROOT / "tests" / "fixtures" / "contracts" / "minimal-trace-event.json").read_text()
+            (
+                PROJECT_ROOT
+                / "tests"
+                / "fixtures"
+                / "contracts"
+                / "minimal-trace-event.json"
+            ).read_text()
         ),
         "run_policy": json.loads(
-            (PROJECT_ROOT / "tests" / "fixtures" / "contracts" / "minimal-run-policy.json").read_text()
+            (
+                PROJECT_ROOT
+                / "tests"
+                / "fixtures"
+                / "contracts"
+                / "minimal-run-policy.json"
+            ).read_text()
         ),
         "decision_envelope": json.loads(
-            (PROJECT_ROOT / "tests" / "fixtures" / "contracts" / "minimal-decision-envelope.json").read_text()
+            (
+                PROJECT_ROOT
+                / "tests"
+                / "fixtures"
+                / "contracts"
+                / "minimal-decision-envelope.json"
+            ).read_text()
         ),
     }
     script = """
@@ -211,8 +239,7 @@ def _json_string_and_key_chars(value: Any) -> int:
         return sum(_json_string_and_key_chars(item) for item in value)
     if type(value) is dict:
         return sum(
-            len(key) + _json_string_and_key_chars(item)
-            for key, item in value.items()
+            len(key) + _json_string_and_key_chars(item) for key, item in value.items()
         )
     return 0
 
@@ -322,14 +349,18 @@ ValueCase = tuple[str, tuple[PathSegment, ...]]
 ClosedObjectCase = tuple[str, tuple[PathSegment, ...]]
 
 
-def _resolve_local_ref(schema: dict[str, Any], root_schema: dict[str, Any]) -> dict[str, Any]:
+def _resolve_local_ref(
+    schema: dict[str, Any], root_schema: dict[str, Any]
+) -> dict[str, Any]:
     """Resolve a local JSON Pointer reference without silently ignoring it."""
     resolved = schema
     seen: set[str] = set()
     while "$ref" in resolved:
         reference = resolved["$ref"]
         if not isinstance(reference, str) or not reference.startswith("#/"):
-            raise AssertionError(f"Unsupported non-local schema reference: {reference!r}")
+            raise AssertionError(
+                f"Unsupported non-local schema reference: {reference!r}"
+            )
         if reference in seen:
             raise AssertionError(f"Cyclic local schema reference: {reference}")
         seen.add(reference)
@@ -337,7 +368,9 @@ def _resolve_local_ref(schema: dict[str, Any], root_schema: dict[str, Any]) -> d
         for token in reference[2:].split("/"):
             token = token.replace("~1", "/").replace("~0", "~")
             if not isinstance(target, dict) or token not in target:
-                raise AssertionError(f"Unresolvable local schema reference: {reference}")
+                raise AssertionError(
+                    f"Unresolvable local schema reference: {reference}"
+                )
             target = target[token]
         if not isinstance(target, dict):
             raise TypeError(f"Local schema reference is not an object: {reference}")
@@ -370,7 +403,11 @@ def _effective_parts(
             condition = branch["if"]
             if not isinstance(condition, dict):
                 raise AssertionError("Schema conditional must be an object")
-            selected = "then" if _matches_condition(condition, instance, root_schema) else "else"
+            selected = (
+                "then"
+                if _matches_condition(condition, instance, root_schema)
+                else "else"
+            )
             selected_schema = branch.get(selected)
             if selected_schema is None:
                 continue
@@ -561,14 +598,17 @@ CLOSED_OBJECT_MATRIX_NAMED_PATHS: frozenset[ClosedObjectCase] = frozenset(
         ("run_policy", ("detectors", "semantic_detector")),
         ("run_policy", ("agreeing_signals",)),
         ("run_policy", ("recovery_ladder",)),
-        *(("run_policy", ("recovery_ladder", stage)) for stage in (
-            "nudge",
-            "diagnose",
-            "reheat",
-            "restart",
-            "escalate",
-            "stop",
-        )),
+        *(
+            ("run_policy", ("recovery_ladder", stage))
+            for stage in (
+                "nudge",
+                "diagnose",
+                "reheat",
+                "restart",
+                "escalate",
+                "stop",
+            )
+        ),
         ("run_policy", ("budgets",)),
         ("run_policy", ("budgets", "per_intervention")),
         ("run_policy", ("budgets", "whole_run")),
@@ -663,7 +703,9 @@ def _value_constraint(case: ValueCase, keyword: str) -> list[Any]:
         current = current[segment]
     values = [part[keyword] for part in parts if keyword in part]
     if not values:
-        raise AssertionError(f"{keyword} case lost its effective schema: {kind} {_format_path(path)}")
+        raise AssertionError(
+            f"{keyword} case lost its effective schema: {kind} {_format_path(path)}"
+        )
     return values
 
 
@@ -695,9 +737,7 @@ def test_closed_object_unknown_field_matrix_has_exact_unique_named_coverage() ->
     )
 
 
-@pytest.mark.parametrize(
-    "case", CLOSED_OBJECT_MATRIX_CASES, ids=_closed_object_case_id
-)
+@pytest.mark.parametrize("case", CLOSED_OBJECT_MATRIX_CASES, ids=_closed_object_case_id)
 def test_every_populated_closed_contract_object_rejects_unknown_field(
     case: ClosedObjectCase,
 ) -> None:
@@ -723,7 +763,9 @@ def test_every_populated_closed_contract_object_rejects_unknown_field(
 
 
 @pytest.mark.parametrize("case", REQUIRED_MATRIX_CASES, ids=_required_case_id)
-def test_every_populated_required_contract_field_is_rejected(case: RequiredCase) -> None:
+def test_every_populated_required_contract_field_is_rejected(
+    case: RequiredCase,
+) -> None:
     from semantic_reheating.validation import (
         ContractValidationError,
         validate_public_artifact,
@@ -758,7 +800,9 @@ def test_every_populated_contract_enum_is_rejected(case: ValueCase) -> None:
         if artifact_kind == kind
     )
     invalid = deepcopy(fixture(fixture_name))
-    enum_values = [value for values in _value_constraint(case, "enum") for value in values]
+    enum_values = [
+        value for values in _value_constraint(case, "enum") for value in values
+    ]
     target = _at_path(invalid, path)
     parent = _at_path(invalid, path[:-1])
     parent[path[-1]] = _enum_sentinel(target, enum_values)
@@ -785,7 +829,9 @@ def test_every_populated_contract_const_is_rejected(case: ValueCase) -> None:
     invalid = deepcopy(fixture(fixture_name))
     target = _at_path(invalid, path)
     parent = _at_path(invalid, path[:-1])
-    parent[path[-1]] = "2.0" if path == ("contract_version",) else _const_sentinel(target)
+    parent[path[-1]] = (
+        "2.0" if path == ("contract_version",) else _const_sentinel(target)
+    )
     expected_code = (
         "unknown_contract_major"
         if path == ("contract_version",)
@@ -1263,7 +1309,9 @@ def test_str_subclass_artifact_kinds_are_rejected_before_hostile_methods(
 
 
 @pytest.mark.parametrize("container", [{}, []])
-def test_direct_cyclic_json_containers_fail_with_stable_typed_error(container: Any) -> None:
+def test_direct_cyclic_json_containers_fail_with_stable_typed_error(
+    container: Any,
+) -> None:
     from semantic_reheating.validation import (
         ContractValidationError,
         validate_public_artifact,
@@ -1323,7 +1371,11 @@ def test_schema_validation_diagnostics_do_not_echo_sensitive_instance_values() -
 @pytest.mark.parametrize(
     ("source", "code", "secret"),
     [
-        ('{"__sensitive-duplicate-key__": 1, "__sensitive-duplicate-key__": 2}', "duplicate_key", "__sensitive-duplicate-key__"),
+        (
+            '{"__sensitive-duplicate-key__": 1, "__sensitive-duplicate-key__": 2}',
+            "duplicate_key",
+            "__sensitive-duplicate-key__",
+        ),
         ("not-used", "unknown_artifact_kind", "__sensitive-artifact-kind__"),
         ("not-used", "unknown_contract_major", "__sensitive-contract-major__"),
     ],

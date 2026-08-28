@@ -37,7 +37,9 @@
         "finding_id": "finding-001",
         "finding_class": "repetition",
         "matched": true,
-        "score": 0.9
+        "score": 0.9,
+        "weight": 0.5,
+        "weighted_score": 0.45
       }
     ]
   },

@@ -51,7 +51,7 @@
           "host_action_required"
         ]
       },
-      "minItems": 1,
+      "minItems": 0,
       "maxItems": 16,
       "uniqueItems": true,
       "description": "Stable decision reason codes."
@@ -237,13 +237,27 @@
                 "minimum": 0,
                 "maximum": 1,
                 "description": "Bounded finding score."
+              },
+              "weight": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Configured class weight used for this finding."
+              },
+              "weighted_score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Clipped product of the raw score and configured weight."
               }
             },
             "required": [
               "finding_id",
               "finding_class",
               "matched",
-              "score"
+              "score",
+              "weight",
+              "weighted_score"
             ],
             "description": "Redacted contributing finding record."
           },
