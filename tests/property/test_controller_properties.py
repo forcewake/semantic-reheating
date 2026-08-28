@@ -14,6 +14,33 @@ from hypothesis import strategies as st
 ROOT = Path(__file__).resolve().parents[2]
 POLICY_FIXTURE = ROOT / "tests" / "fixtures" / "contracts" / "minimal-run-policy.json"
 DIMENSIONS = ("turns", "tool_calls", "tokens", "elapsed_seconds", "cost")
+_DETERMINISTIC_RANKS = (
+    "exact-repetition-",
+    "cycle-",
+    "repeated-error-",
+    "unchanged-state-",
+    "acceptance-stall-",
+    "budget-burn-",
+    "hard-budget-",
+    "repeated-risky-call-",
+    "semantic-",
+)
+_REPETITION_PREFIXES = _DETERMINISTIC_RANKS[:3]
+_NO_PROGRESS_PREFIXES = _DETERMINISTIC_RANKS[3:6]
+
+
+def _contribution_rank(finding_id: str) -> int:
+    matches = [
+        index
+        for index, prefix in enumerate(_DETERMINISTIC_RANKS)
+        if finding_id.startswith(prefix)
+    ]
+    assert len(matches) == 1, finding_id
+    return matches[0]
+
+
+def _has_prefix(finding_id: str, prefixes: tuple[str, ...]) -> bool:
+    return any(finding_id.startswith(prefix) for prefix in prefixes)
 
 
 def _source_policy() -> dict[str, Any]:
@@ -32,6 +59,23 @@ def _policy(*, permits_reheat: bool = True, semantic_enabled: bool = False) -> A
     source["detectors"]["semantic_detector"]["enabled"] = semantic_enabled
     source["detectors"]["semantic_detector"]["weight"] = 0.2 if semantic_enabled else 0
     return RunPolicy.from_dict(source)
+
+
+def _policy_observing_trace(
+    policy: Any, trace: list[Any], *, preserve_budget: bool = False
+) -> Any:
+    """Keep generated safe policy variation while making controlled evidence visible."""
+    source = deepcopy(policy.to_dict())
+    source["detectors"]["windows"] = {
+        "repetition_events": len(trace),
+        "no_progress_events": len(trace),
+    }
+    for threshold in source["detectors"]["thresholds"]:
+        source["detectors"]["thresholds"][threshold] = 0.0
+    if not preserve_budget:
+        for dimension in DIMENSIONS:
+            source["budgets"]["whole_run"][dimension] = 1_000_000
+    return type(policy).from_dict(source)
 
 
 @st.composite
@@ -182,6 +226,8 @@ def _signal_inputs(draw: st.DrawFn) -> tuple[list[Any], Any]:
     # The detector needs these local windows to observe both constructed classes.
     source = policy.to_dict()
     source["detectors"]["windows"] = {"repetition_events": 10, "no_progress_events": 10}
+    source["detectors"]["semantic_detector"]["enabled"] = True
+    source["detectors"]["semantic_detector"]["weight"] = 0.2
     source["recovery_ladder"]["nudge"]["permitted"] = False
     source["recovery_ladder"]["diagnose"]["permitted"] = False
     policy = type(policy).from_dict(source)
@@ -218,17 +264,28 @@ def test_valid_generated_inputs_have_finite_ordered_repeat_stable_envelopes(
     from semantic_reheating.validation import validate_public_artifact
 
     trace, policy = inputs
-    first, second = analyze(trace, policy), analyze(trace, policy)
-    assert first.to_dict() == second.to_dict()
+    first, second = (
+        analyze(trace, policy, semantic_detector=_SemanticRepetitionSupport()),
+        analyze(trace, policy, semantic_detector=_SemanticRepetitionSupport()),
+    )
+    first_bytes = json.dumps(first.to_dict(), separators=(",", ":")).encode("utf-8")
+    second_bytes = json.dumps(second.to_dict(), separators=(",", ":")).encode("utf-8")
+    assert first_bytes == second_bytes
     assert first.decision_id == second.decision_id
     validate_public_artifact("decision_envelope", first.to_dict())
     assert first.decision is Decision.REHEAT
     contributions = first.confidence.contributing_findings
-    assert (
-        contributions == tuple(sorted(contributions, key=lambda item: item.finding_id))
-        or contributions
-    )
+    contribution_ids = tuple(item.finding_id for item in contributions)
+    assert len(contribution_ids) == 3
+    assert contribution_ids[0].startswith("exact-repetition-")
+    assert contribution_ids[1].startswith("acceptance-stall-")
+    assert contribution_ids[2] == "semantic-repetition-support"
+    ranks = tuple(_contribution_rank(item.finding_id) for item in contributions)
+    assert ranks == tuple(sorted(ranks))
     assert len({item.finding_id for item in contributions}) == len(contributions)
+    assert contribution_ids == tuple(
+        item.finding_id for item in second.confidence.contributing_findings
+    )
     assert all(
         math.isfinite(float(item.score))
         and math.isfinite(float(item.weight))
@@ -302,13 +359,16 @@ def test_no_reheat_for_repetition_only_no_progress_only_neither_or_budget_only(
     run_id = f"run-no-reheat-{run_suffix}"
     if kind == "repetition":
         trace = _repetition_only_trace(run_id)
+        policy = _policy_observing_trace(policy, trace)
     elif kind == "no_progress":
         trace = _no_progress_only_trace(run_id)
+        policy = _policy_observing_trace(policy, trace)
     elif kind == "neither":
         trace = [
             _event(1, "message", run_id=run_id, payload={"message": "working"}),
             _event(2, "handoff", run_id=run_id),
         ]
+        policy = _policy_observing_trace(policy, trace)
     else:
         counters = policy.budgets.whole_run.to_dict()
         trace = [
@@ -320,11 +380,36 @@ def test_no_reheat_for_repetition_only_no_progress_only_neither_or_budget_only(
                 budget_counters=counters,
             )
         ]
+        policy = _policy_observing_trace(policy, trace, preserve_budget=True)
     decision = analyze(trace, policy)
+    finding_ids = tuple(
+        item.finding_id for item in decision.confidence.contributing_findings
+    )
+    repetition = [
+        finding_id
+        for finding_id in finding_ids
+        if _has_prefix(finding_id, _REPETITION_PREFIXES)
+    ]
+    no_progress = [
+        finding_id
+        for finding_id in finding_ids
+        if _has_prefix(finding_id, _NO_PROGRESS_PREFIXES)
+    ]
     assert decision.decision is not Decision.REHEAT
-    if kind == "budget":
+    assert "signals_agree" not in decision.reason_codes
+    if kind == "repetition":
+        assert repetition and not no_progress
+    elif kind == "no_progress":
+        assert no_progress and not repetition
+    elif kind == "neither":
+        assert not repetition and not no_progress
+        assert not any(
+            finding_id.startswith("hard-budget-") for finding_id in finding_ids
+        )
+    else:
         assert decision.decision is Decision.STOP
-        assert "signals_agree" not in decision.reason_codes
+        assert any(finding_id.startswith("hard-budget-") for finding_id in finding_ids)
+        assert not repetition and not no_progress
 
 
 @settings(derandomize=True, database=None, deadline=700, max_examples=12)
@@ -350,3 +435,8 @@ def test_exact_two_signal_gate_reheats_only_when_permitted(
     assert decision.decision is (
         Decision.REHEAT if permits_reheat else Decision.RESTART
     )
+    finding_classes = {
+        item.finding_class.value for item in decision.confidence.contributing_findings
+    }
+    assert {"repetition", "no_progress"} <= finding_classes
+    assert "signals_agree" in decision.reason_codes
