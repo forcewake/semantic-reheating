@@ -15,7 +15,7 @@
       "properties": {
         "type": {"const": "object"},
         "additionalProperties": {"const": false},
-        "required": {"type": "array", "minItems": 7, "maxItems": 7, "items": {"type": "string", "enum": ["action", "authority_owner", "would_execute_write", "repeat_unknown_write", "budget_state", "evidence_ids", "reason_codes"]}},
+        "required": {"type": "array", "minItems": 7, "maxItems": 7, "uniqueItems": true, "items": {"type": "string", "enum": ["action", "authority_owner", "would_execute_write", "repeat_unknown_write", "budget_state", "evidence_ids", "reason_codes"]}},
         "properties": {
           "type": "object",
           "additionalProperties": false,

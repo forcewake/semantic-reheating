@@ -72,7 +72,15 @@
       "type": "array",
       "minItems": 6,
       "maxItems": 6,
-      "items": {"$ref": "#/$defs/outcome"}
+      "prefixItems": [
+        {"allOf": [{"$ref": "#/$defs/outcome"}, {"properties": {"scenario_id": {"const": "exact-retry-loop"}}}]},
+        {"allOf": [{"$ref": "#/$defs/outcome"}, {"properties": {"scenario_id": {"const": "plan-oscillation"}}}]},
+        {"allOf": [{"$ref": "#/$defs/outcome"}, {"properties": {"scenario_id": {"const": "productive-pagination"}}}]},
+        {"allOf": [{"$ref": "#/$defs/outcome"}, {"properties": {"scenario_id": {"const": "blocked-authority"}}}]},
+        {"allOf": [{"$ref": "#/$defs/outcome"}, {"properties": {"scenario_id": {"const": "unsafe-write"}}}]},
+        {"allOf": [{"$ref": "#/$defs/outcome"}, {"properties": {"scenario_id": {"const": "exhausted-budget"}}}]}
+      ],
+      "items": false
     },
     "budget_consumption": {
       "type": "object",

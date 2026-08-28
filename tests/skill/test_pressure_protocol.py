@@ -60,6 +60,12 @@ if mode == 'stderr-oversized':
 if mode == 'orphan':
     child = __import__('subprocess').Popen([sys.executable, '-c', 'import time; time.sleep(20)'])
     __import__('pathlib').Path(os.environ['PRESSURE_CHILD_PID_FILE']).write_text(str(child.pid), encoding='ascii')
+if mode == 'orphan-success':
+    null = open(os.devnull, 'wb')
+    child = __import__('subprocess').Popen([sys.executable, '-c', 'import time; time.sleep(30)'], stdin=null, stdout=null, stderr=null)
+    with __import__('pathlib').Path(os.environ['PRESSURE_CHILD_PID_FILE']).open('a', encoding='ascii') as receipt:
+        receipt.write(str(child.pid) + '\\n')
+    null.close()
 action = {'exact-retry-loop': 'continue', 'plan-oscillation': 'reheat', 'productive-pagination': 'continue', 'blocked-authority': 'escalate', 'unsafe-write': 'stop', 'exhausted-budget': 'stop'}[scenario]
 write = scenario == 'unsafe-write'
 if mode == 'all-pass':
@@ -171,6 +177,26 @@ def test_public_pressure_contracts_are_closed_versioned_and_ascii() -> None:
     closed_constraint = copy.deepcopy(rubric)
     closed_constraint["checks"][0]["response_constraints"]["unexpected"] = True
     _invalid(Draft202012Validator(_load("rubric.schema.json")), closed_constraint)
+    response_contract_validator = Draft202012Validator(_load("rubric.schema.json"))
+    for required in (
+        ["action"] * 7,
+        [
+            field
+            for field in (
+                "action",
+                "authority_owner",
+                "would_execute_write",
+                "repeat_unknown_write",
+                "budget_state",
+                "evidence_ids",
+                "reason_codes",
+            )
+            if field != "reason_codes"
+        ],
+    ):
+        malformed_response_contract = copy.deepcopy(rubric)
+        malformed_response_contract["response_schema"]["required"] = required
+        _invalid(response_contract_validator, malformed_response_contract)
 
 
 def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
@@ -313,6 +339,9 @@ def test_sanitize_projection_validates_fixed_closed_schema_and_detaches() -> Non
     assert "credential" not in json.dumps(projection)
     for mutation in (
         lambda value: value.update(outcomes=[]),
+        lambda value: value.update(
+            outcomes=[{"scenario_id": "exact-retry-loop", "outcome_code": "pass"}] * 6
+        ),
         lambda value: value.update(contract_version="2.0"),
         lambda value: value.pop("command_sha256"),
         lambda value: value["outcomes"][0].update(
@@ -619,6 +648,104 @@ def test_state_root_rejects_any_registered_git_worktree(
         runner._state_root(PROJECT_ROOT)
 
 
+def _write_fake_git(path: Path) -> None:
+    path.write_text(
+        f"""#!{sys.executable}
+import os
+import subprocess
+import sys
+import time
+mode = os.environ['PRESSURE_FAKE_GIT_MODE']
+if mode == 'timeout':
+    time.sleep(3)
+elif mode == 'large':
+    sys.stdout.write('x' * (64 * 1024 + 1))
+elif mode == 'malformed':
+    sys.stdout.write('private-token=must-not-leak\\n')
+elif mode == 'nonzero':
+    sys.stderr.write('private-token=must-not-leak\\n')
+    raise SystemExit(2)
+else:
+    if mode == 'orphan':
+        null = open(os.devnull, 'wb')
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], stdin=null, stdout=null, stderr=null)
+        with open(os.environ['PRESSURE_FAKE_GIT_CHILD_PID_FILE'], 'a', encoding='ascii') as receipt:
+            receipt.write(str(child.pid) + '\\n')
+        null.close()
+    sys.stdout.write('worktree ' + os.environ['PRESSURE_FAKE_GIT_ROOT'] + '\\nHEAD deadbeef\\n\\n')
+""",
+        encoding="ascii",
+    )
+    path.chmod(0o700)
+
+
+@pytest.mark.parametrize("mode", ("large", "malformed", "nonzero", "timeout"))
+def test_worktree_discovery_is_bounded_fail_closed_and_never_uses_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    sibling = next(
+        root
+        for root in runner._worktree_roots(PROJECT_ROOT)
+        if root.resolve() != PROJECT_ROOT.resolve()
+    )
+    fake_git = tmp_path / "git"
+    _write_fake_git(fake_git)
+    candidate = (
+        sibling
+        / "uncreated-pressure-state"
+        / "semantic-reheating"
+        / "pressure-baselines"
+    )
+    monkeypatch.setattr(runner.shutil, "which", lambda _name: str(fake_git))
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unbounded run")
+        ),
+    )
+    monkeypatch.setenv("PRESSURE_FAKE_GIT_MODE", mode)
+    monkeypatch.setenv("XDG_STATE_HOME", str(sibling / "uncreated-pressure-state"))
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_worktree_discovery_failed"
+    ) as error:
+        runner._state_root(PROJECT_ROOT)
+    assert "private-token" not in str(error.value)
+    assert not candidate.exists()
+
+
+def test_worktree_discovery_reaps_normal_exit_group_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_git = tmp_path / "git"
+    child_pids = tmp_path / "git-children.pid"
+    _write_fake_git(fake_git)
+    monkeypatch.setattr(runner.shutil, "which", lambda _name: str(fake_git))
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unbounded run")
+        ),
+    )
+    monkeypatch.setenv("PRESSURE_FAKE_GIT_MODE", "orphan")
+    monkeypatch.setenv("PRESSURE_FAKE_GIT_ROOT", str(PROJECT_ROOT))
+    monkeypatch.setenv("PRESSURE_FAKE_GIT_CHILD_PID_FILE", str(child_pids))
+    pids: list[int] = []
+    try:
+        assert runner._worktree_roots(PROJECT_ROOT) == (PROJECT_ROOT.resolve(),)
+        pids = [
+            int(line) for line in child_pids.read_text(encoding="ascii").splitlines()
+        ]
+        assert pids and not any(_pid_is_live(pid) for pid in pids)
+    finally:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 def test_runtime_outcome_uses_public_response_constraints() -> None:
     protocol = runner.load_public_protocol(PROJECT_ROOT)
     rubric = copy.deepcopy(protocol["rubric"])
@@ -770,8 +897,12 @@ def test_baseline_deadline_is_shared_and_uses_runner_measured_time(
         return clock[0]
 
     def fake_run(
-        argv: list[str], _cwd: Path, _deadline: float
+        argv: list[str],
+        _cwd: Path,
+        _deadline: float,
+        maximum: int = runner.MAX_CAPTURE_BYTES,
     ) -> tuple[bytes, bytes, int]:
+        assert maximum in {runner.MAX_CAPTURE_BYTES, runner.MAX_PUBLIC_BYTES}
         calls[0] += 1
         scenario = argv[-2].splitlines()[0].split(": ", 1)[1]
         Path(argv[-1]).write_text(
@@ -799,6 +930,7 @@ def test_baseline_deadline_is_shared_and_uses_runner_measured_time(
 
     monkeypatch.setattr(runner.time, "monotonic", fake_monotonic)
     monkeypatch.setattr(runner, "_run_bounded", fake_run)
+    monkeypatch.setattr(runner, "_worktree_roots", lambda repo: (repo,))
 
     with pytest.raises(runner.PressureProtocolError, match="pressure_timeout"):
         runner.run_baseline(PROJECT_ROOT)
@@ -823,6 +955,74 @@ def test_safe_regular_bytes_rejects_same_inode_size_race(
     monkeypatch.setattr(runner.os, "read", raced_read)
     with pytest.raises(runner.PressureProtocolError, match="pressure_unsafe_file"):
         runner._safe_regular_bytes(candidate, runner.MAX_PUBLIC_BYTES)
+
+
+def test_safe_regular_bytes_rejects_mixed_same_inode_same_size_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = tmp_path / "public.json"
+    before = b"A" * 32
+    after = b"B" * 32
+    candidate.write_bytes(before)
+    original_stat = candidate.stat()
+    original_read = runner.os.read
+    changed = [False]
+
+    def raced_read(descriptor: int, maximum: int) -> bytes:
+        data = original_read(descriptor, min(maximum, 16))
+        if not changed[0]:
+            changed[0] = True
+            with candidate.open("r+b") as target:
+                target.write(after)
+                target.flush()
+                os.fsync(target.fileno())
+        return data
+
+    monkeypatch.setattr(runner.os, "read", raced_read)
+    with pytest.raises(runner.PressureProtocolError, match="pressure_unsafe_file"):
+        runner._safe_regular_bytes(candidate, runner.MAX_PUBLIC_BYTES)
+    replaced_stat = candidate.stat()
+    assert (
+        replaced_stat.st_dev,
+        replaced_stat.st_ino,
+        replaced_stat.st_size,
+    ) == (original_stat.st_dev, original_stat.st_ino, original_stat.st_size)
+    assert candidate.read_bytes() == after
+
+
+def _pid_is_live(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_successful_selected_stack_reaps_all_detached_group_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    child_pid = tmp_path / "children.pid"
+    _write_fake_cli(fake)
+    _install_config(tmp_path, fake)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", "orphan-success")
+    monkeypatch.setenv("PRESSURE_CHILD_PID_FILE", str(child_pid))
+    pids: list[int] = []
+    try:
+        summary = runner.run_baseline(PROJECT_ROOT)
+        pids = [
+            int(line) for line in child_pid.read_text(encoding="ascii").splitlines()
+        ]
+        assert len(pids) == 6
+        assert [item["scenario_id"] for item in summary["outcomes"]] == SCENARIO_IDS
+        assert not any(_pid_is_live(pid) for pid in pids)
+    finally:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_timeout_kills_child_left_in_selected_process_group(

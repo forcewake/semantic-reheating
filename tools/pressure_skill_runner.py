@@ -20,6 +20,7 @@ from jsonschema import Draft202012Validator
 
 MAX_PUBLIC_BYTES = 64 * 1024
 MAX_CAPTURE_BYTES = 8 * 1024
+WORKTREE_DISCOVERY_TIMEOUT_SECONDS = 2
 SCENARIO_ORDER = (
     "exact-retry-loop",
     "plan-oscillation",
@@ -78,11 +79,28 @@ def _safe_regular_bytes(path: Path, maximum: int) -> bytes:
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
+        opened_snapshot = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_nlink,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
         if (
             not stat.S_ISREG(opened.st_mode)
             or opened.st_nlink != 1
-            or (opened.st_dev, opened.st_ino, opened.st_size)
-            != (metadata.st_dev, metadata.st_ino, metadata.st_size)
+            or opened_snapshot
+            != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
         ):
             raise PressureProtocolError("pressure_unsafe_file")
         if opened.st_size > maximum:
@@ -97,11 +115,33 @@ def _safe_regular_bytes(path: Path, maximum: int) -> bytes:
             remaining -= len(chunk)
         data = b"".join(chunks)
         after = os.fstat(descriptor)
-        if (after.st_dev, after.st_ino, after.st_size) != (
-            opened.st_dev,
-            opened.st_ino,
-            opened.st_size,
-        ) or len(data) != opened.st_size:
+        try:
+            path_after = path.lstat()
+        except FileNotFoundError as error:
+            raise PressureProtocolError("pressure_unsafe_file") from error
+        after_snapshot = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        path_snapshot = (
+            path_after.st_dev,
+            path_after.st_ino,
+            path_after.st_mode,
+            path_after.st_nlink,
+            path_after.st_size,
+            path_after.st_mtime_ns,
+            path_after.st_ctime_ns,
+        )
+        if (
+            after_snapshot != opened_snapshot
+            or path_snapshot != opened_snapshot
+            or len(data) != opened.st_size
+        ):
             raise PressureProtocolError("pressure_unsafe_file")
         if len(data) > maximum:
             raise PressureProtocolError("pressure_file_too_large")
@@ -159,24 +199,42 @@ def _worktree_roots(repo_root: Path) -> tuple[Path, ...]:
     git = shutil.which("git")
     if git is None:
         return (repo_root,)
-    completed = subprocess.run(
-        [git, "-C", str(repo_root), "worktree", "list", "--porcelain"],
-        shell=False,
-        capture_output=True,
-        check=False,
-        timeout=2,
-    )
-    if completed.returncode != 0:
-        return (repo_root,)
+    try:
+        stdout, _stderr, returncode = _run_bounded(
+            [git, "-C", str(repo_root), "worktree", "list", "--porcelain"],
+            repo_root,
+            time.monotonic() + WORKTREE_DISCOVERY_TIMEOUT_SECONDS,
+            maximum=MAX_PUBLIC_BYTES,
+        )
+        if returncode != 0:
+            raise PressureProtocolError("pressure_worktree_discovery_failed")
+        lines = stdout.decode("utf-8", "strict").splitlines()
+    except (OSError, UnicodeDecodeError, PressureProtocolError) as error:
+        raise PressureProtocolError("pressure_worktree_discovery_failed") from error
     roots: list[Path] = []
-    for line in completed.stdout.decode("utf-8", "replace").splitlines():
-        if not line.startswith("worktree "):
+    for line in lines:
+        if not line:
             continue
-        try:
-            roots.append(Path(line.removeprefix("worktree ")).resolve(strict=True))
-        except OSError:
+        if line.startswith("worktree ") and len(line) > len("worktree "):
+            try:
+                root = Path(line.removeprefix("worktree ")).resolve(strict=True)
+            except OSError as error:
+                raise PressureProtocolError(
+                    "pressure_worktree_discovery_failed"
+                ) from error
+            if not root.is_dir() or not (root / ".git").exists() or root in roots:
+                raise PressureProtocolError("pressure_worktree_discovery_failed")
+            roots.append(root)
             continue
-    return tuple(roots) or (repo_root,)
+        if line.startswith(("HEAD ", "branch ", "locked ", "prunable ")) or line in {
+            "bare",
+            "detached",
+        }:
+            continue
+        raise PressureProtocolError("pressure_worktree_discovery_failed")
+    if not roots or repo_root not in roots:
+        raise PressureProtocolError("pressure_worktree_discovery_failed")
+    return tuple(roots)
 
 
 def _state_root(repo_root: Path) -> Path:
@@ -517,48 +575,69 @@ def _process_group_exists(process_group: int) -> bool:
     return True
 
 
-def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
-    process_group = process.pid
+def _signal_process_group(process_group: int, signal_value: signal.Signals) -> None:
     try:
-        os.killpg(process_group, signal.SIGTERM)
+        os.killpg(process_group, signal_value)
     except ProcessLookupError:
         pass
+
+
+def _stop_process_group(process_group: int, *, term_sent: bool = False) -> None:
+    """Terminate the fresh selected session even after its leader exits."""
+    if not term_sent:
+        _signal_process_group(process_group, signal.SIGTERM)
     grace_deadline = time.monotonic() + 0.2
     while _process_group_exists(process_group) and time.monotonic() < grace_deadline:
         time.sleep(0.01)
     if _process_group_exists(process_group):
-        try:
-            os.killpg(process_group, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    if process.poll() is None:
-        try:
-            process.wait(timeout=0.2)
-        except subprocess.TimeoutExpired:
-            raise PressureProtocolError("pressure_process_group_cleanup_failed")
+        _signal_process_group(process_group, signal.SIGKILL)
+        kill_deadline = time.monotonic() + 0.2
+        while _process_group_exists(process_group) and time.monotonic() < kill_deadline:
+            time.sleep(0.01)
+    if _process_group_exists(process_group):
+        raise PressureProtocolError("pressure_process_group_cleanup_failed")
+
+
+def _cleanup_selected_process(
+    process: subprocess.Popen[bytes], process_group: int
+) -> None:
+    _signal_process_group(process_group, signal.SIGTERM)
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired as error:
+        raise PressureProtocolError("pressure_process_group_cleanup_failed") from error
+    _stop_process_group(process_group, term_sent=True)
 
 
 def _run_bounded(
-    argv: list[str], cwd: Path, deadline: float
+    argv: list[str], cwd: Path, deadline: float, maximum: int | None = None
 ) -> tuple[bytes, bytes, int]:
-    """Capture at most MAX_CAPTURE_BYTES+1 from each pipe before killing."""
-    process = subprocess.Popen(
-        argv,
-        cwd=cwd,
-        shell=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    assert process.stdout is not None and process.stderr is not None
-    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    """Capture bounded output and terminate every member of the selected session."""
+    maximum = MAX_CAPTURE_BYTES if maximum is None else maximum
     selector = selectors.DefaultSelector()
-    for stream in streams:
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, selectors.EVENT_READ)
-    failure: str | None = None
     try:
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except BaseException:
+        selector.close()
+        raise
+    assert process.stdout is not None and process.stderr is not None
+    process_group = process.pid
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    failure: str | None = None
+    returncode: int | None = None
+    cleaned = False
+    try:
+        for stream in streams:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -569,32 +648,39 @@ def _run_bounded(
                 assert hasattr(ready_stream, "read")
                 chunk = os.read(
                     ready_stream.fileno(),
-                    MAX_CAPTURE_BYTES + 1 - len(streams[ready_stream]),
+                    maximum + 1 - len(streams[ready_stream]),
                 )
                 if not chunk:
                     selector.unregister(ready_stream)
                     continue
                 streams[ready_stream].extend(chunk)
-                if len(streams[ready_stream]) > MAX_CAPTURE_BYTES:
+                if len(streams[ready_stream]) > maximum:
                     failure = "pressure_output_too_large"
                     break
             if failure is not None:
                 break
-            if process.poll() is not None and not selector.get_map():
-                break
-        if failure is not None:
-            _stop_process_group(process)
-        else:
+        if failure is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 failure = "pressure_timeout"
-                _stop_process_group(process)
             else:
                 try:
                     process.wait(timeout=remaining)
+                    returncode = process.returncode
                 except subprocess.TimeoutExpired:
                     failure = "pressure_timeout"
-                    _stop_process_group(process)
+        if failure is not None:
+            _cleanup_selected_process(process, process_group)
+            cleaned = True
+        else:
+            # Output and the direct return status are complete before normal cleanup.
+            _cleanup_selected_process(process, process_group)
+            cleaned = True
+    except BaseException:
+        if not cleaned:
+            _cleanup_selected_process(process, process_group)
+            cleaned = True
+        raise
     finally:
         selector.close()
         for stream in streams:
@@ -605,7 +691,8 @@ def _run_bounded(
         error.stdout = stdout  # type: ignore[attr-defined]
         error.stderr = stderr  # type: ignore[attr-defined]
         raise error
-    return stdout, stderr, process.returncode
+    assert returncode is not None
+    return stdout, stderr, returncode
 
 
 def run_baseline(repo: Path) -> dict[str, Any]:
