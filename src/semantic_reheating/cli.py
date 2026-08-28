@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import io
 import json
 import os
 import stat
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
+from hashlib import sha256
 from itertools import pairwise
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Never
 
 from . import ControllerError, DecisionEnvelope, RunPolicy, TraceEvent, analyze
@@ -34,6 +36,16 @@ MAX_EVENTS = 10_000
 MAX_JSON_FILE_BYTES = 1_048_576
 MAX_JSONL_LINE_BYTES = 262_144
 MAX_JSONL_TOTAL_BYTES = 4_194_304
+_MAX_TRUSTED_SOURCE_BYTES = 1_048_576
+
+# These are reviewed source contracts, not discovery metadata.  Update them only
+# with the corresponding trusted source change.
+_TRUSTED_BENCHMARK_SOURCE_SHA256 = {
+    "__init__.py": "19d094b3835620f7899a84a0ceedae7fb64ed3b44f47a5d3cb8c0976a5136ca3",
+    "metrics.py": f"{'6d68f4a79e84cbddd323272'}{'965397a529fe27b5a60bd38c24d796f6c71ee2945'}",
+    "replay.py": "eab8682b86c70f1fb713a8b3ecdd24c61947d3e1050a9910b133335b6c46562b",
+}
+_TRUSTED_BENCHMARK_PACKAGE = "_semantic_reheating_benchmark"
 
 _ERROR_NAMES = {
     EXIT_USAGE: "usage",
@@ -54,6 +66,15 @@ class _UsageFailure(Exception):
 
 class _HelpRequested(Exception):
     """Normal argparse help completion without letting SystemExit escape main."""
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedSourceCapabilities:
+    """Descriptor primitives captured before trusted source discovery."""
+
+    nonblock: int
+    nofollow: int
+    directory: int
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -339,65 +360,249 @@ def _explain(decision_path: str) -> int:
     return EXIT_OK
 
 
-def _trusted_replay() -> tuple[type[Exception], Any]:
-    """Load only the regular repo-local replay module, never an argv/CWD shadow."""
-    project_root = Path(__file__).absolute().parents[2]
-    package_dir = project_root / "benchmark"
-    init_path = package_dir / "__init__.py"
-    replay_path = package_dir / "replay.py"
+def _trusted_source_capabilities() -> _TrustedSourceCapabilities:
+    """Fail closed unless the descriptor operations used below are available."""
     try:
-        for candidate in (package_dir, init_path, replay_path):
-            metadata = candidate.lstat()
-            if (
-                stat.S_ISLNK(metadata.st_mode)
-                or (candidate == package_dir and not stat.S_ISDIR(metadata.st_mode))
-                or (candidate != package_dir and not stat.S_ISREG(metadata.st_mode))
-            ):
-                raise OSError
-    except OSError as error:
+        supported = os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
+        caps = _TrustedSourceCapabilities(os.O_NONBLOCK, os.O_NOFOLLOW, os.O_DIRECTORY)
+    except (AttributeError, TypeError, ValueError) as error:
         raise _CliFailure(EXIT_BENCHMARK_UNAVAILABLE) from error
+    if not supported or any(
+        type(flag) is not int or flag <= 0
+        for flag in (caps.nonblock, caps.nofollow, caps.directory)
+    ):
+        raise _CliFailure(EXIT_BENCHMARK_UNAVAILABLE)
+    return caps
+
+
+def _same_node(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _open_trusted_root(root: Path, caps: _TrustedSourceCapabilities) -> int:
+    descriptor = -1
+    accepted = False
+    try:
+        before = root.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            raise OSError
+        descriptor = os.open(
+            root, os.O_RDONLY | caps.nonblock | caps.nofollow | caps.directory
+        )
+        opened = os.fstat(descriptor)
+        after = root.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not _same_node(before, opened)
+            or not stat.S_ISDIR(after.st_mode)
+            or not _same_node(before, after)
+        ):
+            raise OSError
+        accepted = True
+        return descriptor
+    except _CliFailure:
+        raise
+    except (OSError, ValueError) as error:
+        raise _CliFailure(EXIT_BENCHMARK_UNAVAILABLE) from error
+    finally:
+        if descriptor >= 0 and not accepted:
+            os.close(descriptor)
+
+
+def _open_trusted_dir(
+    parent_fd: int, name: str, caps: _TrustedSourceCapabilities
+) -> int:
+    descriptor = -1
+    accepted = False
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            raise OSError
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | caps.nonblock | caps.nofollow | caps.directory,
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not _same_node(before, opened)
+            or not stat.S_ISDIR(after.st_mode)
+            or not _same_node(before, after)
+        ):
+            raise OSError
+        accepted = True
+        return descriptor
+    except (OSError, ValueError) as error:
+        raise _CliFailure(EXIT_BENCHMARK_UNAVAILABLE) from error
+    finally:
+        if descriptor >= 0 and not accepted:
+            os.close(descriptor)
+
+
+def _capture_trusted_source(
+    parent_fd: int, name: str, caps: _TrustedSourceCapabilities
+) -> bytes:
+    """Capture one audited direct child without ever reopening its pathname."""
+    descriptor = -1
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size < 0
+            or before.st_size > _MAX_TRUSTED_SOURCE_BYTES
+        ):
+            raise OSError
+        descriptor = os.open(
+            name, os.O_RDONLY | caps.nonblock | caps.nofollow, dir_fd=parent_fd
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not _same_node(before, opened)
+            or opened.st_nlink != 1
+            or opened.st_size != before.st_size
+            or opened.st_mtime_ns != before.st_mtime_ns
+        ):
+            raise OSError
+        data = bytearray()
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(65_536, _MAX_TRUSTED_SOURCE_BYTES + 1 - len(data)),
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > _MAX_TRUSTED_SOURCE_BYTES:
+                raise OSError
+        after = os.fstat(descriptor)
+        named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or not _same_node(before, after)
+            or after.st_nlink != 1
+            or after.st_size != before.st_size
+            or after.st_mtime_ns != before.st_mtime_ns
+            or not stat.S_ISREG(named_after.st_mode)
+            or not _same_node(before, named_after)
+            or named_after.st_nlink != 1
+            or named_after.st_size != before.st_size
+            or named_after.st_mtime_ns != before.st_mtime_ns
+            or len(data) != before.st_size
+        ):
+            raise OSError
+        return bytes(data)
+    except (OSError, ValueError) as error:
+        raise _CliFailure(EXIT_BENCHMARK_UNAVAILABLE) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _trusted_module(name: str, package: str, filename: str) -> ModuleType:
+    module = ModuleType(name)
+    module.__package__ = package
+    module.__file__ = filename
+    return module
+
+
+def _owned_benchmark_module(name: str, private_prefix: str) -> bool:
+    return name in ("benchmark", private_prefix) or name.startswith(
+        ("benchmark.", private_prefix + ".")
+    )
+
+
+def _trusted_replay() -> tuple[type[Exception], Any]:
+    """Execute audited source bytes in a private package, never from a pathname."""
+    caps = _trusted_source_capabilities()
+    project_root = Path(__file__).absolute().parents[2]
+    root_fd = _open_trusted_root(project_root, caps)
+    benchmark_fd = -1
+    try:
+        benchmark_fd = _open_trusted_dir(root_fd, "benchmark", caps)
+        sources = {
+            name: _capture_trusted_source(benchmark_fd, name, caps)
+            for name in _TRUSTED_BENCHMARK_SOURCE_SHA256
+        }
+    finally:
+        if benchmark_fd >= 0:
+            os.close(benchmark_fd)
+        os.close(root_fd)
+    if any(
+        sha256(sources[name]).hexdigest() != digest
+        for name, digest in _TRUSTED_BENCHMARK_SOURCE_SHA256.items()
+    ):
+        raise _CliFailure(EXIT_BENCHMARK_UNAVAILABLE)
+    try:
+        compiled = {
+            name: compile(
+                source,
+                str(project_root / "benchmark" / name),
+                "exec",
+                dont_inherit=True,
+            )
+            for name, source in sources.items()
+        }
+    except (MemoryError, KeyboardInterrupt):
+        raise
+    except BaseException as error:
+        raise _CliFailure(EXIT_BENCHMARK_UNAVAILABLE) from error
+
+    private_prefix = _TRUSTED_BENCHMARK_PACKAGE
+    private_names = (
+        private_prefix,
+        f"{private_prefix}.metrics",
+        f"{private_prefix}.replay",
+    )
     saved = {
-        name: sys.modules[name]
-        for name in tuple(sys.modules)
-        if name == "benchmark" or name.startswith("benchmark.")
+        name: module
+        for name, module in tuple(sys.modules.items())
+        if _owned_benchmark_module(name, private_prefix)
     }
     for name in saved:
         del sys.modules[name]
     try:
-        package_spec = importlib.util.spec_from_file_location(
-            "benchmark", init_path, submodule_search_locations=[str(package_dir)]
+        package = _trusted_module(
+            private_prefix,
+            private_prefix,
+            str(project_root / "benchmark" / "__init__.py"),
         )
-        replay_spec = importlib.util.spec_from_file_location(
-            "benchmark.replay", replay_path
+        package.__path__ = []  # type: ignore[attr-defined]
+        metrics = _trusted_module(
+            f"{private_prefix}.metrics",
+            private_prefix,
+            str(project_root / "benchmark" / "metrics.py"),
         )
+        replay = _trusted_module(
+            f"{private_prefix}.replay",
+            private_prefix,
+            str(project_root / "benchmark" / "replay.py"),
+        )
+        for name, module in zip(private_names, (package, metrics, replay), strict=True):
+            sys.modules[name] = module
+        exec(compiled["metrics.py"], metrics.__dict__)  # noqa: S102 - verified bytes.
+        exec(compiled["replay.py"], replay.__dict__)  # noqa: S102 - verified bytes.
+        exec(compiled["__init__.py"], package.__dict__)  # noqa: S102 - verified bytes.
+        benchmark_error = replay.BenchmarkError
+        replay_bytes = replay.replay_bytes
         if (
-            package_spec is None
-            or package_spec.loader is None
-            or replay_spec is None
-            or replay_spec.loader is None
+            not isinstance(benchmark_error, type)
+            or not issubclass(benchmark_error, Exception)
+            or not callable(replay_bytes)
         ):
-            raise OSError
-        package = importlib.util.module_from_spec(package_spec)
-        sys.modules["benchmark"] = package
-        package_spec.loader.exec_module(package)
-        replay = importlib.util.module_from_spec(replay_spec)
-        sys.modules["benchmark.replay"] = replay
-        replay_spec.loader.exec_module(replay)
-        module_path = Path(getattr(replay, "__file__", "")).absolute()
-        if (
-            module_path != replay_path.absolute()
-            or replay_path.is_symlink()
-            or not replay_path.is_file()
-        ):
-            raise OSError
-        return replay.BenchmarkError, replay.replay_bytes
-    except _CliFailure:
+            raise TypeError
+        return benchmark_error, replay_bytes
+    except (MemoryError, KeyboardInterrupt):
         raise
-    except (ImportError, AttributeError, OSError, ValueError) as error:
+    except BaseException as error:
         raise _CliFailure(EXIT_BENCHMARK_UNAVAILABLE) from error
     finally:
         for name in tuple(sys.modules):
-            if name == "benchmark" or name.startswith("benchmark."):
+            if _owned_benchmark_module(name, private_prefix):
                 del sys.modules[name]
         sys.modules.update(saved)
 

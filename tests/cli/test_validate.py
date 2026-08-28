@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import contextlib
 import io
 import json
@@ -128,6 +129,74 @@ def test_benchmark_unavailable_loader_failure_is_typed_and_sanitized(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "error: benchmark_unavailable\n"
+
+
+def test_trusted_replay_executes_frozen_bytes_when_path_is_replaced_after_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay_path = ROOT / "benchmark/replay.py"
+    original = replay_path.read_bytes()
+    replacement = b"raise RuntimeError('replacement marker executed')\n"
+    replaced = False
+
+    def compile_after_replacement(
+        source: object, filename: object, mode: object, **kwargs: object
+    ) -> object:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            replay_path.write_bytes(replacement)
+        return builtins.compile(source, filename, mode, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "compile", compile_after_replacement, raising=False)
+    try:
+        error_type, replay_bytes = cli._trusted_replay()
+        assert issubclass(error_type, Exception)
+        assert callable(replay_bytes)
+        assert replaced
+    finally:
+        replay_path.write_bytes(original)
+    assert "replacement marker executed" not in sys.modules
+
+
+@pytest.mark.parametrize("source_name", ["__init__.py", "metrics.py", "replay.py"])
+def test_trusted_replay_rejects_pre_capture_source_substitution(
+    source_name: str,
+) -> None:
+    source = ROOT / "benchmark" / source_name
+    original = source.read_bytes()
+    try:
+        source.write_bytes(original + b"\n# replacement marker\n")
+        with pytest.raises(cli._CliFailure) as caught:
+            cli._trusted_replay()
+    finally:
+        source.write_bytes(original)
+    assert caught.value.exit_code == cli.EXIT_BENCHMARK_UNAVAILABLE
+
+
+def test_trusted_replay_uses_no_path_loader_or_preloaded_benchmark_modules() -> None:
+    source = (ROOT / "src/semantic_reheating/cli.py").read_text(encoding="utf-8")
+    assert "spec_from_file_location" not in source
+    assert "loader.exec_module" not in source
+    legacy = object()
+    private = object()
+    prior_legacy = sys.modules.get("benchmark")
+    prior_private = sys.modules.get("_semantic_reheating_benchmark")
+    sys.modules["benchmark"] = legacy  # type: ignore[assignment]
+    sys.modules["_semantic_reheating_benchmark"] = private  # type: ignore[assignment]
+    try:
+        cli._trusted_replay()
+        assert sys.modules["benchmark"] is legacy
+        assert sys.modules["_semantic_reheating_benchmark"] is private
+    finally:
+        if prior_legacy is None:
+            del sys.modules["benchmark"]
+        else:
+            sys.modules["benchmark"] = prior_legacy
+        if prior_private is None:
+            del sys.modules["_semantic_reheating_benchmark"]
+        else:
+            sys.modules["_semantic_reheating_benchmark"] = prior_private
 
 
 def test_validate_emits_only_canonical_status_record(

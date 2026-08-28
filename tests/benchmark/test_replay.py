@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -15,8 +18,11 @@ sys.path.insert(0, str(ROOT))
 
 from benchmark.metrics import compute_metrics
 from benchmark.replay import (
+    _CORPUS_MANIFEST_SCHEMA_SHA256,
+    _REPLAY_RESULT_SCHEMA_SHA256,
     BenchmarkError,
     _CapturedTrace,
+    _detector_names,
     _parse_events,
     _policy,
     _revision,
@@ -47,6 +53,16 @@ def _context() -> tuple[dict[str, object], tuple[_CapturedTrace, ...], str]:
     return manifest, traces, manifest["evaluation_policy"]["source_sha256"]
 
 
+def _copied_root(tmp_path: Path) -> Path:
+    root = tmp_path / "copy"
+    shutil.copytree(ROOT / "benchmark", root / "benchmark")
+    (root / "tests/fixtures").mkdir(parents=True)
+    shutil.copytree(
+        ROOT / "tests/fixtures/contracts", root / "tests/fixtures/contracts"
+    )
+    return root
+
+
 def test_replay_is_byte_deterministic_matches_committed_artifact_and_schema() -> None:
     first = replay_bytes(CORPUS, MANIFEST)
     second = replay_bytes(CORPUS, MANIFEST)
@@ -60,6 +76,118 @@ def test_replay_is_byte_deterministic_matches_committed_artifact_and_schema() ->
     assert result["metrics"]["decision_accuracy"]["value"] == 1.0
     assert result["metrics"]["false_intervention_rate"]["value"] == 0.0
     assert len(result["traces"]) == 29
+
+
+def test_schema_contract_digests_pin_the_raw_committed_bytes() -> None:
+    assert (
+        _CORPUS_MANIFEST_SCHEMA_SHA256
+        == hashlib.sha256(
+            (ROOT / "benchmark/schemas/v1/corpus-manifest.schema.json").read_bytes()
+        ).hexdigest()
+    )
+    assert (
+        _REPLAY_RESULT_SCHEMA_SHA256 == hashlib.sha256(SCHEMA.read_bytes()).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    "schema_name", ["corpus-manifest.schema.json", "replay-result.schema.json"]
+)
+def test_replay_rejects_even_valid_but_unpinned_schema_bytes(
+    tmp_path: Path, schema_name: str
+) -> None:
+    root = _copied_root(tmp_path)
+    schema = root / "benchmark/schemas/v1" / schema_name
+    schema.write_text(
+        '{"$schema":"https://json-schema.org/draft/2020-12/schema","anyOf":[{}]}'
+    )
+
+    with pytest.raises(BenchmarkError) as caught:
+        replay_result(
+            root / "benchmark/corpus", root / "benchmark/scenarios/manifest.json"
+        )
+
+    assert caught.value.code == "invalid_schema"
+
+
+@pytest.mark.parametrize("extra_name", ["unlisted.jsonl", "unexpected.txt"])
+def test_replay_rejects_a_physically_open_corpus_directory(
+    tmp_path: Path, extra_name: str
+) -> None:
+    root = _copied_root(tmp_path)
+    (root / "benchmark/corpus" / extra_name).write_text("x", encoding="utf-8")
+
+    with pytest.raises(BenchmarkError) as caught:
+        replay_result(
+            root / "benchmark/corpus", root / "benchmark/scenarios/manifest.json"
+        )
+
+    assert caught.value.code == "io"
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "benchmark/scenarios/manifest.json",
+        "tests/fixtures/contracts/minimal-run-policy.json",
+        "benchmark/schemas/v1/corpus-manifest.schema.json",
+        "benchmark/corpus/exact-repetition-stall.jsonl",
+    ],
+)
+def test_replay_rejects_hardlinked_fixed_and_trace_leaves(
+    tmp_path: Path, relative: str
+) -> None:
+    root = _copied_root(tmp_path)
+    target = root / relative
+    external = tmp_path / "external"
+    external.write_bytes(target.read_bytes())
+    target.unlink()
+    os.link(external, target)
+
+    with pytest.raises(BenchmarkError) as caught:
+        replay_result(
+            root / "benchmark/corpus", root / "benchmark/scenarios/manifest.json"
+        )
+
+    assert caught.value.code in {"io", "invalid_schema"}
+
+
+@pytest.mark.parametrize(
+    "finding_id",
+    [
+        "unknown-detector-" + "0" * 64,
+        "exact-repetition-" + "g" * 64,
+        "exact-repetition-" + "0" * 63,
+        "exact-repetition-" + "0" * 65,
+        "exact-repetition-" + "0" * 64 + "-spoof",
+    ],
+)
+def test_detector_names_rejects_malformed_or_unknown_closed_ids(
+    finding_id: str,
+) -> None:
+    record = replay_result(CORPUS, MANIFEST)["traces"][0]["decision_record"]
+    record = copy.deepcopy(record)
+    record["confidence"]["contributing_findings"][0]["finding_id"] = finding_id
+
+    with pytest.raises(BenchmarkError) as caught:
+        _detector_names(record)
+
+    assert caught.value.code == "internal"
+
+
+def test_detector_names_rejects_a_duplicate_detector_contribution() -> None:
+    record = replay_result(CORPUS, MANIFEST)["traces"][0]["decision_record"]
+    record = copy.deepcopy(record)
+    duplicate = copy.deepcopy(record["confidence"]["contributing_findings"][0])
+    duplicate["finding_id"] = duplicate["finding_id"][:-1] + (
+        "0" if duplicate["finding_id"][-1] != "0" else "1"
+    )
+    record["confidence"]["contributing_findings"].append(duplicate)
+
+    with pytest.raises(BenchmarkError) as caught:
+        _detector_names(record)
+
+    assert caught.value.code == "internal"
 
 
 def test_replay_reports_valid_expected_evidence_mismatch_without_hiding_it() -> None:

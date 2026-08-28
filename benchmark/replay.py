@@ -34,6 +34,26 @@ MAX_EVENTS = 10_000
 MAX_SMALL_BYTES = 1_048_576
 _READ_CHUNK = 65_536
 _TRACE_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\.jsonl$")
+_CORPUS_MANIFEST_SCHEMA_SHA256 = (
+    "6e4c9626bf7b6d9adabdf095473c1df3f0930b1416ffdd2706b9d84b3d3e9182"
+)
+_REPLAY_RESULT_SCHEMA_SHA256 = (
+    "792054afc0fbd8b729fb12fe61b502f13f58f4246daf1edd6cd3596e75d1bf30"
+)
+_DETECTOR_FINDING_IDS = (
+    ("exact-repetition", "exact_repetition"),
+    ("cycle", "cycle"),
+    ("repeated-error", "repeated_error"),
+    ("unchanged-state", "unchanged_state"),
+    ("acceptance-stall", "acceptance_stall"),
+    ("budget-burn", "budget_burn"),
+    ("hard-budget", "hard_budget"),
+    ("repeated-risky-call", "repeated_risky_call"),
+)
+_DETECTOR_FINDING_PATTERNS = tuple(
+    (re.compile(re.escape(prefix) + r"-[0-9a-f]{64}\Z"), name)
+    for prefix, name in _DETECTOR_FINDING_IDS
+)
 
 
 class BenchmarkError(ValueError):
@@ -49,6 +69,7 @@ class _Capabilities:
     nonblock: int
     nofollow: int
     directory: int
+    listdir: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,8 +85,12 @@ def _fail(code: str) -> NoReturn:
 
 def _capabilities() -> _Capabilities:
     try:
-        supported = os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
-        caps = _Capabilities(os.O_NONBLOCK, os.O_NOFOLLOW, os.O_DIRECTORY)
+        supported = (
+            os.open in os.supports_dir_fd
+            and os.stat in os.supports_dir_fd
+            and os.listdir in os.supports_fd
+        )
+        caps = _Capabilities(os.O_NONBLOCK, os.O_NOFOLLOW, os.O_DIRECTORY, supported)
     except (AttributeError, TypeError, ValueError):
         _fail("io")
     if not supported or any(
@@ -154,7 +179,11 @@ def _read_regular(parent_fd: int, name: str, caps: _Capabilities, limit: int) ->
     fd = -1
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+        ):
             _fail("io")
         if before.st_size < 0 or before.st_size > limit:
             _fail("invalid_schema")
@@ -162,7 +191,11 @@ def _read_regular(parent_fd: int, name: str, caps: _Capabilities, limit: int) ->
             name, os.O_RDONLY | caps.nonblock | caps.nofollow, dir_fd=parent_fd
         )
         opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or not _same_node(before, opened):
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not _same_node(before, opened)
+            or opened.st_nlink != 1
+        ):
             _fail("io")
         data = bytearray()
         while True:
@@ -179,8 +212,12 @@ def _read_regular(parent_fd: int, name: str, caps: _Capabilities, limit: int) ->
             or not _same_node(before, after)
             or after.st_size != before.st_size
             or after.st_mtime_ns != before.st_mtime_ns
+            or after.st_nlink != 1
             or not stat.S_ISREG(named_after.st_mode)
             or not _same_node(before, named_after)
+            or named_after.st_size != before.st_size
+            or named_after.st_mtime_ns != before.st_mtime_ns
+            or named_after.st_nlink != 1
             or len(data) != before.st_size
         ):
             _fail("io")
@@ -220,6 +257,41 @@ def _json_object(raw: bytes) -> dict[str, Any]:
     return value
 
 
+def _trace_leaf(trace_path: object) -> str:
+    if type(trace_path) is not str:
+        _fail("invalid_schema")
+    relative = PurePosixPath(trace_path)
+    name = relative.name
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or relative.parts != ("benchmark", "corpus", name)
+        or trace_path != f"benchmark/corpus/{name}"
+        or not name.isascii()
+        or _TRACE_NAME.fullmatch(name) is None
+    ):
+        _fail("invalid_schema")
+    return name
+
+
+def _corpus_names(corpus_fd: int) -> frozenset[str]:
+    """Enumerate an already-opened corpus directory without pathname traversal."""
+    try:
+        names = os.listdir(corpus_fd)
+    except (OSError, TypeError, ValueError):
+        _fail("io")
+    if type(names) is not list or any(
+        type(name) is not str
+        or not name.isascii()
+        or _TRACE_NAME.fullmatch(name) is None
+        for name in names
+    ):
+        _fail("io")
+    if len(names) != len(set(names)):
+        _fail("io")
+    return frozenset(names)
+
+
 def _validator(schema_raw: bytes) -> Draft202012Validator:
     try:
         schema = _json_object(schema_raw)
@@ -233,7 +305,7 @@ def _validator(schema_raw: bytes) -> Draft202012Validator:
 
 def _validate(validator: Draft202012Validator, value: Any) -> None:
     try:
-        if list(validator.iter_errors(value)):
+        if next(validator.iter_errors(value), None) is not None:
             _fail("invalid_schema")
     except BenchmarkError:
         raise
@@ -285,18 +357,15 @@ def _read_trace(
     remaining: int,
     scenario_id: str,
 ) -> tuple[bytes, tuple[TraceEvent, ...]]:
-    relative = PurePosixPath(trace_path)
-    name = relative.name
-    if (
-        relative.parts != ("benchmark", "corpus", name)
-        or trace_path != f"benchmark/corpus/{name}"
-        or _TRACE_NAME.fullmatch(name) is None
-    ):
-        _fail("invalid_schema")
+    name = _trace_leaf(trace_path)
     fd = -1
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+        ):
             _fail("io")
         if before.st_size > MAX_TRACE_BYTES or before.st_size > remaining:
             _fail("invalid_schema")
@@ -304,7 +373,11 @@ def _read_trace(
             name, os.O_RDONLY | caps.nonblock | caps.nofollow, dir_fd=parent_fd
         )
         opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or not _same_node(before, opened):
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not _same_node(before, opened)
+            or opened.st_nlink != 1
+        ):
             _fail("io")
         raw, line, events = bytearray(), bytearray(), []
         while True:
@@ -334,8 +407,12 @@ def _read_trace(
             or not _same_node(before, after)
             or after.st_size != before.st_size
             or after.st_mtime_ns != before.st_mtime_ns
+            or after.st_nlink != 1
             or not stat.S_ISREG(named_after.st_mode)
             or not _same_node(before, named_after)
+            or named_after.st_size != before.st_size
+            or named_after.st_mtime_ns != before.st_mtime_ns
+            or named_after.st_nlink != 1
             or len(raw) != before.st_size
         ):
             _fail("io")
@@ -386,22 +463,30 @@ def _policy(raw: bytes, manifest: dict[str, Any]) -> tuple[RunPolicy, str]:
 
 
 def _detector_names(record: dict[str, Any]) -> list[str]:
-    mapping = {
-        "exact-repetition": "exact_repetition",
-        "cycle": "cycle",
-        "repeated-error": "repeated_error",
-        "unchanged-state": "unchanged_state",
-        "acceptance-stall": "acceptance_stall",
-        "budget-burn": "budget_burn",
-        "hard-budget": "hard_budget",
-        "repeated-risky-call": "repeated_risky_call",
-    }
+    """Return a closed detector set only from exact, unambiguous finding IDs."""
+    if type(record) is not dict:
+        _fail("internal")
+    confidence = record.get("confidence")
+    if type(confidence) is not dict:
+        _fail("internal")
+    contributions = confidence.get("contributing_findings")
+    if type(contributions) is not list:
+        _fail("internal")
     found: set[str] = set()
-    for contribution in record["confidence"]["contributing_findings"]:
-        for prefix, name in mapping.items():
-            if contribution["finding_id"].startswith(prefix + "-"):
-                found.add(name)
-                break
+    for contribution in contributions:
+        if type(contribution) is not dict:
+            _fail("internal")
+        finding_id = contribution.get("finding_id")
+        if type(finding_id) is not str:
+            _fail("internal")
+        matches = [
+            name
+            for pattern, name in _DETECTOR_FINDING_PATTERNS
+            if pattern.fullmatch(finding_id) is not None
+        ]
+        if len(matches) != 1 or matches[0] in found:
+            _fail("internal")
+        found.add(matches[0])
     return [name for name in DETECTOR_ORDER if name in found]
 
 
@@ -713,15 +798,23 @@ def replay_result(corpus: Path, manifest_path: Path) -> dict[str, Any]:
         fds.append(contracts_fd)
         corpus_fd = _open_dir(benchmark_fd, "corpus", caps)
         fds.append(corpus_fd)
-        manifest = _json_object(
-            _read_regular(scenarios_fd, "manifest.json", caps, MAX_SMALL_BYTES)
+        manifest_raw = _read_regular(
+            scenarios_fd, "manifest.json", caps, MAX_SMALL_BYTES
         )
+        manifest_schema_raw = _read_regular(
+            v1_fd, "corpus-manifest.schema.json", caps, MAX_SMALL_BYTES
+        )
+        result_schema_raw = _read_regular(
+            v1_fd, "replay-result.schema.json", caps, MAX_SMALL_BYTES
+        )
+        if (
+            sha256(manifest_schema_raw).hexdigest() != _CORPUS_MANIFEST_SCHEMA_SHA256
+            or sha256(result_schema_raw).hexdigest() != _REPLAY_RESULT_SCHEMA_SHA256
+        ):
+            _fail("invalid_schema")
+        manifest = _json_object(manifest_raw)
         _validate(
-            _validator(
-                _read_regular(
-                    v1_fd, "corpus-manifest.schema.json", caps, MAX_SMALL_BYTES
-                )
-            ),
+            _validator(manifest_schema_raw),
             manifest,
         )
         entries = manifest.get("entries")
@@ -738,6 +831,14 @@ def replay_result(corpus: Path, manifest_path: Path) -> dict[str, Any]:
             != len(entries)
         ):
             _fail("invalid_schema")
+        expected_names = frozenset(
+            _trace_leaf(entry["trace_path"]) for entry in entries
+        )
+        if (
+            len(expected_names) != len(entries)
+            or _corpus_names(corpus_fd) != expected_names
+        ):
+            _fail("io")
         policy, policy_digest = _policy(
             _read_regular(
                 contracts_fd, "minimal-run-policy.json", caps, MAX_SMALL_BYTES
@@ -749,7 +850,8 @@ def replay_result(corpus: Path, manifest_path: Path) -> dict[str, Any]:
         for entry in entries:
             if (
                 type(entry) is not dict
-                or Path(entry["trace_path"]).stem != entry["scenario_id"]
+                or _trace_leaf(entry["trace_path"]).removesuffix(".jsonl")
+                != entry["scenario_id"]
             ):
                 _fail("invalid_schema")
             raw, events = _read_trace(
@@ -761,6 +863,8 @@ def replay_result(corpus: Path, manifest_path: Path) -> dict[str, Any]:
             )
             total += len(raw)
             captured.append(_CapturedTrace(entry, raw, events))
+        if _corpus_names(corpus_fd) != expected_names:
+            _fail("io")
         frozen = tuple(captured)
         records: list[dict[str, Any]] = []
         deterministic = True
@@ -791,9 +895,7 @@ def replay_result(corpus: Path, manifest_path: Path) -> dict[str, Any]:
             "traces": records,
         }
         _validate(
-            _validator(
-                _read_regular(v1_fd, "replay-result.schema.json", caps, MAX_SMALL_BYTES)
-            ),
+            _validator(result_schema_raw),
             result,
         )
         validate_result(
