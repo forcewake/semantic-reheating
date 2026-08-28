@@ -94,8 +94,14 @@ usage = {'turns': 1, 'tools': 0, 'tokens': 1, 'cost': '0.0'}
 if mode == 'usage-unsupported':
     usage.pop('tokens')
     usage.pop('cost')
-Path(usage_path).write_text(json.dumps(usage))
-print(json.dumps(response))
+if mode == 'duplicate-usage':
+    Path(usage_path).write_text('{"turns":1,"tools":0,"tokens":1,"cost":"0.0","cost":"9.0"}')
+else:
+    Path(usage_path).write_text(json.dumps(usage))
+if mode == 'duplicate-response' and scenario == 'exact-retry-loop':
+    print('{"action":"stop","action":"reheat","authority_owner":"none","would_execute_write":false,"repeat_unknown_write":false,"budget_state":"available","evidence_ids":[],"reason_codes":[]}')
+else:
+    print(json.dumps(response))
 """,
         encoding="ascii",
     )
@@ -359,6 +365,14 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
                 "contract_version": "1.0",
                 "mode": "baseline",
                 "command_sha256": projection["command_sha256"],
+                "scenario_schema_sha256": projection["scenario_schema_sha256"],
+                "rubric_schema_sha256": projection["rubric_schema_sha256"],
+                "baseline_summary_schema_sha256": projection[
+                    "baseline_summary_schema_sha256"
+                ],
+                "stack_receipt_schema_sha256": projection[
+                    "stack_receipt_schema_sha256"
+                ],
                 "stack_metadata": {
                     "cli": "fake-cli",
                     "framework": "fake-framework",
@@ -433,11 +447,16 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
 
 
 def test_sanitize_projection_validates_fixed_closed_schema_and_detaches() -> None:
+    _, fixed_hashes = runner._baseline_summary_schema()
     summary = {
         "contract_version": "1.0",
         "mode": "baseline",
         "scenario_set_sha256": "a" * 64,
         "rubric_sha256": "b" * 64,
+        "scenario_schema_sha256": fixed_hashes["scenarios_schema"],
+        "rubric_schema_sha256": fixed_hashes["rubric_schema"],
+        "baseline_summary_schema_sha256": fixed_hashes["baseline_summary_schema"],
+        "stack_receipt_schema_sha256": fixed_hashes["stack_receipt_schema"],
         "stack_config_sha256": "c" * 64,
         "command_sha256": "d" * 64,
         "supports": {
@@ -497,6 +516,10 @@ def test_future_projection_schemas_reject_unknown_major_and_missing_bindings() -
         "contract_version": "1.0",
         "mode": "baseline",
         "command_sha256": "a" * 64,
+        "scenario_schema_sha256": "c" * 64,
+        "rubric_schema_sha256": "d" * 64,
+        "baseline_summary_schema_sha256": "e" * 64,
+        "stack_receipt_schema_sha256": "f" * 64,
         "stack_metadata": {
             "cli": "cli",
             "framework": "framework",
@@ -526,6 +549,10 @@ def test_future_projection_schemas_reject_unknown_major_and_missing_bindings() -
         "mode": "baseline",
         "scenario_set_sha256": "a" * 64,
         "rubric_sha256": "b" * 64,
+        "scenario_schema_sha256": "c" * 64,
+        "rubric_schema_sha256": "d" * 64,
+        "baseline_summary_schema_sha256": "e" * 64,
+        "stack_receipt_schema_sha256": "f" * 64,
         "stack_config_sha256": "c" * 64,
         "command_sha256": "d" * 64,
         "supports": stack_receipt["supports"],
@@ -766,13 +793,16 @@ def test_state_root_inside_repository_and_symlink_config_fail_closed(
 
 
 def test_state_root_rejects_any_registered_git_worktree(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A sibling worktree is a forbidden state-root boundary too."""
-    other_worktree = next(
-        root
-        for root in runner._worktree_roots(PROJECT_ROOT)
-        if root.resolve() != PROJECT_ROOT.resolve()
+    """Containment uses every discovered root without needing a sibling checkout."""
+    other_worktree = tmp_path / "controlled-sibling-worktree"
+    other_worktree.mkdir()
+    monkeypatch.setattr(
+        runner,
+        "_worktree_roots",
+        lambda _repo: (PROJECT_ROOT.resolve(), other_worktree.resolve()),
     )
     monkeypatch.setenv("XDG_STATE_HOME", str(other_worktree))
 
@@ -817,11 +847,8 @@ else:
 def test_worktree_discovery_is_bounded_fail_closed_and_never_uses_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    sibling = next(
-        root
-        for root in runner._worktree_roots(PROJECT_ROOT)
-        if root.resolve() != PROJECT_ROOT.resolve()
-    )
+    sibling = tmp_path / "controlled-sibling-worktree"
+    sibling.mkdir()
     fake_git = tmp_path / "git"
     _write_fake_git(fake_git)
     candidate = (
@@ -846,6 +873,14 @@ def test_worktree_discovery_is_bounded_fail_closed_and_never_uses_run(
         runner._state_root(PROJECT_ROOT)
     assert "private-token" not in str(error.value)
     assert not candidate.exists()
+
+
+def test_state_root_allows_single_root_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "_worktree_roots", lambda repo: (repo.resolve(),))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    assert runner._state_root(PROJECT_ROOT).is_relative_to(tmp_path.resolve())
 
 
 def test_worktree_discovery_reaps_normal_exit_group_child(
@@ -1268,3 +1303,204 @@ def test_fewer_than_six_scenarios_fails_closed(
         runner.PressureProtocolError, match="pressure_outcome_count_invalid"
     ):
         runner.run_baseline(PROJECT_ROOT)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b'{"outer":{"nested":{"key":1,"key":2}}}',
+        b'{"first":1}{"second":2}',
+        b'{"first":1} trailing',
+    ),
+)
+def test_strict_json_loader_rejects_nested_duplicate_and_multiple_values(
+    tmp_path: Path, raw: bytes
+) -> None:
+    candidate = tmp_path / "input.json"
+    candidate.write_bytes(raw)
+
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_invalid_json"
+    ) as error:
+        runner._load_json(candidate)
+    assert "key" not in str(error.value)
+
+
+def test_validated_config_hash_binds_exact_raw_bytes_and_duplicate_config_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    path = _install_config(tmp_path, fake)
+    value = json.loads(path.read_text(encoding="ascii"))
+    raw_one = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    raw_two = json.dumps(value, sort_keys=True, indent=2).encode("ascii")
+    assert (
+        runner._validate_config(value, raw_one)["config_sha256"]
+        != runner._validate_config(value, raw_two)["config_sha256"]
+    )
+    path.write_bytes(b'{"contract_version":"1.0","contract_version":"1.0"}')
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    with pytest.raises(runner.PressureProtocolError, match="pressure_invalid_config"):
+        runner.run_baseline(PROJECT_ROOT)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "1e1000000",
+        "1e-1000000",
+        "-0.1",
+        "+0.1",
+        "00.1",
+        "0000000000001",
+        "1.0000000",
+        "NaN",
+        "Infinity",
+        "0" * 13,
+        "1" * 13,
+    ),
+)
+def test_cost_grammar_is_fixed_point_bounded_and_never_expands(value: str) -> None:
+    with pytest.raises(runner.PressureProtocolError, match="pressure_invalid_decimal"):
+        runner._decimal(value)
+
+
+def test_duplicate_cli_response_is_malformed_and_duplicate_usage_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    _install_config(tmp_path, fake)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", "duplicate-response")
+    summary = runner.run_baseline(PROJECT_ROOT)
+    assert summary["outcomes"][0]["outcome_code"] == "malformed-output"
+
+    retry_home = tmp_path / "retry"
+    _install_config(retry_home, fake)
+    monkeypatch.setenv("XDG_STATE_HOME", str(retry_home))
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", "duplicate-usage")
+    with pytest.raises(runner.PressureProtocolError, match="pressure_invalid_usage"):
+        runner.run_baseline(PROJECT_ROOT)
+
+
+def test_manifest_binds_all_six_scenario_streams_and_usage_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    _install_config(tmp_path, fake)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    summary = runner.run_baseline(PROJECT_ROOT)
+    state_root = tmp_path / "semantic-reheating" / "pressure-baselines"
+    run_dir = next(
+        path for path in state_root.iterdir() if path.name.startswith("run-")
+    )
+    receipt = summary["private_transcript_receipt"]
+    assert receipt["name"] == "baseline-evidence-manifest.json"
+    manifest_bytes = (run_dir / receipt["name"]).read_bytes()
+    assert hashlib.sha256(manifest_bytes).hexdigest() == receipt["sha256"]
+    manifest = json.loads(manifest_bytes)
+    assert [entry["scenario_id"] for entry in manifest["entries"]] == SCENARIO_IDS
+    assert len(manifest["entries"]) == 6
+    for position, entry in enumerate(manifest["entries"], start=1):
+        assert (
+            entry["stdout_sha256"]
+            == hashlib.sha256(
+                (run_dir / f"stdout-{position}.bin").read_bytes()
+            ).hexdigest()
+        )
+        assert (
+            entry["stderr_sha256"]
+            == hashlib.sha256(
+                (run_dir / f"stderr-{position}.bin").read_bytes()
+            ).hexdigest()
+        )
+        assert (
+            entry["usage_sha256"]
+            == hashlib.sha256(
+                (run_dir / f"usage-{position}.json").read_bytes()
+            ).hexdigest()
+        )
+    assert stat.S_IMODE((run_dir / receipt["name"]).stat().st_mode) == 0o600
+    for position in range(2, 7):
+        assert (
+            manifest["entries"][position - 1]["stdout_sha256"]
+            != hashlib.sha256(
+                f"detached-scenario-{position}".encode("ascii")
+            ).hexdigest()
+        )
+    assert (
+        manifest["entries"][0]["stderr_sha256"]
+        != hashlib.sha256(b"detached-stderr").hexdigest()
+    )
+    assert (
+        manifest["entries"][0]["usage_sha256"]
+        != hashlib.sha256(b'{"detached":"usage"}').hexdigest()
+    )
+
+
+def test_sanitize_projection_rejects_oversized_canonical_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    _install_config(tmp_path, fake)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    summary = runner.run_baseline(PROJECT_ROOT)
+    schema, hashes = runner._baseline_summary_schema()
+    monkeypatch.setattr(runner, "_baseline_summary_schema", lambda: (schema, hashes))
+    monkeypatch.setattr(runner, "MAX_PUBLIC_BYTES", 10)
+
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_invalid_public_contract"
+    ):
+        runner.sanitize_projection(summary)
+
+
+@pytest.mark.parametrize("name", ("pressure-scenarios.json", "rubric.json"))
+def test_public_protocol_rejects_deep_duplicate_json_members(
+    tmp_path: Path, name: str
+) -> None:
+    repo = tmp_path / "repo"
+    reference = repo / "skills" / "semantic-reheating" / "references"
+    reference.mkdir(parents=True)
+    (repo / ".git").write_text("gitdir: not-a-real-repository\n", encoding="ascii")
+    for source in REFERENCES.glob("*.json"):
+        target = reference / source.name
+        target.write_bytes(source.read_bytes())
+    target = reference / name
+    raw = target.read_bytes()
+    marker = b'"contract_version": "1.0"'
+    target.write_bytes(raw.replace(marker, marker + b',"contract_version":"1.0"', 1))
+    with pytest.raises(runner.PressureProtocolError, match="pressure_invalid_json"):
+        runner.load_public_protocol(repo)
+
+
+def test_schema_byte_bindings_are_reported_and_stale_summary_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    _install_config(tmp_path, fake)
+    original = runner.load_public_protocol(PROJECT_ROOT)
+    repo = tmp_path / "repo"
+    reference = repo / "skills" / "semantic-reheating" / "references"
+    reference.mkdir(parents=True)
+    (repo / ".git").write_text("gitdir: not-a-real-repository\n", encoding="ascii")
+    for source in REFERENCES.glob("*.json"):
+        (reference / source.name).write_bytes(source.read_bytes())
+    (reference / "rubric.schema.json").write_bytes(
+        (reference / "rubric.schema.json").read_bytes() + b"\n"
+    )
+    monkeypatch.setattr(runner, "_worktree_roots", lambda root: (root.resolve(),))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    summary = runner.run_baseline(repo)
+    assert summary["rubric_schema_sha256"] != original["hashes"]["rubric_schema"]
+    stale = copy.deepcopy(summary)
+    stale["rubric_schema_sha256"] = "0" * 64
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_invalid_public_contract"
+    ):
+        runner.sanitize_projection(stale)

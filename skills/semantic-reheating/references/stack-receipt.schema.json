@@ -3,39 +3,339 @@
   "$id": "https://semantic-reheating.dev/pressure/stack-receipt.schema.json",
   "type": "object",
   "additionalProperties": false,
-  "required": ["contract_version", "mode", "command_sha256", "stack_metadata", "supports"],
+  "required": [
+    "contract_version",
+    "mode",
+    "command_sha256",
+    "scenario_schema_sha256",
+    "rubric_schema_sha256",
+    "baseline_summary_schema_sha256",
+    "stack_receipt_schema_sha256",
+    "stack_metadata",
+    "supports"
+  ],
   "$defs": {
-    "support": {"type": "string", "enum": ["supported", "unsupported"]},
-    "enforcement": {"type": "string", "enum": ["hard", "reported", "unsupported"]},
+    "support": {
+      "type": "string",
+      "enum": [
+        "supported",
+        "unsupported"
+      ]
+    },
+    "enforcement": {
+      "type": "string",
+      "enum": [
+        "hard",
+        "reported",
+        "unsupported"
+      ]
+    },
     "usageSupport": {
-      "type": "object", "additionalProperties": false,
-      "required": ["turns", "tools", "tokens", "elapsed_seconds", "cost"],
-      "properties": {"turns": {"$ref": "#/$defs/support"}, "tools": {"$ref": "#/$defs/support"}, "tokens": {"$ref": "#/$defs/support"}, "elapsed_seconds": {"$ref": "#/$defs/support"}, "cost": {"$ref": "#/$defs/support"}}
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turns",
+        "tools",
+        "tokens",
+        "elapsed_seconds",
+        "cost"
+      ],
+      "properties": {
+        "turns": {
+          "$ref": "#/$defs/support"
+        },
+        "tools": {
+          "$ref": "#/$defs/support"
+        },
+        "tokens": {
+          "$ref": "#/$defs/support"
+        },
+        "elapsed_seconds": {
+          "$ref": "#/$defs/support"
+        },
+        "cost": {
+          "$ref": "#/$defs/support"
+        }
+      }
     },
     "dimensionEnforcement": {
-      "type": "object", "additionalProperties": false,
-      "required": ["turns", "tools", "tokens", "elapsed_seconds", "cost"],
-      "properties": {"turns": {"$ref": "#/$defs/enforcement"}, "tools": {"$ref": "#/$defs/enforcement"}, "tokens": {"$ref": "#/$defs/enforcement"}, "elapsed_seconds": {"$ref": "#/$defs/enforcement"}, "cost": {"$ref": "#/$defs/enforcement"}}
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turns",
+        "tools",
+        "tokens",
+        "elapsed_seconds",
+        "cost"
+      ],
+      "properties": {
+        "turns": {
+          "$ref": "#/$defs/enforcement"
+        },
+        "tools": {
+          "$ref": "#/$defs/enforcement"
+        },
+        "tokens": {
+          "$ref": "#/$defs/enforcement"
+        },
+        "elapsed_seconds": {
+          "$ref": "#/$defs/enforcement"
+        },
+        "cost": {
+          "$ref": "#/$defs/enforcement"
+        }
+      }
     }
   },
   "properties": {
-    "contract_version": {"const": "1.0"}, "mode": {"const": "baseline"},
-    "command_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "contract_version": {
+      "const": "1.0"
+    },
+    "mode": {
+      "const": "baseline"
+    },
+    "command_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "scenario_schema_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "rubric_schema_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "baseline_summary_schema_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "stack_receipt_schema_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "stack_metadata": {
-      "type": "object", "additionalProperties": false,
-      "required": ["cli", "framework", "model", "provider", "version", "executable_sha256"],
-      "properties": {"cli": {"type": "string"}, "framework": {"type": "string"}, "model": {"type": "string"}, "provider": {"type": "string"}, "version": {"type": "string"}, "executable_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cli",
+        "framework",
+        "model",
+        "provider",
+        "version",
+        "executable_sha256"
+      ],
+      "properties": {
+        "cli": {
+          "type": "string"
+        },
+        "framework": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "executable_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
     },
     "supports": {
-      "type": "object", "additionalProperties": false,
-      "required": ["seed", "decoding", "usage_report", "enforcement"],
-      "properties": {"seed": {"$ref": "#/$defs/support"}, "decoding": {"$ref": "#/$defs/support"}, "usage_report": {"$ref": "#/$defs/usageSupport"}, "enforcement": {"$ref": "#/$defs/dimensionEnforcement"}},
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seed",
+        "decoding",
+        "usage_report",
+        "enforcement"
+      ],
+      "properties": {
+        "seed": {
+          "$ref": "#/$defs/support"
+        },
+        "decoding": {
+          "$ref": "#/$defs/support"
+        },
+        "usage_report": {
+          "$ref": "#/$defs/usageSupport"
+        },
+        "enforcement": {
+          "$ref": "#/$defs/dimensionEnforcement"
+        }
+      },
       "allOf": [
-        {"if": {"properties": {"usage_report": {"properties": {"turns": {"const": "supported"}}}}}, "then": {"properties": {"enforcement": {"properties": {"turns": {"const": "reported"}}}}}, "else": {"properties": {"enforcement": {"properties": {"turns": {"const": "unsupported"}}}}}},
-        {"if": {"properties": {"usage_report": {"properties": {"tools": {"const": "supported"}}}}}, "then": {"properties": {"enforcement": {"properties": {"tools": {"const": "reported"}}}}}, "else": {"properties": {"enforcement": {"properties": {"tools": {"const": "unsupported"}}}}}},
-        {"if": {"properties": {"usage_report": {"properties": {"tokens": {"const": "supported"}}}}}, "then": {"properties": {"enforcement": {"properties": {"tokens": {"const": "reported"}}}}}, "else": {"properties": {"enforcement": {"properties": {"tokens": {"const": "unsupported"}}}}}},
-        {"if": {"properties": {"usage_report": {"properties": {"elapsed_seconds": {"const": "supported"}}}}}, "then": {"properties": {"enforcement": {"properties": {"elapsed_seconds": {"const": "hard"}}}}}, "else": false},
-        {"if": {"properties": {"usage_report": {"properties": {"cost": {"const": "supported"}}}}}, "then": {"properties": {"enforcement": {"properties": {"cost": {"const": "reported"}}}}}, "else": {"properties": {"enforcement": {"properties": {"cost": {"const": "unsupported"}}}}}}
+        {
+          "if": {
+            "properties": {
+              "usage_report": {
+                "properties": {
+                  "turns": {
+                    "const": "supported"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "enforcement": {
+                "properties": {
+                  "turns": {
+                    "const": "reported"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "enforcement": {
+                "properties": {
+                  "turns": {
+                    "const": "unsupported"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "usage_report": {
+                "properties": {
+                  "tools": {
+                    "const": "supported"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "enforcement": {
+                "properties": {
+                  "tools": {
+                    "const": "reported"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "enforcement": {
+                "properties": {
+                  "tools": {
+                    "const": "unsupported"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "usage_report": {
+                "properties": {
+                  "tokens": {
+                    "const": "supported"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "enforcement": {
+                "properties": {
+                  "tokens": {
+                    "const": "reported"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "enforcement": {
+                "properties": {
+                  "tokens": {
+                    "const": "unsupported"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "usage_report": {
+                "properties": {
+                  "elapsed_seconds": {
+                    "const": "supported"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "enforcement": {
+                "properties": {
+                  "elapsed_seconds": {
+                    "const": "hard"
+                  }
+                }
+              }
+            }
+          },
+          "else": false
+        },
+        {
+          "if": {
+            "properties": {
+              "usage_report": {
+                "properties": {
+                  "cost": {
+                    "const": "supported"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "enforcement": {
+                "properties": {
+                  "cost": {
+                    "const": "reported"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "enforcement": {
+                "properties": {
+                  "cost": {
+                    "const": "unsupported"
+                  }
+                }
+              }
+            }
+          }
+        }
       ]
     }
   }

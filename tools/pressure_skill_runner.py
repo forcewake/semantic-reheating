@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import selectors
 import shutil
 import signal
@@ -21,6 +22,9 @@ from jsonschema import Draft202012Validator
 MAX_PUBLIC_BYTES = 64 * 1024
 MAX_CAPTURE_BYTES = 8 * 1024
 WORKTREE_DISCOVERY_TIMEOUT_SECONDS = 2
+MAX_COST_INTEGRAL_DIGITS = 12
+MAX_COST_FRACTION_DIGITS = 6
+MAX_COST = Decimal("999999999999.999999")
 SCENARIO_ORDER = (
     "exact-retry-loop",
     "plan-oscillation",
@@ -54,14 +58,17 @@ def _is_int(value: object) -> bool:
     return type(value) is int and value >= 0
 
 
+_COST_PATTERN = re.compile(r"^(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,6})?$")
+
+
 def _decimal(value: object) -> Decimal:
-    if type(value) is not str:
+    if type(value) is not str or _COST_PATTERN.fullmatch(value) is None:
         raise PressureProtocolError("pressure_invalid_decimal")
     try:
         parsed = Decimal(value)
     except InvalidOperation as error:
         raise PressureProtocolError("pressure_invalid_decimal") from error
-    if not parsed.is_finite() or parsed < 0:
+    if not parsed.is_finite() or parsed < 0 or parsed > MAX_COST:
         raise PressureProtocolError("pressure_invalid_decimal")
     return parsed
 
@@ -150,14 +157,35 @@ def _safe_regular_bytes(path: Path, maximum: int) -> bytes:
         os.close(descriptor)
 
 
+def _strict_json_loads(raw: bytes) -> object:
+    """Parse one RFC JSON value without duplicate-key last-wins behavior."""
+
+    def no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON member")
+            value[key] = item
+        return value
+
+    def no_constants(_value: str) -> object:
+        raise ValueError("invalid JSON constant")
+
+    try:
+        return json.loads(
+            raw.decode("utf-8", "strict"),
+            object_pairs_hook=no_duplicates,
+            parse_constant=no_constants,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+        raise PressureProtocolError("pressure_invalid_json") from error
+
+
 def _load_json(
     path: Path, maximum: int = MAX_PUBLIC_BYTES
 ) -> tuple[dict[str, Any], bytes]:
     raw = _safe_regular_bytes(path, maximum)
-    try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise PressureProtocolError("pressure_invalid_json") from error
+    value = _strict_json_loads(raw)
     if type(value) is not dict:
         raise PressureProtocolError("pressure_invalid_json")
     return value, raw
@@ -173,18 +201,22 @@ def _validate_schema(schema: dict[str, Any], value: Any) -> None:
         raise PressureProtocolError("pressure_invalid_public_contract")
 
 
-def _baseline_summary_schema() -> dict[str, Any]:
-    """Load only the committed, bounded public projection contract."""
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "skills"
-        / "semantic-reheating"
-        / "references"
-        / "baseline-summary.schema.json"
-    )
-    schema, _ = _load_json(path, MAX_PUBLIC_BYTES)
-    Draft202012Validator.check_schema(schema)
-    return schema
+def _baseline_summary_schema() -> tuple[dict[str, Any], dict[str, str]]:
+    """Load the fixed, descriptor-read summary contract and its governing bindings."""
+    paths = _public_paths(Path(__file__).resolve().parents[1])
+    values: dict[str, dict[str, Any]] = {}
+    hashes: dict[str, str] = {}
+    for name in (
+        "scenarios_schema",
+        "rubric_schema",
+        "baseline_summary_schema",
+        "stack_receipt_schema",
+    ):
+        value, raw = _load_json(paths[name], MAX_PUBLIC_BYTES)
+        values[name] = value
+        hashes[name] = _sha256(raw)
+    Draft202012Validator.check_schema(values["baseline_summary_schema"])
+    return values["baseline_summary_schema"], hashes
 
 
 def _repo_root(value: Path) -> Path:
@@ -368,7 +400,7 @@ def _validate_config(config: dict[str, Any], config_raw: bytes) -> dict[str, Any
         raise PressureProtocolError("pressure_invalid_config")
     return {
         "config": config,
-        "config_sha256": _sha256(_canonical_bytes(json.loads(config_raw))),
+        "config_sha256": _sha256(config_raw),
     }
 
 
@@ -395,6 +427,8 @@ def _public_paths(repo_root: Path) -> dict[str, Path]:
         "scenarios_schema": reference / "pressure-scenarios.schema.json",
         "rubric": reference / "rubric.json",
         "rubric_schema": reference / "rubric.schema.json",
+        "baseline_summary_schema": reference / "baseline-summary.schema.json",
+        "stack_receipt_schema": reference / "stack-receipt.schema.json",
     }
 
 
@@ -411,6 +445,11 @@ def load_public_protocol(repo: Path) -> dict[str, Any]:
         hashes[name] = _sha256(raw)
     _validate_schema(values["scenarios_schema"], values["scenarios"])
     _validate_schema(values["rubric_schema"], values["rubric"])
+    try:
+        Draft202012Validator.check_schema(values["baseline_summary_schema"])
+        Draft202012Validator.check_schema(values["stack_receipt_schema"])
+    except Exception as error:
+        raise PressureProtocolError("pressure_invalid_public_contract") from error
     _validate_schema(
         values["rubric"]["response_schema"],
         {
@@ -470,16 +509,40 @@ def _response_outcome(
     return "pass"
 
 
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise OSError("short private write")
+        offset += written
+
+
 def _write_private(path: Path, data: bytes) -> str:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, 0o600)
     try:
-        os.write(descriptor, data)
+        _write_all(descriptor, data)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
     os.chmod(path, 0o600)
     return _sha256(data)
+
+
+def _write_private_atomic(path: Path, data: bytes) -> str:
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    digest = _write_private(temporary, data)
+    try:
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return digest
 
 
 def _usage(
@@ -531,6 +594,51 @@ def _supports(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_evidence_manifest(value: object) -> dict[str, Any]:
+    """Keep the private transcript evidence closed and in public scenario order."""
+    required = {
+        "contract_version",
+        "mode",
+        "scenario_set_sha256",
+        "rubric_sha256",
+        "scenario_schema_sha256",
+        "rubric_schema_sha256",
+        "baseline_summary_schema_sha256",
+        "stack_receipt_schema_sha256",
+        "stack_config_sha256",
+        "command_sha256",
+        "entries",
+    }
+    if type(value) is not dict or set(value) != required:
+        raise PressureProtocolError("pressure_evidence_manifest_invalid")
+    if value["contract_version"] != "1.0" or value["mode"] != "baseline":
+        raise PressureProtocolError("pressure_evidence_manifest_invalid")
+    hash_names = required - {"contract_version", "mode", "entries"}
+    if any(
+        type(value[name]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value[name]) is None
+        for name in hash_names
+    ):
+        raise PressureProtocolError("pressure_evidence_manifest_invalid")
+    entries = value["entries"]
+    if type(entries) is not list or len(entries) != len(SCENARIO_ORDER):
+        raise PressureProtocolError("pressure_evidence_manifest_invalid")
+    for scenario_id, entry in zip(SCENARIO_ORDER, entries, strict=True):
+        if (
+            type(entry) is not dict
+            or set(entry)
+            != {"scenario_id", "stdout_sha256", "stderr_sha256", "usage_sha256"}
+            or entry["scenario_id"] != scenario_id
+            or any(
+                type(entry[name]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", entry[name]) is None
+                for name in ("stdout_sha256", "stderr_sha256", "usage_sha256")
+            )
+        ):
+            raise PressureProtocolError("pressure_evidence_manifest_invalid")
+    return value
+
+
 def sanitize_projection(summary: dict[str, Any]) -> dict[str, Any]:
     """Return only the future public receipt shape; never include private receipts."""
     fields = {
@@ -538,6 +646,10 @@ def sanitize_projection(summary: dict[str, Any]) -> dict[str, Any]:
         "mode",
         "scenario_set_sha256",
         "rubric_sha256",
+        "scenario_schema_sha256",
+        "rubric_schema_sha256",
+        "baseline_summary_schema_sha256",
+        "stack_receipt_schema_sha256",
         "stack_config_sha256",
         "command_sha256",
         "supports",
@@ -558,13 +670,26 @@ def sanitize_projection(summary: dict[str, Any]) -> dict[str, Any]:
     ):
         raise PressureProtocolError("pressure_summary_private_receipt_invalid")
     try:
-        _validate_schema(
-            _baseline_summary_schema(), {field: summary[field] for field in fields}
-        )
+        schema, fixed_hashes = _baseline_summary_schema()
+        public = {field: summary[field] for field in fields}
+        expected = {
+            "scenario_schema_sha256": fixed_hashes["scenarios_schema"],
+            "rubric_schema_sha256": fixed_hashes["rubric_schema"],
+            "baseline_summary_schema_sha256": fixed_hashes["baseline_summary_schema"],
+            "stack_receipt_schema_sha256": fixed_hashes["stack_receipt_schema"],
+        }
+        if any(public[name] != digest for name, digest in expected.items()):
+            raise PressureProtocolError("pressure_invalid_public_contract")
+        _validate_schema(schema, public)
     except (KeyError, PressureProtocolError) as error:
         raise PressureProtocolError("pressure_invalid_public_contract") from error
     # Canonical serialize/parse detaches all nested public values from private state.
-    return json.loads(_canonical_bytes({field: summary[field] for field in fields}))
+    detached_raw = _canonical_bytes(public)
+    if len(detached_raw) > MAX_PUBLIC_BYTES:
+        raise PressureProtocolError("pressure_invalid_public_contract")
+    detached = _strict_json_loads(detached_raw)
+    assert type(detached) is dict
+    return detached
 
 
 def _process_group_exists(process_group: int) -> bool:
@@ -756,7 +881,12 @@ def run_baseline(repo: Path) -> dict[str, Any]:
     config_path = _private_file(state_root / _PRIVATE_CONFIG_NAME, state_root)
     if not config_path.exists():
         raise PressureProtocolError("pressure_stack_missing")
-    config, raw_config = _load_json(config_path)
+    try:
+        config, raw_config = _load_json(config_path)
+    except PressureProtocolError as error:
+        if error.code == "pressure_invalid_json":
+            raise PressureProtocolError("pressure_invalid_config") from error
+        raise
     validated = _validate_config(config, raw_config)
     config = validated["config"]
     argv = config["command_argv"]
@@ -769,6 +899,7 @@ def run_baseline(repo: Path) -> dict[str, Any]:
         raise PressureProtocolError("pressure_run_exists")
     run_dir.mkdir(mode=0o700)
     outcomes: list[dict[str, str]] = []
+    evidence_entries: list[dict[str, str]] = []
     total_counts: dict[str, int] = {
         "turns": 0,
         "tools": 0,
@@ -813,10 +944,13 @@ def run_baseline(repo: Path) -> dict[str, Any]:
             )
             raise
         stdout_digest = _write_private(run_dir / f"stdout-{position}.bin", stdout)
-        _write_private(run_dir / f"stderr-{position}.bin", stderr)
+        stderr_digest = _write_private(run_dir / f"stderr-{position}.bin", stderr)
         if returncode != 0:
             raise PressureProtocolError("pressure_subprocess_failed")
-        usage_value, _ = _load_json(usage_path)
+        try:
+            usage_value, usage_raw = _load_json(usage_path)
+        except PressureProtocolError as error:
+            raise PressureProtocolError("pressure_invalid_usage") from error
         consumption = _usage(usage_value, config["caps"], config["usage_report"])
         if time.monotonic() > deadline:
             raise PressureProtocolError("pressure_timeout")
@@ -826,8 +960,8 @@ def run_baseline(repo: Path) -> dict[str, Any]:
         if consumption["cost"] != "unsupported":
             total_cost += _decimal(consumption["cost"])
         try:
-            response = json.loads(stdout)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            response = _strict_json_loads(stdout)
+        except PressureProtocolError:
             response = None
         outcomes.append(
             {
@@ -837,9 +971,13 @@ def run_baseline(repo: Path) -> dict[str, Any]:
                 ),
             }
         )
-        _write_private(
-            run_dir / f"receipt-{position}.json",
-            _canonical_bytes({"stdout_sha256": stdout_digest}),
+        evidence_entries.append(
+            {
+                "scenario_id": scenario_id,
+                "stdout_sha256": stdout_digest,
+                "stderr_sha256": stderr_digest,
+                "usage_sha256": _sha256(usage_raw),
+            }
         )
     measured_elapsed = time.monotonic() - baseline_started
     if measured_elapsed > config["caps"]["elapsed_seconds"]:
@@ -857,11 +995,35 @@ def run_baseline(repo: Path) -> dict[str, Any]:
     }
     if len(failure_codes) < 2:
         raise PressureProtocolError("pressure_failure_classes_insufficient")
+    manifest = _validate_evidence_manifest(
+        {
+            "contract_version": "1.0",
+            "mode": "baseline",
+            "scenario_set_sha256": protocol["hashes"]["scenarios"],
+            "rubric_sha256": protocol["hashes"]["rubric"],
+            "scenario_schema_sha256": protocol["hashes"]["scenarios_schema"],
+            "rubric_schema_sha256": protocol["hashes"]["rubric_schema"],
+            "baseline_summary_schema_sha256": protocol["hashes"][
+                "baseline_summary_schema"
+            ],
+            "stack_receipt_schema_sha256": protocol["hashes"]["stack_receipt_schema"],
+            "stack_config_sha256": validated["config_sha256"],
+            "command_sha256": command_hash,
+            "entries": evidence_entries,
+        }
+    )
+    manifest_digest = _write_private_atomic(
+        run_dir / "baseline-evidence-manifest.json", _canonical_bytes(manifest)
+    )
     summary = {
         "contract_version": "1.0",
         "mode": "baseline",
         "scenario_set_sha256": protocol["hashes"]["scenarios"],
         "rubric_sha256": protocol["hashes"]["rubric"],
+        "scenario_schema_sha256": protocol["hashes"]["scenarios_schema"],
+        "rubric_schema_sha256": protocol["hashes"]["rubric_schema"],
+        "baseline_summary_schema_sha256": protocol["hashes"]["baseline_summary_schema"],
+        "stack_receipt_schema_sha256": protocol["hashes"]["stack_receipt_schema"],
         "stack_config_sha256": validated["config_sha256"],
         "command_sha256": command_hash,
         "supports": _supports(config),
@@ -881,10 +1043,8 @@ def run_baseline(repo: Path) -> dict[str, Any]:
             ),
         },
         "private_transcript_receipt": {
-            "name": "receipt-1.json",
-            "sha256": _sha256(
-                _safe_regular_bytes(run_dir / "receipt-1.json", MAX_CAPTURE_BYTES)
-            ),
+            "name": "baseline-evidence-manifest.json",
+            "sha256": manifest_digest,
         },
     }
     return summary
