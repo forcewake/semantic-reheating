@@ -43,6 +43,16 @@ def _has_prefix(finding_id: str, prefixes: tuple[str, ...]) -> bool:
     return any(finding_id.startswith(prefix) for prefix in prefixes)
 
 
+def _contribution_name(finding_id: str) -> str:
+    if finding_id == "semantic-repetition-support":
+        return "semantic"
+    for name in _DETERMINISTIC_RANKS[:-1]:
+        candidate = name.removesuffix("-")
+        if finding_id.startswith(name):
+            return candidate.replace("-", "_")
+    raise AssertionError(finding_id)
+
+
 def _source_policy() -> dict[str, Any]:
     return json.loads(POLICY_FIXTURE.read_text(encoding="utf-8"))
 
@@ -254,6 +264,294 @@ class _SemanticRepetitionSupport:
         }
 
 
+def _order_policy(
+    trace: list[Any], *, semantic_enabled: bool = False, hard_budget: bool = False
+) -> Any:
+    from semantic_reheating.models import RunPolicy
+
+    source = _source_policy()
+    source["detectors"]["windows"] = {
+        "repetition_events": len(trace),
+        "no_progress_events": len(trace),
+    }
+    source["detectors"]["semantic_detector"]["enabled"] = semantic_enabled
+    source["detectors"]["semantic_detector"]["weight"] = 0.2 if semantic_enabled else 0
+    for dimension in DIMENSIONS:
+        source["budgets"]["per_intervention"][dimension] = 1
+        source["budgets"]["whole_run"][dimension] = 3 if hard_budget else 1_000_000
+    return RunPolicy.from_dict(source)
+
+
+def _detector_order_cases() -> tuple[
+    tuple[str, list[Any], Any, Any, tuple[str, ...]], ...
+]:
+    """Literal real-analyze cases for every production contribution category."""
+    exact = _repetition_only_trace("run-order-exact")
+    cycle = [
+        _event(1, "state_observation", run_id="run-order-cycle", state_fingerprint="A"),
+        _event(2, "state_observation", run_id="run-order-cycle", state_fingerprint="B"),
+        _event(3, "state_observation", run_id="run-order-cycle", state_fingerprint="A"),
+    ]
+    repeated_error = [
+        _event(1, "tool_call", run_id="run-order-error", payload={"action": "read"}),
+        _event(2, "error", run_id="run-order-error", error_fingerprint="same-error"),
+        _event(3, "tool_call", run_id="run-order-error", payload={"action": "read"}),
+        _event(4, "error", run_id="run-order-error", error_fingerprint="same-error"),
+    ]
+    unchanged = [
+        _event(
+            1,
+            "state_observation",
+            run_id="run-order-unchanged",
+            state_fingerprint="same-state",
+        ),
+        _event(
+            2,
+            "tool_call",
+            run_id="run-order-unchanged",
+            payload={"action": "read"},
+            expected_state_change=True,
+        ),
+        _event(
+            3,
+            "state_observation",
+            run_id="run-order-unchanged",
+            state_fingerprint="same-state",
+        ),
+    ]
+    acceptance = _no_progress_only_trace("run-order-acceptance")
+    budget_burn = [
+        _event(
+            1,
+            "budget",
+            run_id="run-order-burn",
+            budget_counters={dimension: 0 for dimension in DIMENSIONS},
+        ),
+        _event(
+            2,
+            "budget",
+            run_id="run-order-burn",
+            budget_counters={dimension: 1 for dimension in DIMENSIONS},
+        ),
+    ]
+    hard_budget = [
+        _event(
+            1,
+            "budget",
+            run_id="run-order-hard-budget",
+            budget_counters={dimension: 3 for dimension in DIMENSIONS},
+        )
+    ]
+    repeated_risky = [
+        _event(
+            1,
+            "tool_call",
+            run_id="run-order-risk",
+            payload={"action": "write"},
+            effect_class="unknown",
+        ),
+        _event(
+            2,
+            "tool_call",
+            run_id="run-order-risk",
+            payload={"action": "write"},
+            effect_class="unknown",
+        ),
+    ]
+    semantic = [
+        _event(1, "message", run_id="run-order-semantic", payload={"message": "x"})
+    ]
+    interaction = _signals_trace("run-order-interaction") + [
+        _event(
+            7,
+            "budget",
+            run_id="run-order-interaction",
+            budget_counters={dimension: 3 for dimension in DIMENSIONS},
+        ),
+        _event(
+            8,
+            "tool_call",
+            run_id="run-order-interaction",
+            payload={"action": "write"},
+            effect_class="unknown",
+        ),
+        _event(
+            9,
+            "tool_call",
+            run_id="run-order-interaction",
+            payload={"action": "write"},
+            effect_class="unknown",
+        ),
+    ]
+    full_interaction = [
+        _event(1, "tool_call", run_id="run-order-full", payload={"action": "read"}),
+        _event(
+            2,
+            "tool_result",
+            run_id="run-order-full",
+            payload={"result": "same"},
+            parent_event_id="event-001",
+        ),
+        _event(3, "tool_call", run_id="run-order-full", payload={"action": "read"}),
+        _event(
+            4,
+            "tool_result",
+            run_id="run-order-full",
+            payload={"result": "same"},
+            parent_event_id="event-003",
+        ),
+        _event(5, "state_observation", run_id="run-order-full", state_fingerprint="A"),
+        _event(6, "state_observation", run_id="run-order-full", state_fingerprint="B"),
+        _event(7, "state_observation", run_id="run-order-full", state_fingerprint="A"),
+        _event(8, "tool_call", run_id="run-order-full", payload={"action": "error"}),
+        _event(9, "error", run_id="run-order-full", error_fingerprint="same-error"),
+        _event(10, "tool_call", run_id="run-order-full", payload={"action": "error"}),
+        _event(11, "error", run_id="run-order-full", error_fingerprint="same-error"),
+        _event(
+            12,
+            "state_observation",
+            run_id="run-order-full",
+            state_fingerprint="same-state",
+        ),
+        _event(
+            13,
+            "tool_call",
+            run_id="run-order-full",
+            payload={"action": "observe"},
+            expected_state_change=True,
+        ),
+        _event(
+            14,
+            "state_observation",
+            run_id="run-order-full",
+            state_fingerprint="same-state",
+        ),
+        _event(
+            15,
+            "acceptance_check",
+            run_id="run-order-full",
+            payload={"check": "done"},
+            acceptance_delta="none",
+        ),
+        _event(
+            16,
+            "acceptance_check",
+            run_id="run-order-full",
+            payload={"check": "done"},
+            acceptance_delta="none",
+        ),
+        _event(
+            17,
+            "budget",
+            run_id="run-order-full",
+            budget_counters={dimension: 0 for dimension in DIMENSIONS},
+        ),
+        _event(
+            18,
+            "budget",
+            run_id="run-order-full",
+            budget_counters={dimension: 3 for dimension in DIMENSIONS},
+        ),
+        _event(
+            19,
+            "tool_call",
+            run_id="run-order-full",
+            payload={"action": "write"},
+            effect_class="unknown",
+        ),
+        _event(
+            20,
+            "tool_call",
+            run_id="run-order-full",
+            payload={"action": "write"},
+            effect_class="unknown",
+        ),
+    ]
+    return (
+        ("exact_repetition", exact, _order_policy(exact), None, ("exact_repetition",)),
+        ("cycle", cycle, _order_policy(cycle), None, ("cycle",)),
+        (
+            "repeated_error",
+            repeated_error,
+            _order_policy(repeated_error),
+            None,
+            ("repeated_error",),
+        ),
+        (
+            "unchanged_state",
+            unchanged,
+            _order_policy(unchanged),
+            None,
+            ("unchanged_state",),
+        ),
+        (
+            "acceptance_stall",
+            acceptance,
+            _order_policy(acceptance),
+            None,
+            ("acceptance_stall",),
+        ),
+        (
+            "budget_burn",
+            budget_burn,
+            _order_policy(budget_burn),
+            None,
+            ("budget_burn",),
+        ),
+        (
+            "hard_budget",
+            hard_budget,
+            _order_policy(hard_budget, hard_budget=True),
+            None,
+            ("hard_budget",),
+        ),
+        (
+            "repeated_risky_call",
+            repeated_risky,
+            _order_policy(repeated_risky),
+            None,
+            ("repeated_risky_call",),
+        ),
+        (
+            "semantic",
+            semantic,
+            _order_policy(semantic, semantic_enabled=True),
+            _SemanticRepetitionSupport(),
+            ("semantic",),
+        ),
+        (
+            "interaction",
+            interaction,
+            _order_policy(interaction, semantic_enabled=True, hard_budget=True),
+            _SemanticRepetitionSupport(),
+            (
+                "exact_repetition",
+                "acceptance_stall",
+                "hard_budget",
+                "repeated_risky_call",
+                "semantic",
+            ),
+        ),
+        (
+            "full_interaction",
+            full_interaction,
+            _order_policy(full_interaction, semantic_enabled=True, hard_budget=True),
+            _SemanticRepetitionSupport(),
+            (
+                "exact_repetition",
+                "cycle",
+                "repeated_error",
+                "unchanged_state",
+                "acceptance_stall",
+                "budget_burn",
+                "hard_budget",
+                "repeated_risky_call",
+                "semantic",
+            ),
+        ),
+    )
+
+
 @settings(derandomize=True, database=None, deadline=700, max_examples=24)
 @given(inputs=_signal_inputs())
 def test_valid_generated_inputs_have_finite_ordered_repeat_stable_envelopes(
@@ -341,6 +639,16 @@ def test_one_whole_run_budget_dimension_dominates_competing_signals(
         for item in first.confidence.contributing_findings
         if item.finding_class.value == "budget"
     ]
+    contribution_names = tuple(
+        _contribution_name(item.finding_id)
+        for item in first.confidence.contributing_findings
+    )
+    assert contribution_names == (
+        "exact_repetition",
+        "acceptance_stall",
+        "hard_budget",
+        "semantic",
+    )
     assert len(budget) == 1 and "event-007" in first.evidence_event_ids
 
 
@@ -410,6 +718,57 @@ def test_no_reheat_for_repetition_only_no_progress_only_neither_or_budget_only(
         assert decision.decision is Decision.STOP
         assert any(finding_id.startswith("hard-budget-") for finding_id in finding_ids)
         assert not repetition and not no_progress
+
+
+def test_detector_order_table_covers_every_production_category() -> None:
+    assert {case[0] for case in _detector_order_cases()} >= {
+        "exact_repetition",
+        "cycle",
+        "repeated_error",
+        "unchanged_state",
+        "acceptance_stall",
+        "budget_burn",
+        "hard_budget",
+        "repeated_risky_call",
+        "semantic",
+    }
+
+
+def test_real_analyze_has_literal_complete_detector_contribution_order() -> None:
+    from semantic_reheating.controller import analyze
+
+    observed: set[str] = set()
+    for name, trace, policy, semantic_detector, expected in _detector_order_cases():
+        first = analyze(trace, policy, semantic_detector=semantic_detector)
+        second = analyze(trace, policy, semantic_detector=semantic_detector)
+        first_bytes = json.dumps(
+            first.to_dict(), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        second_bytes = json.dumps(
+            second.to_dict(), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        actual_names = tuple(
+            _contribution_name(item.finding_id)
+            for item in first.confidence.contributing_findings
+        )
+        assert actual_names == expected, (name, actual_names)
+        assert first_bytes == second_bytes
+        assert first.decision_id == second.decision_id
+        assert tuple(
+            item.finding_id for item in first.confidence.contributing_findings
+        ) == tuple(item.finding_id for item in second.confidence.contributing_findings)
+        observed.update(actual_names)
+    assert observed >= {
+        "exact_repetition",
+        "cycle",
+        "repeated_error",
+        "unchanged_state",
+        "acceptance_stall",
+        "budget_burn",
+        "hard_budget",
+        "repeated_risky_call",
+        "semantic",
+    }
 
 
 @settings(derandomize=True, database=None, deadline=700, max_examples=12)

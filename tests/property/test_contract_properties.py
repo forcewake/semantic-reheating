@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -90,6 +91,8 @@ class Mutation:
     keyword: str
     description: str
     changed_pointers: frozenset[str]
+    expected_errors: tuple[tuple[str, str, str], ...]
+    covered_constraints: frozenset[tuple[str, str]]
     apply: Callable[[Any], Any]
 
     @property
@@ -214,7 +217,13 @@ def _resolve(
 
 
 def _wrong_type(types: object) -> object:
-    allowed = {types} if type(types) is str else set(types)
+    if isinstance(types, str):
+        allowed = {types}
+    else:
+        assert isinstance(types, (list, tuple)) and all(
+            isinstance(item, str) for item in types
+        ), types
+        allowed = set(types)
     candidates: tuple[object, ...] = (False, 0, "task15-wrong-type", [], {}, None)
     for candidate in candidates:
         actual = (
@@ -294,8 +303,77 @@ def _leaf_errors(errors: Iterator[ValidationError]) -> tuple[ValidationError, ..
     return tuple(leaves)
 
 
-def _error_location(error: ValidationError) -> str:
-    return _schema_pointer(tuple(error.absolute_schema_path))
+def _ref_parts(ref: str) -> tuple[str, ...]:
+    assert type(ref) is str and ref.startswith("#/") and not ref.startswith("#//"), ref
+    return tuple(
+        part.replace("~1", "/").replace("~0", "~") for part in ref[2:].split("/")
+    )
+
+
+@cache
+def _ref_aliases(kind: str) -> dict[tuple[str | int, ...], tuple[str | int, ...]]:
+    """Expand each local ref use site to its canonical target path.
+
+    jsonschema reports a Draft error below the concrete use site, even when the
+    inventory deliberately names the canonical `$defs` target.  Ref expansion
+    records only edges actually present in this schema graph; it never maps a
+    same-keyword error merely because its instance location happens to match.
+    """
+    root = _schema_data(kind)
+    aliases: dict[tuple[str | int, ...], tuple[str | int, ...]] = {}
+    expanded: set[tuple[tuple[str | int, ...], tuple[str | int, ...]]] = set()
+
+    def visit(node: Any, path: tuple[str | int, ...]) -> None:
+        if type(node) is dict:
+            ref = node.get("$ref")
+            if ref is not None:
+                target = _ref_parts(ref)
+                aliases[path] = target
+                expansion = (path, target)
+                if expansion not in expanded:
+                    expanded.add(expansion)
+                    visit(_at(root, target), path)
+            for key, child in node.items():
+                if key != "$ref":
+                    visit(child, path + (key,))
+        elif type(node) is list:
+            for index, child in enumerate(node):
+                visit(child, path + (index,))
+
+    visit(root, ())
+    return aliases
+
+
+def _normalized_error_location(kind: str, error: ValidationError) -> str:
+    """Canonically resolve a Draft error location through real local ref edges."""
+    location: tuple[str | int, ...] = tuple(error.absolute_schema_path)
+    seen: set[tuple[str | int, ...]] = set()
+    while location not in seen:
+        seen.add(location)
+        candidates = [
+            source
+            for source in _ref_aliases(kind)
+            if len(source) <= len(location) and location[: len(source)] == source
+        ]
+        if not candidates:
+            break
+        source = max(candidates, key=len)
+        normalized = _ref_aliases(kind)[source] + location[len(source) :]
+        if normalized == location:
+            break
+        location = normalized
+    return _schema_pointer(location)
+
+
+def _normalized_leaf_counter(kind: str, value: Any) -> Counter[tuple[str, str, str]]:
+    return Counter(
+        (
+            _normalized_error_location(kind, error),
+            error.validator,
+            _json_pointer(tuple(error.absolute_path)),
+        )
+        for error in _leaf_errors(_schema(kind).iter_errors(value))
+    )
 
 
 def _recursive_diff(
@@ -498,6 +576,14 @@ def _walk_seed(
                 keyword,
                 description,
                 frozenset((_json_pointer(declared),)),
+                (
+                    (
+                        _schema_pointer(schema_path + (keyword,)),
+                        keyword,
+                        _json_pointer(instance_path),
+                    ),
+                ),
+                frozenset(((_schema_pointer(schema_path + (keyword,)), keyword),)),
                 apply,
             )
         )
@@ -748,17 +834,56 @@ def _walk_seed(
             schema_path + ("oneOf", branch_index),
             instance_path,
         )
-        mutations.extend(more)
+        # One `oneOf` removal is conceptual evidence, not three falsely-isolated
+        # branch claims.  It must declare every terminal branch context exactly.
+        branch_prefix = _schema_pointer(schema_path + ("oneOf", branch_index))
+        mutations.extend(
+            item
+            for item in more
+            if not (
+                item.keyword == "required"
+                and item.schema_pointer.startswith(branch_prefix)
+            )
+        )
         exclusions.extend(omitted)
+        required = matching[0].get("required")
+        assert (
+            type(required) is list and len(required) == 1 and type(required[0]) is str
+        )
+        field = required[0]
+        expected_errors = tuple(
+            (
+                _schema_pointer(schema_path + ("oneOf", index, "required")),
+                "required",
+                _json_pointer(instance_path),
+            )
+            for index, member in enumerate(node["oneOf"])
+            if type(member.get("required")) is list and len(member["required"]) == 1
+        )
+        assert len(expected_errors) == len(node["oneOf"]), (schema_path, node["oneOf"])
+        mutations.append(
+            Mutation(
+                artifact=artifact,
+                seed=seed.name,
+                schema_pointer=_schema_pointer(schema_path + ("oneOf",)),
+                instance_pointer=_json_pointer(instance_path),
+                keyword="oneOf",
+                description="remove the selected oneOf discriminator",
+                changed_pointers=frozenset((_json_pointer(instance_path + (field,)),)),
+                expected_errors=expected_errors,
+                covered_constraints=frozenset(
+                    (location, keyword) for location, keyword, _ in expected_errors
+                ),
+                apply=_delete(instance_path + (field,)),
+            )
+        )
     return mutations, exclusions
 
 
 def _candidate_isolated(case: Mutation, seed: SeedVariant) -> bool:
-    errors = _leaf_errors(
-        _schema(case.artifact).iter_errors(case.apply(deepcopy(seed.value)))
-    )
-    validators = {error.validator for error in errors}
-    return bool(errors) and validators == {case.keyword}
+    return _normalized_leaf_counter(
+        case.artifact, case.apply(deepcopy(seed.value))
+    ) == Counter(case.expected_errors)
 
 
 def _inventory() -> tuple[tuple[Mutation, ...], tuple[Exclusion, ...]]:
@@ -793,28 +918,87 @@ SCHEMA_CONSTRAINTS = {
 
 def _coverage_keys() -> set[tuple[str, str, str]]:
     return {
-        (item.artifact, item.schema_pointer, item.keyword) for item in MUTATIONS
+        (item.artifact, pointer, keyword)
+        for item in MUTATIONS
+        for pointer, keyword in item.covered_constraints
     } | {(item.artifact, item.schema_pointer, item.keyword) for item in EXCLUSIONS}
 
 
 def _assert_isolated_rejection(mutation: Mutation, before: Any, invalid: Any) -> None:
-    errors = _leaf_errors(_schema(mutation.artifact).iter_errors(invalid))
-    found = {(_error_location(error), error.validator) for error in errors}
-    validators = {validator for _, validator in found}
-    # jsonschema reports a local $ref constraint at its use site; the inventory
-    # retains the referenced schema location so repeated refs stay distinct.
-    assert mutation.keyword in validators, (mutation, found)
-    # A failed selected oneOf branch necessarily reports the alternative branch
-    # requirements too; those are branch-discrimination contexts, not extra
-    # violations credited to this mutation.
-    if "/oneOf/" in mutation.schema_pointer:
-        oneof_root = mutation.schema_pointer.split("/oneOf/", 1)[0] + "/oneOf/"
-        assert validators == {mutation.keyword} and all(
-            location.startswith(oneof_root) for location, _ in found
-        ), (mutation, found)
-    else:
-        assert validators == {mutation.keyword}, (mutation, found)
+    found = _normalized_leaf_counter(mutation.artifact, invalid)
+    expected = Counter(mutation.expected_errors)
+    assert found == expected, (mutation, found, expected)
     assert not _runtime_accepts(mutation.artifact, invalid), mutation
+
+
+def test_reviewer_payload_oneof_probe_declares_all_branch_contexts() -> None:
+    """Removing payload makes every alternative fail; this is one conceptual proof."""
+    mutation = next(
+        item
+        for item in MUTATIONS
+        if item.artifact == "trace_event"
+        and item.seed == "payload-maximal"
+        and item.schema_pointer == "#/oneOf"
+    )
+    seed = next(
+        item
+        for item in SEED_VARIANTS
+        if item.artifact == mutation.artifact and item.name == mutation.seed
+    )
+    assert _normalized_leaf_counter(
+        mutation.artifact, mutation.apply(seed.value)
+    ) == Counter(
+        {
+            ("#/oneOf/0/required", "required", ""): 1,
+            ("#/oneOf/1/required", "required", ""): 1,
+            ("#/oneOf/2/required", "required", ""): 1,
+        }
+    )
+
+
+def test_reviewer_run_policy_ref_aliases_normalize_every_recovery_ladder_use() -> None:
+    aliases = _ref_aliases("run_policy")
+    recovery = ("properties", "recovery_ladder", "properties")
+    expected_targets = {
+        "nudge": ("$defs", "recovery_stage_permission"),
+        "diagnose": ("$defs", "recovery_stage_permission"),
+        "reheat": ("$defs", "recovery_stage_permission"),
+        "restart": ("$defs", "restart_stage_permission"),
+        "escalate": ("$defs", "escalation_stage_permission"),
+        "stop": ("$defs", "stop_stage_permission"),
+    }
+    assert {
+        recovery + (stage,): aliases[recovery + (stage,)] for stage in expected_targets
+    } == {recovery + (stage,): target for stage, target in expected_targets.items()}
+    normalized = [
+        _normalized_leaf_counter(item.artifact, item.apply(deepcopy(seed.value)))
+        for item in MUTATIONS
+        if item.artifact == "run_policy"
+        and item.seed == "maximal"
+        and item.instance_pointer.startswith("/recovery_ladder/")
+        for seed in SEED_VARIANTS
+        if seed.artifact == item.artifact and seed.name == item.seed
+    ]
+    assert len(normalized) == 30
+    assert all(
+        next(iter(errors))[0].startswith("#/$defs/") and len(errors) == 1
+        for errors in normalized
+    )
+
+
+def test_all_declared_mutations_have_zero_normalized_expectation_mismatches() -> None:
+    mismatches = []
+    for mutation in MUTATIONS:
+        seed = next(
+            item
+            for item in SEED_VARIANTS
+            if item.artifact == mutation.artifact and item.name == mutation.seed
+        )
+        found = _normalized_leaf_counter(mutation.artifact, mutation.apply(seed.value))
+        expected = Counter(mutation.expected_errors)
+        if found != expected:
+            mismatches.append((mutation.identity, found, expected))
+    assert mismatches == []
 
 
 def test_schema_complete_seed_inventory_and_runtime_parity() -> None:
