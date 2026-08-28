@@ -11,6 +11,7 @@ from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import corpus_support
 import pytest
 from corpus_support import (
     CorpusBudget,
@@ -413,6 +414,96 @@ def test_safe_corpus_reader_rejects_identity_swap_and_closes_descriptor(
         read_corpus((trace_path,), root=root, before_open=swap)
 
     assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_safe_corpus_reader_rejects_same_inode_root_swap_with_restored_mtime(
+    tmp_path: Path,
+) -> None:
+    original = b'{"safe":1}\n'
+    malicious = b'{"evil":1}\n'
+    assert len(original) == len(malicious)
+    root, trace_path = _write_corpus_trace(tmp_path, "sample.jsonl", original)
+    holder = tmp_path / "original-holder"
+    external = tmp_path / "external"
+    external.mkdir()
+
+    def swap_root(candidate: Path) -> None:
+        metadata = candidate.stat()
+        root.rename(holder)
+        (holder / candidate.name).replace(external / candidate.name)
+        root.symlink_to(external, target_is_directory=True)
+        (external / candidate.name).write_bytes(malicious)
+        os.utime(
+            external / candidate.name,
+            ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+        )
+
+    with pytest.raises(AssertionError, match="unsafe corpus input") as error:
+        read_corpus((trace_path,), root=root, before_open=swap_root)
+
+    assert str(tmp_path) not in str(error.value)
+
+
+def test_safe_corpus_reader_never_mixes_a_second_trace_from_a_swapped_root(
+    tmp_path: Path,
+) -> None:
+    first_raw = b'{"first":1}\n'
+    second_raw = b'{"safe":2}\n'
+    malicious = b'{"evil":2}\n'
+    assert len(second_raw) == len(malicious)
+    root, first = _write_corpus_trace(tmp_path, "first.jsonl", first_raw)
+    second = "benchmark/corpus/second.jsonl"
+    (root / "second.jsonl").write_bytes(second_raw)
+    holder = tmp_path / "original-holder"
+    external = tmp_path / "external"
+    external.mkdir()
+    calls = 0
+
+    def swap_before_second_open(candidate: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls != 2:
+            return
+        metadata = candidate.stat()
+        root.rename(holder)
+        (holder / candidate.name).replace(external / candidate.name)
+        root.symlink_to(external, target_is_directory=True)
+        (external / candidate.name).write_bytes(malicious)
+        os.utime(
+            external / candidate.name,
+            ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+        )
+
+    with pytest.raises(AssertionError, match="unsafe corpus input"):
+        read_corpus((first, second), root=root, before_open=swap_before_second_open)
+
+    assert calls == 2
+
+
+def test_safe_corpus_reader_closes_root_descriptor_on_success_and_hook_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, trace_path = _write_corpus_trace(tmp_path, "sample.jsonl", b"{}\n")
+    real_close = corpus_support.os.close
+    closed: list[int] = []
+
+    def tracking_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(corpus_support.os, "close", tracking_close)
+
+    read_corpus((trace_path,), root=root)
+    read_corpus((trace_path,), root=root)
+    assert len(closed) == 4
+
+    def fail_before_open(_: Path) -> None:
+        raise OSError("callback failure")
+
+    with pytest.raises(AssertionError, match="unsafe corpus input"):
+        read_corpus((trace_path,), root=root, before_open=fail_before_open)
+
+    assert len(closed) == 5
 
 
 @pytest.mark.parametrize("field", ("scenario_id", "trace_path"))

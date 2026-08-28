@@ -98,14 +98,36 @@ def _trace_name(trace_path: object) -> str:
     return name
 
 
-def _validated_root(root: Path) -> Path:
-    try:
-        metadata = root.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            _unsafe()
-        return root.resolve(strict=True)
-    except (OSError, ValueError):
+def _open_root(root: Path) -> tuple[int, os.stat_result]:
+    """Open the corpus root once and bind traversal to its descriptor.
+
+    This fail-closed capability check is test evidence only; Task14 needs a
+    production ingestion implementation rather than a path-based fallback.
+    """
+    if os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd:
         _unsafe()
+    fd = -1
+    accepted = False
+    try:
+        before = root.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            _unsafe()
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(root, flags)
+        during = os.fstat(fd)
+        if not stat.S_ISDIR(during.st_mode) or not _same_identity(before, during):
+            _unsafe()
+        accepted = True
+        return fd, during
+    except MemoryError:
+        raise
+    except Exception:  # noqa: BLE001 - sanitize ordinary test-reader failures.
+        _unsafe()
+    finally:
+        if fd >= 0 and not accepted:
+            os.close(fd)
 
 
 def _open_readonly(path: Path) -> int:
@@ -157,7 +179,9 @@ def read_small_public_file(
 
 
 def _read_trace(
-    path: Path,
+    root_fd: int,
+    name: str,
+    callback_path: Path,
     trace_path: str,
     *,
     limits: CorpusLimits,
@@ -165,7 +189,7 @@ def _read_trace(
     before_open: Callable[[Path], None] | None,
 ) -> CorpusTrace:
     try:
-        before = path.lstat()
+        before = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
             _unsafe()
         if before.st_size > limits.max_trace_bytes or before.st_size > remaining_bytes:
@@ -174,8 +198,14 @@ def _read_trace(
         _unsafe()
 
     if before_open is not None:
-        before_open(path)
-    fd = _open_readonly(path)
+        before_open(callback_path)
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=root_fd)
+    except (OSError, ValueError):
+        _unsafe()
     try:
         during = os.fstat(fd)
         if not stat.S_ISREG(during.st_mode) or not _same_identity(before, during):
@@ -212,12 +242,15 @@ def _read_trace(
         if line or not lines:
             _unsafe()
         after = os.fstat(fd)
+        named_after = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
         if (
             not stat.S_ISREG(after.st_mode)
             or not _same_identity(before, after)
             or after.st_size != before.st_size
             or after.st_mtime_ns != before.st_mtime_ns
             or total_bytes != before.st_size
+            or not stat.S_ISREG(named_after.st_mode)
+            or not _same_identity(before, named_after)
         ):
             _unsafe()
         return CorpusTrace(trace_path, tuple(lines), total_bytes)
@@ -246,20 +279,20 @@ def read_corpus(
         budget = CorpusBudget()
     if type(budget) is not CorpusBudget:
         raise ValueError("corpus budget must be CorpusBudget")
-    resolved_root = _validated_root(root)
-    running_total = budget.total_bytes
-    if running_total > limits.max_corpus_bytes:
-        _unsafe()
-    traces: list[CorpusTrace] = []
+    root_fd, _ = _open_root(root)
     try:
+        running_total = budget.total_bytes
+        if running_total > limits.max_corpus_bytes:
+            _unsafe()
+        traces: list[CorpusTrace] = []
         for trace_path in trace_paths:
             name = _trace_name(trace_path)
             candidate = root / name
             if candidate.parent != root:
                 _unsafe()
-            if not candidate.resolve(strict=True).is_relative_to(resolved_root):
-                _unsafe()
             trace = _read_trace(
+                root_fd,
+                name,
                 candidate,
                 trace_path,
                 limits=limits,
@@ -270,7 +303,11 @@ def read_corpus(
             if running_total > limits.max_corpus_bytes:
                 _unsafe()
             traces.append(trace)
-    except (OSError, TypeError, ValueError):
+        budget.total_bytes = running_total
+        return CorpusRead(tuple(traces), running_total)
+    except MemoryError:
+        raise
+    except Exception:  # noqa: BLE001 - sanitize ordinary test-reader failures.
         _unsafe()
-    budget.total_bytes = running_total
-    return CorpusRead(tuple(traces), running_total)
+    finally:
+        os.close(root_fd)
