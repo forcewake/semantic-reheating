@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import re
 import stat
+import time
 from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -391,6 +392,172 @@ def _assert_prompt_unsafe_child(
             process.join(timeout=1)
         results.close()
         results.join_thread()
+
+
+def _reader_rejects_post_preflight_child_fifo_flag_mutation_in_child(
+    base: str, results: object
+) -> None:
+    """Prove a callback cannot turn a checked child open into a blocking FIFO."""
+    import corpus_support as child_corpus_support
+
+    base_path = Path(base)
+    root = base_path / "corpus"
+    candidate = root / "sample.jsonl"
+    base_path.mkdir(parents=True, exist_ok=True)
+    root.mkdir()
+    candidate.write_bytes(b"{}\n")
+
+    def replace_with_fifo_after_preflight(path: Path) -> None:
+        child_corpus_support.os.O_NONBLOCK = 0
+        child_corpus_support.os.O_NOFOLLOW = 0
+        child_corpus_support.os.O_DIRECTORY = 0
+        path.unlink()
+        os.mkfifo(path)
+
+    try:
+        child_corpus_support.read_corpus(
+            ("benchmark/corpus/sample.jsonl",),
+            root=root,
+            before_open=replace_with_fifo_after_preflight,
+        )
+    except AssertionError as error:
+        results.put(str(error))  # type: ignore[union-attr]
+    else:
+        results.put("accepted")  # type: ignore[union-attr]
+
+
+def _reader_rejects_post_preflight_root_fifo_flag_mutation_in_child(
+    base: str, results: object
+) -> None:
+    """Prove a root lstat/open race cannot remove nonblocking directory flags."""
+    import corpus_support as child_corpus_support
+
+    base_path = Path(base)
+    root = base_path / "corpus"
+    holder = base_path / "original-root"
+    base_path.mkdir(parents=True, exist_ok=True)
+    root.mkdir()
+    (root / "sample.jsonl").write_bytes(b"{}\n")
+    real_lstat = Path.lstat
+    swapped = False
+
+    def swap_root_after_lstat(self: Path) -> os.stat_result:
+        nonlocal swapped
+        result = real_lstat(self)
+        if self == root and not swapped:
+            swapped = True
+            child_corpus_support.os.O_NONBLOCK = 0
+            child_corpus_support.os.O_NOFOLLOW = 0
+            child_corpus_support.os.O_DIRECTORY = 0
+            root.rename(holder)
+            os.mkfifo(root)
+        return result
+
+    Path.lstat = swap_root_after_lstat  # type: ignore[method-assign]
+    try:
+        child_corpus_support.read_corpus(("benchmark/corpus/sample.jsonl",), root=root)
+    except AssertionError as error:
+        results.put(str(error))  # type: ignore[union-attr]
+    else:
+        results.put("accepted")  # type: ignore[union-attr]
+
+
+def _reader_rejects_post_preflight_child_symlink_nofollow_mutation_in_child(
+    base: str, results: object
+) -> None:
+    """Prove a callback cannot remove O_NOFOLLOW before a child descriptor open."""
+    import corpus_support as child_corpus_support
+
+    base_path = Path(base)
+    root = base_path / "corpus"
+    candidate = root / "sample.jsonl"
+    external = base_path / "external.jsonl"
+    base_path.mkdir(parents=True, exist_ok=True)
+    root.mkdir()
+    candidate.write_bytes(b"{}\n")
+    external.write_bytes(b'{"external":true}\n')
+    original_nofollow = child_corpus_support.os.O_NOFOLLOW
+    real_open = child_corpus_support.os.open
+    protected_open = False
+
+    def assert_nofollow(path: str | Path, flags: int, *args: Any, **kwargs: Any) -> int:
+        nonlocal protected_open
+        if path == "sample.jsonl":
+            protected_open = flags & original_nofollow == original_nofollow
+            if not protected_open:
+                raise OSError("child open lost O_NOFOLLOW")
+        return real_open(path, flags, *args, **kwargs)
+
+    def replace_with_external_symlink_after_preflight(path: Path) -> None:
+        child_corpus_support.os.O_NOFOLLOW = 0
+        path.unlink()
+        path.symlink_to(external)
+
+    child_corpus_support.os.open = assert_nofollow
+    child_corpus_support.os.supports_dir_fd = (
+        child_corpus_support.os.supports_dir_fd | {assert_nofollow}
+    )
+    try:
+        child_corpus_support.read_corpus(
+            ("benchmark/corpus/sample.jsonl",),
+            root=root,
+            before_open=replace_with_external_symlink_after_preflight,
+        )
+    except AssertionError as error:
+        results.put((str(error), protected_open))  # type: ignore[union-attr]
+    else:
+        results.put(("accepted", protected_open))  # type: ignore[union-attr]
+
+
+def _assert_prompt_child_result(
+    target: Callable[[str, object], None], base: Path, expected: object
+) -> None:
+    results = multiprocessing.Queue()
+    process = multiprocessing.Process(target=target, args=(str(base), results))
+    started = time.monotonic()
+    try:
+        process.start()
+        process.join(timeout=1)
+        elapsed = time.monotonic() - started
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1)
+            pytest.fail("safe corpus reader blocked after post-preflight flag mutation")
+        assert elapsed < 1
+        assert process.exitcode == 0
+        assert results.get(timeout=1) == expected
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=1)
+        results.close()
+        results.join_thread()
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    (
+        (
+            _reader_rejects_post_preflight_child_fifo_flag_mutation_in_child,
+            "unsafe corpus input",
+        ),
+        (
+            _reader_rejects_post_preflight_root_fifo_flag_mutation_in_child,
+            "unsafe corpus input",
+        ),
+        (
+            _reader_rejects_post_preflight_child_symlink_nofollow_mutation_in_child,
+            ("unsafe corpus input", True),
+        ),
+    ),
+)
+def test_safe_corpus_reader_captures_descriptor_flags_before_mutable_races(
+    tmp_path: Path,
+    target: Callable[[str, object], None],
+    expected: object,
+) -> None:
+    for attempt in range(3):
+        _assert_prompt_child_result(target, tmp_path / str(attempt), expected)
 
 
 def test_safe_corpus_reader_rejects_missing_nonblocking_before_fifo_swap_blocks(

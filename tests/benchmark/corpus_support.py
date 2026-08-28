@@ -72,20 +72,46 @@ class CorpusRead:
     total_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class _DescriptorCapabilities:
+    """Validated descriptor flags captured once for one trusted read."""
+
+    nonblock: int
+    nofollow: int
+    directory: int
+
+    def __post_init__(self) -> None:
+        if any(
+            type(flag) is not int or flag <= 0
+            for flag in (self.nonblock, self.nofollow, self.directory)
+        ):
+            raise ValueError(
+                "descriptor capabilities must be positive built-in integers"
+            )
+
+
 def _unsafe() -> NoReturn:
     raise AssertionError("unsafe corpus input")
 
 
-def _require_descriptor_capabilities() -> None:
-    """Reject platforms lacking every descriptor safety primitive this reader uses."""
-    if os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd:
-        _unsafe()
+def _require_descriptor_capabilities() -> _DescriptorCapabilities:
+    """Capture and validate descriptor primitives before a trusted read begins."""
     try:
-        flags = (os.O_NONBLOCK, os.O_NOFOLLOW, os.O_DIRECTORY)
-    except AttributeError:
+        has_dir_fd_support = (
+            os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
+        )
+        nonblock = os.O_NONBLOCK
+        nofollow = os.O_NOFOLLOW
+        directory = os.O_DIRECTORY
+    except (AttributeError, TypeError):
         _unsafe()
-    if any(type(flag) is not int or flag <= 0 for flag in flags):
+    if not has_dir_fd_support:
         _unsafe()
+    if any(
+        type(flag) is not int or flag <= 0 for flag in (nonblock, nofollow, directory)
+    ):
+        _unsafe()
+    return _DescriptorCapabilities(nonblock, nofollow, directory)
 
 
 def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -110,7 +136,7 @@ def _trace_name(trace_path: object) -> str:
     return name
 
 
-def _open_root(root: Path) -> tuple[int, os.stat_result]:
+def _open_root(root: Path, caps: _DescriptorCapabilities) -> tuple[int, os.stat_result]:
     """Open the corpus root once and bind traversal to its descriptor.
 
     This fail-closed capability check is test evidence only; Task14 needs a
@@ -122,10 +148,7 @@ def _open_root(root: Path) -> tuple[int, os.stat_result]:
         before = root.lstat()
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
             _unsafe()
-        flags = os.O_RDONLY
-        flags |= os.O_NONBLOCK
-        flags |= os.O_DIRECTORY
-        flags |= os.O_NOFOLLOW
+        flags = caps.nonblock | caps.directory | caps.nofollow
         fd = os.open(root, flags)
         during = os.fstat(fd)
         if not stat.S_ISDIR(during.st_mode) or not _same_identity(before, during):
@@ -141,10 +164,8 @@ def _open_root(root: Path) -> tuple[int, os.stat_result]:
             os.close(fd)
 
 
-def _open_readonly(path: Path) -> int:
-    flags = os.O_RDONLY
-    flags |= os.O_NONBLOCK
-    flags |= os.O_NOFOLLOW
+def _open_readonly(path: Path, caps: _DescriptorCapabilities) -> int:
+    flags = caps.nonblock | caps.nofollow
     try:
         return os.open(path, flags)
     except (OSError, ValueError):
@@ -155,7 +176,7 @@ def read_small_public_file(
     path: Path, *, max_bytes: int = MAX_SMALL_PUBLIC_BYTES
 ) -> bytes:
     """Read a small trusted JSON asset only after an explicit byte-size cap."""
-    _require_descriptor_capabilities()
+    caps = _require_descriptor_capabilities()
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ValueError("small-file limit must be a positive built-in integer")
     try:
@@ -166,7 +187,7 @@ def read_small_public_file(
             _unsafe()
     except (OSError, ValueError):
         _unsafe()
-    fd = _open_readonly(path)
+    fd = _open_readonly(path, caps)
     try:
         during = os.fstat(fd)
         if not stat.S_ISREG(during.st_mode) or not _same_identity(before, during):
@@ -196,6 +217,7 @@ def _read_trace(
     callback_path: Path,
     trace_path: str,
     *,
+    caps: _DescriptorCapabilities,
     limits: CorpusLimits,
     remaining_bytes: int,
     before_open: Callable[[Path], None] | None,
@@ -211,9 +233,7 @@ def _read_trace(
 
     if before_open is not None:
         before_open(callback_path)
-    flags = os.O_RDONLY
-    flags |= os.O_NONBLOCK
-    flags |= os.O_NOFOLLOW
+    flags = caps.nonblock | caps.nofollow
     try:
         fd = os.open(name, flags, dir_fd=root_fd)
     except (OSError, ValueError):
@@ -285,14 +305,14 @@ def read_corpus(
     This helper is test-data validation evidence only; production ingestion needs
     its own trust-boundary implementation.
     """
-    _require_descriptor_capabilities()
+    caps = _require_descriptor_capabilities()
     if type(limits) is not CorpusLimits:
         raise ValueError("corpus limits must be CorpusLimits")
     if budget is None:
         budget = CorpusBudget()
     if type(budget) is not CorpusBudget:
         raise ValueError("corpus budget must be CorpusBudget")
-    root_fd, _ = _open_root(root)
+    root_fd, _ = _open_root(root, caps)
     try:
         running_total = budget.total_bytes
         if running_total > limits.max_corpus_bytes:
@@ -308,6 +328,7 @@ def read_corpus(
                 name,
                 candidate,
                 trace_path,
+                caps=caps,
                 limits=limits,
                 remaining_bytes=limits.max_corpus_bytes - running_total,
                 before_open=before_open,
