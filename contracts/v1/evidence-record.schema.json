@@ -60,12 +60,19 @@
       "description": "Closed recovery trigger."
     },
     "chosen_policy": {
-      "type": "string",
+      "type": [
+        "string",
+        "null"
+      ],
       "enum": [
         "policy-standard",
-        "policy-conservative"
+        "policy-conservative",
+        "research",
+        "branch",
+        "model_switch",
+        null
       ],
-      "description": "Closed chosen policy identifier."
+      "description": "Closed chosen policy identifier or null."
     },
     "actual_counters": {
       "type": "object",
