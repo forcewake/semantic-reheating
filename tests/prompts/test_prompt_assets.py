@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -456,7 +457,19 @@ def _validate_annealing_hygiene(text: str) -> None:
         assert _section(text, section_name).count(exact) == 1
     assert text.count(exact) == len(required_sections)
     remaining = text.replace(exact, "")
-    assert "simulated annealing" not in remaining.lower()
+    assert not any(
+        unicodedata.category(character) in {"Cc", "Cf"}
+        and character not in {"\n", "\t"}
+        for character in remaining
+    ), "residual annealing text contains unsafe Unicode control or format characters"
+    normalized = unicodedata.normalize("NFKC", remaining).casefold()
+    without_html_markup = re.sub(r"<[a-z][^>\n]{0,256}>", "", normalized)
+    compact = "".join(
+        character
+        for character in without_html_markup
+        if character.isascii() and character.isalnum()
+    )
+    assert "simulatedannealing" not in compact
     assert not re.search(
         r"\bdecoding[- ]temperature control\b", remaining, re.IGNORECASE
     )
@@ -470,12 +483,24 @@ def test_bounded_reheating_has_only_the_exact_strict_annealing_nonclaim() -> Non
         text.replace("not simulated annealing", "simulated annealing", 1),
         text.replace("strict mathematical ", "", 1),
         f"{text}\nSemantic reheating is simulated annealing.\n",
+        f"{text}\nSemantic reheating is simulated  annealing.\n",
+        f"{text}\nSemantic reheating is simulated\tannealing.\n",
+        f"{text}\nSemantic reheating is simulated **annealing**.\n",
+        f"{text}\nSemantic reheating is simulated\nannealing.\n",
+        f"{text}\nSemantic reheating is simulated_annealing.\n",
+        f"{text}\nSemantic reheating is simulated`annealing`.\n",
+        f"{text}\nSemantic reheating is simu**lated annealing**.\n",
+        f"{text}\nSemantic reheating is simulated <em>annealing</em>.\n",
+        f"{text}\nSemantic reheating is simulated\u200bannealing.\n",
         f"{text}\nSemantic reheating equals simulated annealing.\n",
         f"{text}\nSemantic reheating is equivalent to simulated annealing.\n",
         f"{text}\n{exact}\n",
     ):
         with pytest.raises(AssertionError):
             _validate_annealing_hygiene(mutation)
+    _validate_annealing_hygiene(
+        f"{text}\nA simulated read precedes separate annealing diagnostics.\n"
+    )
 
 
 @pytest.mark.parametrize("path", _prompt_paths(), ids=lambda path: path.name)
