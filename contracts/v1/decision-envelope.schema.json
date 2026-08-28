@@ -281,6 +281,84 @@
       "description": "Redacted public human summary.",
       "minLength": 1,
       "maxLength": 2000
+    },
+    "diagnosed_gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "missing_evidence",
+              "ambiguous_goal",
+              "failed_acceptance",
+              "stalled_progress",
+              "risk_blocker"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        },
+        "required": [
+          "kind",
+          "description"
+        ]
+      },
+      "minItems": 0,
+      "maxItems": 16,
+      "description": "Closed portable diagnosed recovery gaps."
+    },
+    "rejected_hypothesis_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^rejected-hypothesis-[0-9a-f]{24}$"
+      },
+      "minItems": 0,
+      "maxItems": 100,
+      "uniqueItems": true,
+      "description": "Redacted rejected-hypothesis references."
+    },
+    "detector_notices": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "detector_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "degraded",
+              "unavailable"
+            ]
+          },
+          "notice": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        },
+        "required": [
+          "detector_name",
+          "status",
+          "notice"
+        ]
+      },
+      "minItems": 0,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "description": "Structured fixed redacted detector availability notices."
     }
   },
   "required": [
@@ -296,7 +374,10 @@
     "cooling_conditions",
     "confidence",
     "requires_host_action",
-    "human_summary"
+    "human_summary",
+    "diagnosed_gaps",
+    "rejected_hypothesis_refs",
+    "detector_notices"
   ],
   "allOf": [
     {

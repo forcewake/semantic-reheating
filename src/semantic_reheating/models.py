@@ -589,6 +589,19 @@ class DecisionConfidence:
     contributing_findings: tuple[ContributingFinding, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class DiagnosedGap:
+    kind: str
+    description: str
+
+
+@dataclass(frozen=True, slots=True)
+class DetectorNotice:
+    detector_name: str
+    status: str
+    notice: str
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class DecisionEnvelope:
     contract_version: str
@@ -602,6 +615,9 @@ class DecisionEnvelope:
     constraints: DecisionConstraints
     cooling_conditions: CoolingConditions
     confidence: DecisionConfidence
+    diagnosed_gaps: tuple[DiagnosedGap, ...]
+    rejected_hypothesis_refs: tuple[str, ...]
+    detector_notices: tuple[DetectorNotice, ...]
     requires_host_action: bool
     human_summary: str
     _source: Any = field(repr=False, compare=False, hash=False, default=None)
@@ -646,6 +662,15 @@ class DecisionEnvelope:
                     )
                     for item in confidence["contributing_findings"]
                 ),
+            ),
+            diagnosed_gaps=tuple(
+                DiagnosedGap(item["kind"], item["description"])
+                for item in value["diagnosed_gaps"]
+            ),
+            rejected_hypothesis_refs=tuple(value["rejected_hypothesis_refs"]),
+            detector_notices=tuple(
+                DetectorNotice(item["detector_name"], item["status"], item["notice"])
+                for item in value["detector_notices"]
             ),
             requires_host_action=value["requires_host_action"],
             human_summary=value["human_summary"],

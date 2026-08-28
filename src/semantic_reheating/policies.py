@@ -331,6 +331,85 @@ def _copy_json(value: Any) -> Any:
     return value
 
 
+def recovery_gaps_for_causes(
+    cause_classes: tuple[CauseClass, ...],
+) -> list[dict[str, str]]:
+    """Return fixed public gaps in established cause order and multiplicity."""
+    return [
+        {"kind": _RECOVERY_GAPS[cause][0], "description": _RECOVERY_GAPS[cause][1]}
+        for cause in cause_classes
+    ]
+
+
+def recovery_instruction_source(
+    *,
+    run_id: str,
+    diagnosed_gaps: list[dict[str, str]],
+    recovery_budget: dict[str, Any],
+    evidence_refs: list[str],
+    rejected_hypothesis_refs: list[str],
+    cooling_conditions: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the shared deterministic Task10/Task11 advisory instruction basis."""
+    basis: dict[str, Any] = {
+        "contract_version": "1.0",
+        "run_id": run_id,
+        "selected_prompt_asset_id": "prompt-reheat-v1",
+        "variables": [
+            {
+                "name": "constraint",
+                "value": "Produce exactly three mutually exclusive, falsifiable hypotheses and one discriminating read-only test per hypothesis.",
+            },
+            {
+                "name": "evidence_summary",
+                "value": "Preserve the referenced public evidence identifiers.",
+            },
+            {
+                "name": "next_step",
+                "value": "Return advisory structured output to the host runtime without executing tools.",
+            },
+        ],
+        "diagnosed_gaps": _copy_json(diagnosed_gaps),
+        "recovery_budget": _copy_json(recovery_budget),
+        "allowed_tools": ["read_only", "analysis", "validation"],
+        "forbidden_actions": [
+            "credential_access",
+            "authority_grant",
+            "network_publish",
+            "non_idempotent_repeat",
+        ],
+        "evidence_refs": list(evidence_refs),
+        "rejected_hypothesis_refs": list(rejected_hypothesis_refs),
+        "expected_output": {
+            "kind": "plan",
+            "required_sections": [
+                "summary",
+                "evidence",
+                "constraints",
+                "next_steps",
+                "stop_conditions",
+            ],
+            "max_characters": 6000,
+            "hypothesis_contract": _copy_json(_HYPOTHESIS_CONTRACT),
+        },
+        "cooling_conditions": _copy_json(cooling_conditions),
+        "stop_conditions": [
+            "budget_exhausted",
+            "host_denial",
+            "risk_detected",
+            "acceptance_met",
+            "cooling_required",
+        ],
+        "advisory_only": True,
+        "grants_authority": False,
+    }
+    return {
+        "instruction_id": "instruction-"
+        + sha256(canonicalize_json(basis)).hexdigest()[:24],
+        **basis,
+    }
+
+
 def _validate_reheat_selection(
     selection: PolicySelection, diagnosis: Diagnosis, policy: RunPolicy
 ) -> None:
@@ -416,13 +495,7 @@ def construct_recovery_instruction(
                     ),
                 },
             ],
-            "diagnosed_gaps": [
-                {
-                    "kind": _RECOVERY_GAPS[cause][0],
-                    "description": _RECOVERY_GAPS[cause][1],
-                }
-                for cause in fresh_diagnosis.cause_classes
-            ],
+            "diagnosed_gaps": recovery_gaps_for_causes(fresh_diagnosis.cause_classes),
             "recovery_budget": _copy_json(policy_data["budgets"]["per_intervention"]),
             "allowed_tools": ["read_only", "analysis", "validation"],
             "forbidden_actions": [

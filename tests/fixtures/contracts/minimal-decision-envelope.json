@@ -44,5 +44,8 @@
     ]
   },
   "requires_host_action": true,
-  "human_summary": "Redacted host action request."
+  "human_summary": "Redacted host action request.",
+  "diagnosed_gaps": [],
+  "rejected_hypothesis_refs": [],
+  "detector_notices": []
 }

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from hashlib import sha256
 from itertools import pairwise
 from re import compile as re_compile
-from typing import Any, NoReturn
+from types import MappingProxyType
+from typing import Any, NoReturn, Protocol
 
 from .canonical import action_fingerprint, canonicalize_json
 from .detectors.acceptance_stall import detect_acceptance_stall
@@ -24,7 +26,11 @@ from .models import (
     TraceEvent,
     TraceKind,
 )
-from .policies import select_recovery_policy
+from .policies import (
+    recovery_gaps_for_causes,
+    recovery_instruction_source,
+    select_recovery_policy,
+)
 from .validation import validate_public_artifact
 
 _MAX_ITEMS = 10_000
@@ -47,9 +53,6 @@ _SUMMARIES = {
     Decision.ESCALATE: "Request host action for the bounded escalation.",
     Decision.STOP: "Stop automated activity and preserve evidence.",
 }
-_DEGRADED_SEMANTIC_SENTENCE = (
-    " Semantic detector is unavailable; deterministic analysis continued."
-)
 
 
 class ControllerError(ValueError):
@@ -58,6 +61,73 @@ class ControllerError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__("Invalid controller input")
+
+
+class SemanticDetector(Protocol):
+    """Injected pure detector returning exactly one detector-finding mapping."""
+
+    def detect(
+        self, trace: tuple[TraceEvent, ...], policy: RunPolicy
+    ) -> Mapping[str, Any]: ...
+
+
+def _freeze_instruction(value: Any) -> Any:
+    if type(value) is dict:
+        return MappingProxyType(
+            {key: _freeze_instruction(item) for key, item in value.items()}
+        )
+    if type(value) is list:
+        return tuple(_freeze_instruction(item) for item in value)
+    return value
+
+
+def _thaw_instruction(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_instruction(item) for key, item in value.items()}
+    if type(value) is tuple:
+        return [_thaw_instruction(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class RecoveryInstruction:
+    """Strict portable advisory instruction; it neither executes nor grants authority."""
+
+    _source: Any = field(repr=False, compare=False, hash=False, default=None)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise ControllerError("validated_construction_required")
+
+    @staticmethod
+    def from_dict(data: Any) -> RecoveryInstruction:
+        try:
+            source = validate_public_artifact("recovery_instruction", data)
+            if type(source) is not dict:
+                _fail("invalid_recovery_instruction")
+            instance = object.__new__(RecoveryInstruction)
+            object.__setattr__(instance, "_source", _freeze_instruction(source))
+            return instance
+        except (MemoryError, SystemExit, ControllerError):
+            raise
+        except Exception:  # noqa: BLE001 - public instruction boundary is sanitized.
+            _fail("invalid_recovery_instruction")
+
+    def to_dict(self) -> dict[str, Any]:
+        try:
+            if type(self._source) is not MappingProxyType:
+                _fail("invalid_recovery_instruction")
+            source = _thaw_instruction(self._source)
+            fresh = validate_public_artifact("recovery_instruction", source)
+            if type(fresh) is not dict:
+                _fail("invalid_recovery_instruction")
+            return fresh
+        except (MemoryError, SystemExit, ControllerError):
+            raise
+        except Exception:  # noqa: BLE001 - public instruction boundary is sanitized.
+            _fail("invalid_recovery_instruction")
+
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        return (RecoveryInstruction.from_dict, (self.to_dict(),))
 
 
 def _fail(code: str) -> NoReturn:
@@ -253,7 +323,9 @@ def _hard_risk_finding(
 
 
 def _weighted_contributions(
-    findings: tuple[dict[str, Any], ...], policy: RunPolicy
+    findings: tuple[dict[str, Any], ...],
+    policy: RunPolicy,
+    semantic_finding_ids: frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     weights = {
         "repetition": float(policy.detectors.weights.repetition),
@@ -267,7 +339,12 @@ def _weighted_contributions(
         if finding["matched"] is not True:
             continue
         finding_class = finding["finding_class"]
-        weight = weights[finding_class]
+        weight = (
+            float(policy.detectors.semantic_detector.weight)
+            if finding["finding_id"] in semantic_finding_ids
+            and policy.detectors.semantic_detector is not None
+            else weights[finding_class]
+        )
         score = float(finding["score"])
         weighted_score = min(1.0, max(0.0, weight * score))
         contributions.append(
@@ -290,11 +367,15 @@ def _envelope_source(
     trace: tuple[TraceEvent, ...],
     policy: RunPolicy,
     findings: tuple[dict[str, Any], ...],
+    detector_notices: tuple[dict[str, str], ...] = (),
+    semantic_finding_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     try:
         diagnosis = diagnose(trace, findings)
         selection = select_recovery_policy(diagnosis, findings, policy)
-        contributions, class_scores = _weighted_contributions(findings, policy)
+        contributions, class_scores = _weighted_contributions(
+            findings, policy, semantic_finding_ids
+        )
         hard_stop = any(
             finding["matched"] is True
             and finding["finding_class"] in {"risk", "budget"}
@@ -311,15 +392,15 @@ def _envelope_source(
             if effect in (EffectClass.READ_ONLY, EffectClass.IDEMPOTENT_WRITE)
         ]
         summary = _SUMMARIES[selection.decision]
-        semantic = policy.detectors.semantic_detector
-        if semantic is not None and semantic.enabled and not semantic.required:
-            summary += _DEGRADED_SEMANTIC_SENTENCE
         basis = {
             "contract_version": "1.0",
             "run_id": trace[0].run_id,
             "decision": selection.decision.value,
             "reason_codes": list(selection.reason_codes),
             "evidence_event_ids": list(selection.evidence_event_ids),
+            "diagnosed_gaps": recovery_gaps_for_causes(diagnosis.cause_classes),
+            "rejected_hypothesis_refs": list(diagnosis.rejected_hypothesis_refs),
+            "detector_notices": [dict(item) for item in detector_notices],
             "recovery_policy": (
                 selection.recovery_policy.value
                 if selection.recovery_policy is not None
@@ -354,16 +435,80 @@ def _envelope_source(
         _fail("invalid_controller_assembly")
 
 
+def _semantic_finding(
+    trace: tuple[TraceEvent, ...], policy: RunPolicy, detector: Any
+) -> tuple[dict[str, Any] | None, tuple[dict[str, str], ...]]:
+    """Call the injected detector once; any optional failure is a structured notice."""
+    semantic = policy.detectors.semantic_detector
+    if semantic is None or not semantic.enabled:
+        return None, ()
+    if detector is None:
+        if semantic.required:
+            _fail("required_detector_unavailable")
+        return None, (
+            (
+                {
+                    "detector_name": "semantic_detector",
+                    "status": "unavailable",
+                    "notice": "Semantic detector unavailable; deterministic analysis continued.",
+                }
+            ),
+        )
+    try:
+        result = detector.detect(trace, policy)
+        if type(result) is not dict:
+            _fail("invalid_semantic_detector_finding")
+        finding = _validated_detector_findings((result,), trace[0].run_id)[0]
+        if finding["finding_class"] not in {"repetition", "no_progress"}:
+            _fail("invalid_semantic_detector_finding")
+        availability = finding["availability"]
+        if availability["status"] != "available":
+            if semantic.required:
+                _fail("required_detector_unavailable")
+            status = availability["status"]
+            notice = (
+                "Semantic detector degraded; deterministic analysis continued."
+                if status == "degraded"
+                else "Semantic detector unavailable; deterministic analysis continued."
+            )
+            return None, (
+                (
+                    {
+                        "detector_name": finding["detector_name"],
+                        "status": status,
+                        "notice": notice,
+                    }
+                ),
+            )
+        return finding, ()
+    except (MemoryError, SystemExit, ControllerError):
+        raise
+    except Exception:  # noqa: BLE001 - optional detector boundary is sanitized.
+        if semantic.required:
+            _fail("required_detector_unavailable")
+        return None, (
+            (
+                {
+                    "detector_name": "semantic_detector",
+                    "status": "degraded",
+                    "notice": "Semantic detector degraded; deterministic analysis continued.",
+                }
+            ),
+        )
+
+
 def analyze(
     trace: Sequence[TraceEvent], policy: RunPolicy, *, semantic_detector: Any = None
 ) -> DecisionEnvelope:
-    """Aggregate deterministic findings without invoking tools or a semantic detector."""
+    """Purely aggregate deterministic findings plus one optional injected finding.
+
+    A host reports a new trace episode; stateless analysis needs independent
+    detector support IDs before it can produce a different reheat decision ID.
+    """
     parsed_trace, parsed_policy = _validated_inputs(trace, policy)
-    if semantic_detector is not None:
-        _fail("semantic_detector_not_implemented")
-    semantic = parsed_policy.detectors.semantic_detector
-    if semantic is not None and semantic.enabled and semantic.required:
-        _fail("required_detector_unavailable")
+    semantic_finding, detector_notices = _semantic_finding(
+        parsed_trace, parsed_policy, semantic_detector
+    )
     raw_findings: list[Any] = []
     try:
         for detector in _DETECTORS:
@@ -379,8 +524,18 @@ def analyze(
         findings.append(hard_budget)
     if hard_risk is not None:
         findings.append(hard_risk)
+    semantic_finding_ids: frozenset[str] = frozenset()
+    if semantic_finding is not None:
+        findings.append(semantic_finding)
+        semantic_finding_ids = frozenset((semantic_finding["finding_id"],))
     validated_findings = _validated_detector_findings(findings, parsed_trace[0].run_id)
-    source = _envelope_source(parsed_trace, parsed_policy, validated_findings)
+    source = _envelope_source(
+        parsed_trace,
+        parsed_policy,
+        validated_findings,
+        detector_notices,
+        semantic_finding_ids,
+    )
     try:
         envelope = DecisionEnvelope.from_dict(source)
     except (MemoryError, SystemExit):
@@ -392,4 +547,85 @@ def analyze(
     return envelope
 
 
-__all__ = ["ControllerError", "analyze"]
+def build_recovery_instruction(
+    decision: DecisionEnvelope,
+) -> RecoveryInstruction | None:
+    """Build a portable, advisory instruction from a serialized decision only.
+
+    The host owns execution and reports a new independent trace episode for any
+    later analysis; this function never calls tools, providers, or the host.
+    """
+    if type(decision) is not DecisionEnvelope:
+        _fail("invalid_recovery_decision")
+    try:
+        fresh = DecisionEnvelope.from_dict(decision.to_dict())
+        if decision != fresh:
+            _fail("invalid_recovery_decision")
+    except (MemoryError, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - typed decision boundary is sanitized.
+        _fail("invalid_recovery_decision")
+    if fresh.decision is not Decision.REHEAT:
+        return None
+    try:
+        source = fresh.to_dict()
+        expected_id = (
+            "decision-"
+            + sha256(
+                canonicalize_json(
+                    {
+                        key: value
+                        for key, value in source.items()
+                        if key != "decision_id"
+                    }
+                )
+            ).hexdigest()[:24]
+        )
+        expected_reasons = (
+            "signals_agree",
+            "repetition_detected",
+            "no_progress_detected",
+        ) + (("host_action_required",) if fresh.requires_host_action else ())
+        invalid = (
+            source["decision_id"] != expected_id
+            or fresh.recovery_policy not in {"research", "branch", "model_switch"}
+            or fresh.reason_codes != expected_reasons
+            or not fresh.constraints.must_preserve_evidence
+            or not fresh.constraints.no_non_idempotent_repeat
+            or EffectClass.READ_ONLY not in fresh.constraints.allowed_effect_classes
+            or any(
+                item.finding_class.value in {"risk", "budget"}
+                for item in fresh.confidence.contributing_findings
+            )
+        )
+        if invalid:
+            _fail("invalid_recovery_decision")
+        instruction_source = recovery_instruction_source(
+            run_id=fresh.run_id,
+            diagnosed_gaps=[
+                {"kind": gap.kind, "description": gap.description}
+                for gap in fresh.diagnosed_gaps
+            ],
+            recovery_budget=fresh.recovery_budget.to_dict(),
+            evidence_refs=list(fresh.evidence_event_ids),
+            rejected_hypothesis_refs=list(fresh.rejected_hypothesis_refs),
+            cooling_conditions={
+                "minimum_elapsed_seconds": fresh.cooling_conditions.minimum_elapsed_seconds,
+                "require_new_evidence": fresh.cooling_conditions.require_new_evidence,
+                "minimum_acceptance_gain": fresh.cooling_conditions.minimum_acceptance_gain,
+            },
+        )
+        return RecoveryInstruction.from_dict(instruction_source)
+    except (MemoryError, SystemExit, ControllerError):
+        raise
+    except Exception:  # noqa: BLE001 - instruction assembly is sanitized.
+        _fail("invalid_recovery_decision")
+
+
+__all__ = [
+    "ControllerError",
+    "RecoveryInstruction",
+    "SemanticDetector",
+    "analyze",
+    "build_recovery_instruction",
+]

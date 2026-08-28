@@ -307,10 +307,8 @@ def test_analyze_is_canonical_deterministic_and_semantic_seam_is_fail_closed() -
 
     optional = _policy(detectors__semantic_detector__enabled=True)
     degraded = analyze(trace, optional)
-    assert (
-        "Semantic detector is unavailable; deterministic analysis continued."
-        in degraded.human_summary
-    )
+    assert degraded.detector_notices[0].status == "unavailable"
+    assert "Semantic detector" not in degraded.human_summary
     required = _policy(
         detectors__semantic_detector__enabled=True,
         detectors__semantic_detector__required=True,
@@ -318,9 +316,272 @@ def test_analyze_is_canonical_deterministic_and_semantic_seam_is_fail_closed() -
     with pytest.raises(ControllerError) as caught:
         analyze(trace, required)
     assert caught.value.code == "required_detector_unavailable"
+
+    class DisabledDetector:
+        calls = 0
+
+        def detect(self, *_: Any) -> dict[str, Any]:
+            self.calls += 1
+            raise AssertionError("disabled detector must not run")
+
+    disabled_detector = DisabledDetector()
+    assert (
+        analyze(trace, policy, semantic_detector=disabled_detector).to_dict()
+        == first.to_dict()
+    )
+    assert disabled_detector.calls == 0
+
+
+def test_envelope_carries_portable_redacted_recovery_context() -> None:
+    """A serialized envelope retains the only public recovery provenance."""
+    from semantic_reheating.controller import analyze
+    from semantic_reheating.models import DecisionEnvelope
+
+    trace = _repetition_and_stall_trace()
+    trace[2] = _event(
+        3,
+        "plan",
+        payload={
+            "diagnostic_cause": "missing_knowledge",
+            "eliminated_hypotheses": ["password=not-public"],
+        },
+    )
+    envelope = analyze(trace, _policy(detectors__semantic_detector__enabled=False))
+    restored = DecisionEnvelope.from_dict(json.loads(json.dumps(envelope.to_dict())))
+
+    assert [(gap.kind, gap.description) for gap in restored.diagnosed_gaps] == [
+        ("missing_evidence", "Required evidence is unavailable."),
+    ]
+    assert len(restored.rejected_hypothesis_refs) == 1
+    assert "password=not-public" not in repr(restored)
+    assert "password=not-public" not in json.dumps(restored.to_dict())
+    assert restored.detector_notices == ()
+
+
+def test_semantic_detector_is_injected_once_and_separately_metered() -> None:
+    from semantic_reheating.controller import analyze
+
+    class Detector:
+        calls = 0
+
+        def detect(self, trace: tuple[Any, ...], policy: Any) -> dict[str, Any]:
+            self.calls += 1
+            return {
+                "contract_version": "1.0",
+                "run_id": trace[0].run_id,
+                "finding_id": "semantic-finding",
+                "detector_name": "semantic",
+                "detector_version": "1.0",
+                "matched": True,
+                "score": 0.5,
+                "finding_class": "repetition",
+                "event_ids": [trace[0].event_id],
+                "reason_code": "repetition_detected",
+                "explanation": "Redacted.",
+                "availability": {"status": "available", "notice": "Available."},
+            }
+
+    detector = Detector()
+    envelope = analyze(
+        _repetition_and_stall_trace(),
+        _policy(
+            detectors__semantic_detector__enabled=True,
+            detectors__semantic_detector__weight=0.2,
+        ),
+        semantic_detector=detector,
+    )
+
+    assert detector.calls == 1
+    assert envelope.confidence.contributing_findings[-1].weight == 0.2
+    assert envelope.detector_notices == ()
+
+
+def test_optional_semantic_degradation_is_fixed_and_structured() -> None:
+    from semantic_reheating.controller import analyze
+
+    class DegradedDetector:
+        def detect(self, trace: tuple[Any, ...], _: Any) -> dict[str, Any]:
+            return {
+                "contract_version": "1.0",
+                "run_id": trace[0].run_id,
+                "finding_id": "semantic-degraded",
+                "detector_name": "semantic",
+                "detector_version": "1.0",
+                "matched": False,
+                "score": 0,
+                "finding_class": "repetition",
+                "event_ids": [trace[0].event_id],
+                "reason_code": "detector_degraded",
+                "explanation": "SECRET-MUST-NOT-LEAK",
+                "availability": {
+                    "status": "degraded",
+                    "notice": "SECRET-MUST-NOT-LEAK",
+                },
+            }
+
+    envelope = analyze(
+        _repetition_and_stall_trace(),
+        _policy(detectors__semantic_detector__enabled=True),
+        semantic_detector=DegradedDetector(),
+    )
+
+    assert envelope.detector_notices[0].status == "degraded"
+    assert envelope.detector_notices[0].notice == (
+        "Semantic detector degraded; deterministic analysis continued."
+    )
+    assert "SECRET-MUST-NOT-LEAK" not in repr(envelope)
+
+
+def test_build_recovery_instruction_is_portable_and_advisory() -> None:
+    from semantic_reheating.controller import (
+        ControllerError,
+        analyze,
+        build_recovery_instruction,
+    )
+
+    decision = analyze(
+        _repetition_and_stall_trace(),
+        _policy(
+            recovery_ladder__nudge__permitted=False,
+            recovery_ladder__diagnose__permitted=False,
+        ),
+    )
+    instruction = build_recovery_instruction(
+        type(decision).from_dict(json.loads(json.dumps(decision.to_dict())))
+    )
+
+    assert instruction is not None
+    assert instruction.to_dict()["selected_prompt_asset_id"] == "prompt-reheat-v1"
+    assert instruction.to_dict()["advisory_only"] is True
+    assert instruction.to_dict()["grants_authority"] is False
+
+    object.__setattr__(decision, "run_id", "tampered-decision-run")
     with pytest.raises(ControllerError) as caught:
-        analyze(trace, policy, semantic_detector=object())
-    assert caught.value.code == "semantic_detector_not_implemented"
+        build_recovery_instruction(decision)
+    assert caught.value.code == "invalid_recovery_decision"
+
+
+def test_shared_gap_basis_preserves_task10_cause_provenance() -> None:
+    """Task11's shared basis must not collapse distinct diagnosed causes."""
+    from semantic_reheating.diagnosis import CauseClass
+    from semantic_reheating.policies import recovery_gaps_for_causes
+
+    assert recovery_gaps_for_causes(
+        (CauseClass.UNSUITABLE_TOOL, CauseClass.RUNTIME_DEFECT)
+    ) == [
+        {
+            "kind": "stalled_progress",
+            "description": "Progress is stalled pending a safe reassessment.",
+        },
+        {
+            "kind": "stalled_progress",
+            "description": "Progress is stalled pending a safe reassessment.",
+        },
+    ]
+
+
+def test_portable_instruction_matches_task10_for_equivalent_context() -> None:
+    from semantic_reheating.controller import analyze, build_recovery_instruction
+    from semantic_reheating.detectors.acceptance_stall import detect_acceptance_stall
+    from semantic_reheating.detectors.budget_burn import detect_budget_burn
+    from semantic_reheating.detectors.cycle import detect_cycle
+    from semantic_reheating.detectors.exact_repetition import detect_exact_repetition
+    from semantic_reheating.detectors.repeated_error import detect_repeated_error
+    from semantic_reheating.detectors.unchanged_state import detect_unchanged_state
+    from semantic_reheating.diagnosis import diagnose
+    from semantic_reheating.policies import (
+        construct_recovery_instruction,
+        select_recovery_policy,
+    )
+
+    policy = _policy(
+        recovery_ladder__nudge__permitted=False,
+        recovery_ladder__diagnose__permitted=False,
+    )
+    trace = _repetition_and_stall_trace()
+    findings = [
+        detector(tuple(trace), policy)
+        for detector in (
+            detect_exact_repetition,
+            detect_cycle,
+            detect_repeated_error,
+            detect_unchanged_state,
+            detect_acceptance_stall,
+            detect_budget_burn,
+        )
+    ]
+    diagnosis = diagnose(tuple(trace), findings)
+    task10 = construct_recovery_instruction(
+        select_recovery_policy(diagnosis, findings, policy), diagnosis, findings, policy
+    )
+    task11 = build_recovery_instruction(analyze(trace, policy))
+
+    assert task10 is not None and task11 is not None
+    assert task11.to_dict() == task10
+
+
+def test_cooling_conditions_and_independent_episode_supports_are_portable() -> None:
+    from semantic_reheating.controller import analyze, build_recovery_instruction
+    from semantic_reheating.models import EffectClass
+    from semantic_reheating.policies import BranchCandidate, select_cooling_branch
+
+    policy = _policy(
+        recovery_ladder__nudge__permitted=False,
+        recovery_ladder__diagnose__permitted=False,
+    )
+    base_trace = _repetition_and_stall_trace()
+    base = analyze(base_trace, policy)
+    replay = analyze(base_trace, policy)
+    instruction = build_recovery_instruction(base)
+    extended = analyze(
+        base_trace
+        + [
+            _event(7, "tool_call", payload={"action": "new-read"}),
+            _event(
+                8,
+                "tool_result",
+                payload={"result": "new-same"},
+                parent_event_id="event-7",
+            ),
+            _event(
+                9, "acceptance_check", payload={"check": "new"}, acceptance_delta="none"
+            ),
+            _event(10, "tool_call", payload={"action": "new-read"}),
+            _event(
+                11,
+                "tool_result",
+                payload={"result": "new-same"},
+                parent_event_id="event-10",
+            ),
+            _event(
+                12,
+                "acceptance_check",
+                payload={"check": "new"},
+                acceptance_delta="none",
+            ),
+        ],
+        policy,
+    )
+
+    assert instruction is not None
+    assert (
+        instruction.to_dict()["cooling_conditions"]
+        == base.to_dict()["cooling_conditions"]
+    )
+    assert (
+        select_cooling_branch(
+            [
+                BranchCandidate(
+                    "sole", ("evidence",), EffectClass.READ_ONLY, True, True, False
+                )
+            ],
+            policy,
+        )
+        == "sole"
+    )
+    assert replay.decision_id == base.decision_id
+    assert extended.decision_id != base.decision_id
+    assert extended.evidence_event_ids != base.evidence_event_ids
 
 
 @pytest.mark.parametrize("trace", ([], (), [object()]))
