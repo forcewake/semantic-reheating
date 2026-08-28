@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import io
 import json
 import os
@@ -10,6 +11,7 @@ import stat
 import sys
 from collections.abc import Sequence
 from itertools import pairwise
+from pathlib import Path
 from typing import Any, Never
 
 from . import ControllerError, DecisionEnvelope, RunPolicy, TraceEvent, analyze
@@ -84,10 +86,11 @@ def _parser() -> argparse.ArgumentParser:
     explain = commands.add_parser("explain", help="render a validated decision")
     explain.add_argument("decision")
     benchmark = commands.add_parser(
-        "benchmark", help="benchmark support is unavailable"
+        "benchmark", help="replay the committed synthetic benchmark corpus"
     )
     benchmark.add_argument("corpus")
     benchmark.add_argument("--manifest", required=True)
+    benchmark.add_argument("--format", choices=("json",), default="json")
     return parser
 
 
@@ -257,6 +260,25 @@ def _write_canonical_stdout(value: dict[str, Any]) -> None:
     buffer.flush()
 
 
+def _write_bytes_stdout(payload: bytes) -> None:
+    """Write already-canonical benchmark bytes without reparsing them."""
+    stdout = sys.stdout
+    buffer = getattr(stdout, "buffer", None)
+    if buffer is None:
+        if not isinstance(stdout, io.StringIO):
+            raise OSError("stdout does not provide a byte buffer")
+        stdout.write(payload.decode("utf-8"))
+        stdout.flush()
+        return
+    remaining = memoryview(payload)
+    while remaining:
+        written = buffer.write(remaining)
+        if type(written) is not int or not 0 < written <= len(remaining):
+            raise OSError("stdout write failed")
+        remaining = remaining[written:]
+    buffer.flush()
+
+
 def _text(envelope: DecisionEnvelope) -> str:
     return (
         "\n".join(
@@ -316,6 +338,89 @@ def _explain(decision_path: str) -> int:
     return EXIT_OK
 
 
+def _trusted_replay() -> tuple[type[Exception], Any]:
+    """Load only the regular repo-local replay module, never an argv/CWD shadow."""
+    project_root = Path(__file__).absolute().parents[2]
+    package_dir = project_root / "benchmark"
+    init_path = package_dir / "__init__.py"
+    replay_path = package_dir / "replay.py"
+    try:
+        for candidate in (package_dir, init_path, replay_path):
+            metadata = candidate.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or (candidate == package_dir and not stat.S_ISDIR(metadata.st_mode))
+                or (candidate != package_dir and not stat.S_ISREG(metadata.st_mode))
+            ):
+                raise OSError
+    except OSError as error:
+        raise _CliFailure(EXIT_BENCHMARK_UNAVAILABLE) from error
+    saved = {
+        name: sys.modules[name]
+        for name in tuple(sys.modules)
+        if name == "benchmark" or name.startswith("benchmark.")
+    }
+    for name in saved:
+        del sys.modules[name]
+    try:
+        package_spec = importlib.util.spec_from_file_location(
+            "benchmark", init_path, submodule_search_locations=[str(package_dir)]
+        )
+        replay_spec = importlib.util.spec_from_file_location(
+            "benchmark.replay", replay_path
+        )
+        if (
+            package_spec is None
+            or package_spec.loader is None
+            or replay_spec is None
+            or replay_spec.loader is None
+        ):
+            raise OSError
+        package = importlib.util.module_from_spec(package_spec)
+        sys.modules["benchmark"] = package
+        package_spec.loader.exec_module(package)
+        replay = importlib.util.module_from_spec(replay_spec)
+        sys.modules["benchmark.replay"] = replay
+        replay_spec.loader.exec_module(replay)
+        module_path = Path(getattr(replay, "__file__", "")).absolute()
+        if (
+            module_path != replay_path.absolute()
+            or replay_path.is_symlink()
+            or not replay_path.is_file()
+        ):
+            raise OSError
+        return replay.BenchmarkError, replay.replay_bytes
+    except _CliFailure:
+        raise
+    except (ImportError, AttributeError, OSError, ValueError) as error:
+        raise _CliFailure(EXIT_BENCHMARK_UNAVAILABLE) from error
+    finally:
+        for name in tuple(sys.modules):
+            if name == "benchmark" or name.startswith("benchmark."):
+                del sys.modules[name]
+        sys.modules.update(saved)
+
+
+def _benchmark(corpus: str, manifest: str, output_format: str) -> int:
+    """Run the offline repo-local benchmark only when the command is requested."""
+    if output_format != "json":
+        raise _CliFailure(EXIT_USAGE)
+    benchmark_error, replay_bytes = _trusted_replay()
+    try:
+        payload = replay_bytes(Path(corpus), Path(manifest))
+    except benchmark_error as error:
+        code = getattr(error, "code", None)
+        if code == "invalid_schema":
+            raise _CliFailure(EXIT_INVALID_SCHEMA) from error
+        if code == "io":
+            raise _CliFailure(EXIT_IO) from error
+        raise _CliFailure(EXIT_INTERNAL) from error
+    except (OSError, ValueError) as error:
+        raise _CliFailure(EXIT_INTERNAL) from error
+    _write_bytes_stdout(payload)
+    return EXIT_OK
+
+
 class _CliFailure(Exception):
     def __init__(self, exit_code: int) -> None:
         self.exit_code = exit_code
@@ -341,8 +446,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return error.code if type(error.code) is int else EXIT_USAGE
     try:
         if arguments.command == "benchmark":
-            print("error: benchmark_unavailable", file=sys.stderr)
-            return EXIT_BENCHMARK_UNAVAILABLE
+            return _benchmark(arguments.corpus, arguments.manifest, arguments.format)
         if arguments.command == "validate":
             return _validate(arguments.trace, arguments.policy)
         if arguments.command == "analyze":

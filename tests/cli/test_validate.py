@@ -104,13 +104,13 @@ def test_usage_errors_do_not_echo_untrusted_arguments(
     assert captured.err == "error: usage\n"
 
 
-def test_benchmark_is_parsed_but_unavailable(
+def test_benchmark_invalid_io_is_sanitized(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert cli.main(["benchmark", "corpus", "--manifest", "manifest.json"]) == 8
+    assert cli.main(["benchmark", "corpus", "--manifest", "manifest.json"]) == 9
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "error: benchmark_unavailable\n"
+    assert captured.err == "error: io_error\n"
 
 
 def test_validate_emits_only_canonical_status_record(
