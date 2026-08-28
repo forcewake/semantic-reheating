@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from corpus_support import CorpusBudget, read_corpus, read_small_public_file
 
 from semantic_reheating.validation import load_public_json
 
@@ -27,6 +28,8 @@ _FORBIDDEN_KEYS = re.compile(
     re.IGNORECASE,
 )
 _URL = re.compile(r"https?://", re.IGNORECASE)
+_EXACT_HTTPS_URL = re.compile(r"https://[^\s]+", re.IGNORECASE)
+_PATH_TRAVERSAL = re.compile(r"(?:^|[\\/])\.\.(?:[\\/]|$)")
 _SCHEMA_URL_POINTERS = frozenset(("$.$id", "$.$schema"))
 
 
@@ -40,6 +43,7 @@ def assert_public_json(
     if type(value) is dict:
         for key, item in value.items():
             assert type(key) is str
+            assert key.isascii(), location
             assert _FORBIDDEN_KEYS.fullmatch(key) is None, location
             assert_public_json(
                 item,
@@ -56,14 +60,17 @@ def assert_public_json(
                 allow_schema_urls=allow_schema_urls,
             )
     elif type(value) is str:
+        assert value.isascii(), location
+        assert not value.startswith("/"), location
+        assert _PATH_TRAVERSAL.search(value) is None, location
         assert _FORBIDDEN_TEXT.search(value) is None, location
-        assert _URL.search(value) is None or (
-            allow_schema_urls and pointer in _SCHEMA_URL_POINTERS
-        ), location
+        if _URL.search(value) is not None:
+            assert allow_schema_urls and pointer in _SCHEMA_URL_POINTERS, location
+            assert _EXACT_HTTPS_URL.fullmatch(value) is not None, location
 
 
 def _public_paths() -> list[Path]:
-    manifest = load_public_json(MANIFEST_PATH.read_bytes())
+    manifest = load_public_json(read_small_public_file(MANIFEST_PATH))
     assert type(manifest) is dict
     return [
         SCHEMA_PATH,
@@ -74,26 +81,37 @@ def _public_paths() -> list[Path]:
 
 def _assert_public_bytes(path: Path, raw: bytes) -> None:
     assert raw.startswith(b"\xef\xbb\xbf") is False
-    assert b"\r\n" not in raw
-    text = raw.decode("utf-8")
-    assert _FORBIDDEN_TEXT.search(text) is None, str(path)
+    assert b"\r" not in raw
+    raw.decode("utf-8", errors="strict")
+    assert raw.isascii(), str(path)
 
 
 def test_public_corpus_bytes_and_json_values_are_redacted_and_deterministic() -> None:
     paths = _public_paths()
+    corpus = read_corpus(
+        (
+            str(path.relative_to(PROJECT_ROOT))
+            for path in paths
+            if path.suffix == ".jsonl"
+        ),
+        budget=CorpusBudget(),
+    )
+    traces = {trace.trace_path: trace for trace in corpus.traces}
     assert len(paths) == 31
+    assert len(traces) == 29
     assert set(paths) == {
         path for path in (PROJECT_ROOT / "benchmark").rglob("*") if path.is_file()
     }
     for path in paths:
-        raw = path.read_bytes()
-        _assert_public_bytes(path, raw)
         if path.suffix == ".jsonl":
-            lines = raw.splitlines()
-            assert lines and all(line.strip() for line in lines)
-            for line in lines:
-                assert_public_json(load_public_json(line), str(path))
+            trace = traces[str(path.relative_to(PROJECT_ROOT))]
+            assert trace.lines and all(line.strip() for line in trace.lines)
+            for line in trace.lines:
+                _assert_public_bytes(path, line)
+                assert_public_json(load_public_json(line[:-1]), str(path))
         else:
+            raw = read_small_public_file(path)
+            _assert_public_bytes(path, raw)
             assert_public_json(
                 load_public_json(raw), str(path), allow_schema_urls=path == SCHEMA_PATH
             )
@@ -120,3 +138,56 @@ def test_public_hygiene_helper_rejects_representative_mutations(
 
 def test_public_hygiene_helper_allows_legitimate_budget_tokens() -> None:
     assert_public_json({"budget_counters": {"tokens": 1}})
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        {"path": "/etc/passwd"},
+        {"path": "/var/lib/private/item"},
+        {"path": "/root/x"},
+        {"path": "/tmp/x"},
+        {"path": "../private"},
+    ),
+)
+def test_public_hygiene_helper_rejects_absolute_posix_and_traversal_paths(
+    value: dict[str, str],
+) -> None:
+    with pytest.raises(AssertionError):
+        assert_public_json(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        {"note": "\u200bsecret"},
+        {"\u200ckey": "safe"},
+        {"note": "\u200dsecret"},
+        {"note": "\u2060secret"},
+        {"note": "\ufeffsecret"},
+        {"note": "ｓｅｃｒｅｔ"},
+    ),
+)
+def test_public_hygiene_helper_rejects_direct_non_ascii_keys_and_values(
+    value: dict[str, str],
+) -> None:
+    with pytest.raises(AssertionError):
+        assert_public_json(value)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b'{"note":"\\u200bsecret"}',
+        b'{"\\u200ckey":"safe"}',
+        b'{"note":"\\u200dsecret"}',
+        b'{"note":"\\u2060secret"}',
+        b'{"note":"\\ufeffsecret"}',
+        b'{"note":"\\uff53\\uff45\\uff43\\uff52\\uff45\\uff54"}',
+    ),
+)
+def test_public_hygiene_helper_rejects_json_escaped_non_ascii_keys_and_values(
+    raw: bytes,
+) -> None:
+    with pytest.raises(AssertionError):
+        assert_public_json(load_public_json(raw))

@@ -55,8 +55,18 @@
         ],
         "properties": {
           "schema_version": {"const": "1.0"},
-          "scenario_id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
-          "trace_path": {"type": "string", "pattern": "^benchmark/corpus/[a-z0-9]+(?:-[a-z0-9]+)*\\.jsonl$"},
+          "scenario_id": {
+            "allOf": [
+              {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+              {"not": {"pattern": "[\\r\\n]"}}
+            ]
+          },
+          "trace_path": {
+            "allOf": [
+              {"type": "string", "pattern": "^benchmark/corpus/[a-z0-9]+(?:-[a-z0-9]+)*\\.jsonl$"},
+              {"not": {"pattern": "[\\r\\n]"}}
+            ]
+          },
           "label": {"enum": ["pathological", "productive_control"]},
           "scenario_type": {
             "enum": [
@@ -71,7 +81,17 @@
             "items": {"enum": ["exact_repetition", "cycle", "repeated_error", "unchanged_state", "acceptance_stall", "budget_burn", "hard_budget", "repeated_risky_call"]}
           },
           "expected_decision": {"enum": ["continue", "nudge", "diagnose", "reheat", "restart", "escalate", "stop"]},
-          "expected_evidence_event_ids": {"type": "array", "uniqueItems": true, "maxItems": 100, "items": {"type": "string", "pattern": "^event-[0-9]{3}$"}},
+          "expected_evidence_event_ids": {
+            "type": "array",
+            "uniqueItems": true,
+            "maxItems": 100,
+            "items": {
+              "allOf": [
+                {"type": "string", "pattern": "^event-[0-9]{3}$"},
+                {"not": {"pattern": "[\\r\\n]"}}
+              ]
+            }
+          },
           "expected_safety_outcome": {"enum": ["safe_continue", "advisory_continue", "recovery", "escalated", "hard_stop"]}
         }
       }

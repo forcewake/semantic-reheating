@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import copy
+import multiprocessing
+import os
+import re
 import stat
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
+from corpus_support import (
+    CorpusBudget,
+    CorpusLimits,
+    read_corpus,
+    read_small_public_file,
+)
 from jsonschema import Draft202012Validator
 
 from semantic_reheating.models import RunPolicy, TraceEvent
@@ -29,10 +38,13 @@ SCHEMA_PATH = PROJECT_ROOT / "benchmark/schemas/v1/corpus-manifest.schema.json"
 MANIFEST_PATH = PROJECT_ROOT / "benchmark/scenarios/manifest.json"
 POLICY_SOURCE_PATH = "tests/fixtures/contracts/minimal-run-policy.json"
 POLICY_BINDING_VERSION = "1.0"
+_SCENARIO_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_TRACE_PATH = re.compile(r"benchmark/corpus/[a-z0-9]+(?:-[a-z0-9]+)*\.jsonl")
+_EVIDENCE_EVENT_ID = re.compile(r"event-[0-9]{3}")
 
 
 def _load(path: Path) -> dict[str, Any]:
-    value = load_public_json(path.read_bytes())
+    value = load_public_json(read_small_public_file(path))
     assert type(value) is dict
     return value
 
@@ -73,7 +85,7 @@ def _load_effective_policy(
     assert source_path.resolve(strict=True).is_relative_to(source_root.resolve())
     source_metadata = source_path.lstat()
     assert stat.S_ISREG(source_metadata.st_mode)
-    raw_source = source_path.read_bytes()
+    raw_source = read_small_public_file(source_path)
     assert sha256(raw_source).hexdigest() == binding["source_sha256"]
     policy_source = load_public_json(raw_source)
     assert type(policy_source) is dict
@@ -98,6 +110,21 @@ def _load_effective_policy(
 
 def _assert_relational_bindings(source: dict[str, Any]) -> None:
     entries = source["entries"]
+    for entry in entries:
+        scenario_id = entry["scenario_id"]
+        trace_path = entry["trace_path"]
+        evidence_event_ids = entry["expected_evidence_event_ids"]
+        assert type(scenario_id) is str
+        assert "\r" not in scenario_id and "\n" not in scenario_id
+        assert _SCENARIO_ID.fullmatch(scenario_id) is not None
+        assert type(trace_path) is str
+        assert "\r" not in trace_path and "\n" not in trace_path
+        assert _TRACE_PATH.fullmatch(trace_path) is not None
+        assert type(evidence_event_ids) is list
+        for event_id in evidence_event_ids:
+            assert type(event_id) is str
+            assert "\r" not in event_id and "\n" not in event_id
+            assert _EVIDENCE_EVENT_ID.fullmatch(event_id) is not None
     assert len({entry["scenario_id"] for entry in entries}) == len(entries)
     assert len({entry["trace_path"] for entry in entries}) == len(entries)
 
@@ -214,6 +241,178 @@ def test_manifest_schema_rejects_unknown_fields_versions_and_invalid_enums() -> 
     missing_expectation = copy.deepcopy(manifest)
     del missing_expectation["entries"][0]["expected_safety_outcome"]
     _assert_invalid(validator, missing_expectation)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("scenario_id", "exact-repetition-stall\n"),
+        ("scenario_id", "exact-repetition-stall\r\n"),
+        ("scenario_id", "exact-\nrepetition-stall"),
+        ("trace_path", "benchmark/corpus/exact-repetition-stall.jsonl\n"),
+        ("trace_path", "benchmark/corpus/exact-repetition-stall.jsonl\r\n"),
+        ("trace_path", "benchmark/corpus/exact-\nrepetition-stall.jsonl"),
+    ),
+)
+def test_manifest_schema_rejects_newlines_in_scalar_identifier_fields(
+    field: str, value: str
+) -> None:
+    validator = _validator()
+    manifest = _load(MANIFEST_PATH)
+    mutated = copy.deepcopy(manifest)
+    mutated["entries"][0][field] = value
+
+    _assert_invalid(validator, mutated)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("event-001\n", "event-001\r\n", "event-\n001"),
+)
+def test_manifest_schema_rejects_newlines_in_evidence_event_ids(value: str) -> None:
+    validator = _validator()
+    manifest = _load(MANIFEST_PATH)
+    mutated = copy.deepcopy(manifest)
+    mutated["entries"][0]["expected_evidence_event_ids"][0] = value
+
+    _assert_invalid(validator, mutated)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("scenario_id", "exact-repetition-stall\n"),
+        ("scenario_id", "exact-repetition-stall\r\n"),
+        ("scenario_id", "exact-\nrepetition-stall"),
+        ("trace_path", "benchmark/corpus/exact-repetition-stall.jsonl\n"),
+        ("trace_path", "benchmark/corpus/exact-repetition-stall.jsonl\r\n"),
+        ("trace_path", "benchmark/corpus/exact-\nrepetition-stall.jsonl"),
+        ("expected_evidence_event_ids", ["event-001\n"]),
+        ("expected_evidence_event_ids", ["event-001\r\n"]),
+        ("expected_evidence_event_ids", ["event-\n001"]),
+    ),
+)
+def test_manifest_runtime_bindings_reject_newline_evasions(
+    field: str, value: str | list[str]
+) -> None:
+    manifest = _load(MANIFEST_PATH)
+    mutated = copy.deepcopy(manifest)
+    mutated["entries"][0][field] = value
+
+    with pytest.raises(AssertionError):
+        _assert_relational_bindings(mutated)
+
+
+def _write_corpus_trace(tmp_path: Path, name: str, raw: bytes) -> tuple[Path, str]:
+    root = tmp_path / "corpus"
+    root.mkdir()
+    (root / name).write_bytes(raw)
+    return root, f"benchmark/corpus/{name}"
+
+
+def _reader_rejects_in_child(root: str, trace_path: str, results: object) -> None:
+    try:
+        read_corpus((trace_path,), root=Path(root))
+    except AssertionError:
+        results.put(True)  # type: ignore[union-attr]
+    else:
+        results.put(False)  # type: ignore[union-attr]
+
+
+def test_safe_corpus_reader_returns_bounded_immutable_lines(tmp_path: Path) -> None:
+    root, trace_path = _write_corpus_trace(tmp_path, "sample.jsonl", b"{}\n{}\n")
+
+    corpus = read_corpus((trace_path,), root=root, budget=CorpusBudget())
+
+    assert corpus.total_bytes == 6
+    assert corpus.traces[0].lines == (b"{}\n", b"{}\n")
+    assert type(corpus.traces) is tuple
+    assert type(corpus.traces[0].lines) is tuple
+
+
+@pytest.mark.parametrize("kind", ("symlink", "fifo", "directory"))
+def test_safe_corpus_reader_rejects_nonregular_or_linked_nodes(
+    tmp_path: Path, kind: str
+) -> None:
+    root = tmp_path / "corpus"
+    root.mkdir()
+    name = "sample.jsonl"
+    candidate = root / name
+    if kind == "symlink":
+        target = tmp_path / "target.jsonl"
+        target.write_bytes(b"{}\n")
+        candidate.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(candidate)
+    else:
+        candidate.mkdir()
+
+    results = multiprocessing.Queue()
+    process = multiprocessing.Process(
+        target=_reader_rejects_in_child,
+        args=(str(root), f"benchmark/corpus/{name}", results),
+    )
+    process.start()
+    process.join(timeout=3)
+    if process.is_alive():
+        process.kill()
+        process.join()
+        pytest.fail("safe corpus reader child did not terminate")
+    assert process.exitcode == 0
+    assert results.get(timeout=1) is True
+    results.close()
+
+
+def test_safe_corpus_reader_rejects_declared_per_file_and_aggregate_caps(
+    tmp_path: Path,
+) -> None:
+    root, first = _write_corpus_trace(tmp_path, "first.jsonl", b"{}\n{}\n")
+    (root / "second.jsonl").write_bytes(b"{}\n{}\n")
+    second = "benchmark/corpus/second.jsonl"
+
+    with pytest.raises(AssertionError, match="unsafe corpus input"):
+        read_corpus((first,), root=root, limits=CorpusLimits(max_trace_bytes=5))
+    with pytest.raises(AssertionError, match="unsafe corpus input"):
+        read_corpus(
+            (first, second), root=root, limits=CorpusLimits(max_corpus_bytes=11)
+        )
+
+
+@pytest.mark.parametrize(
+    "raw, limits",
+    (
+        (b"123456789\n", CorpusLimits(max_line_bytes=8)),
+        (b"{}\n" * 10_001, CorpusLimits(max_events=10_000)),
+        (b"{}", CorpusLimits()),
+        (b"{}\r\n", CorpusLimits()),
+        (b"{}\n\n", CorpusLimits()),
+        (b"\xef\xbb\xbf{}\n", CorpusLimits()),
+    ),
+)
+def test_safe_corpus_reader_rejects_invalid_line_framing_and_bounds(
+    tmp_path: Path, raw: bytes, limits: CorpusLimits
+) -> None:
+    root, trace_path = _write_corpus_trace(tmp_path, "sample.jsonl", raw)
+
+    with pytest.raises(AssertionError, match="unsafe corpus input"):
+        read_corpus((trace_path,), root=root, limits=limits)
+
+
+def test_safe_corpus_reader_rejects_identity_swap_and_closes_descriptor(
+    tmp_path: Path,
+) -> None:
+    root, trace_path = _write_corpus_trace(tmp_path, "sample.jsonl", b"{}\n")
+    replacement = root / "replacement.jsonl"
+    replacement.write_bytes(b"{}\n")
+    before_fds = len(os.listdir("/proc/self/fd"))
+
+    def swap(candidate: Path) -> None:
+        replacement.replace(candidate)
+
+    with pytest.raises(AssertionError, match="unsafe corpus input"):
+        read_corpus((trace_path,), root=root, before_open=swap)
+
+    assert len(os.listdir("/proc/self/fd")) == before_fds
 
 
 @pytest.mark.parametrize("field", ("scenario_id", "trace_path"))
@@ -347,23 +546,32 @@ def test_manifest_safety_outcomes_are_coherent_with_decisions_and_context() -> N
     assert deviations == []
 
 
-def _load_trace(entry: dict[str, Any]) -> list[TraceEvent]:
-    path = PROJECT_ROOT / entry["trace_path"]
-    raw_lines = path.read_bytes().splitlines()
-    assert raw_lines
+def _parse_trace_lines(raw_lines: tuple[bytes, ...]) -> list[TraceEvent]:
     events: list[TraceEvent] = []
     for line in raw_lines:
         assert line.strip()
-        source = load_public_json(line)
+        source = load_public_json(line[:-1])
         assert type(source) is dict
         events.append(TraceEvent.from_dict(source))
     return events
 
 
+def _load_trace(entry: dict[str, Any]) -> list[TraceEvent]:
+    corpus = read_corpus((entry["trace_path"],), budget=CorpusBudget())
+    return _parse_trace_lines(corpus.traces[0].lines)
+
+
 def test_manifest_entries_bind_to_complete_valid_public_traces() -> None:
     manifest = _load(MANIFEST_PATH)
+    corpus = read_corpus(
+        (entry["trace_path"] for entry in manifest["entries"]), budget=CorpusBudget()
+    )
+    assert len(corpus.traces) == len(manifest["entries"]) == 29
+    trace_events = {
+        trace.trace_path: _parse_trace_lines(trace.lines) for trace in corpus.traces
+    }
     for entry in manifest["entries"]:
-        events = _load_trace(entry)
+        events = trace_events[entry["trace_path"]]
         assert 1 <= len(events) <= 10_000
         assert [event.sequence for event in events] == list(range(1, len(events) + 1))
         assert {event.run_id for event in events} == {f"run-{entry['scenario_id']}"}
