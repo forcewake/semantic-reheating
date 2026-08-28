@@ -57,6 +57,14 @@ import time
 prompt, usage_path = sys.argv[1:]
 scenario = prompt.splitlines()[0].split(': ', 1)[1]
 mode = os.environ.get('PRESSURE_FAKE_MODE', 'mixed')
+if mode == 'capture-env':
+    __import__('pathlib').Path(os.environ['PRESSURE_ENV_RECEIPT']).write_text(
+        json.dumps({key: os.environ[key] for key in sorted(os.environ)}), encoding='ascii'
+    )
+if mode == 'capture-run-context':
+    __import__('pathlib').Path(os.environ['PRESSURE_ENV_RECEIPT']).write_text(
+        json.dumps({'cwd': str(__import__('pathlib').Path.cwd().resolve()), 'usage_path': str(__import__('pathlib').Path(usage_path).resolve())}), encoding='ascii'
+    )
 if mode == 'timeout':
     time.sleep(2)
 if mode == 'oversized':
@@ -147,12 +155,278 @@ def _install_config(state_home: Path, fake_cli: Path, **changes: Any) -> Path:
             "cost": True,
         },
         "skill_absent": True,
+        "environment_allowlist": [],
     }
     config.update(changes)
     path = root / "pressure-stack.local.json"
     path.write_text(json.dumps(config, sort_keys=True), encoding="ascii")
     path.chmod(0o600)
     return path
+
+
+def test_private_state_environment_contract_rejects_relative_fallback_and_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Private state never falls back into CWD and config names are closed."""
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("HOME", "relative-home")
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_unsafe_state_root"
+    ):
+        runner._state_root(PROJECT_ROOT)
+
+    monkeypatch.setenv("XDG_STATE_HOME", "relative-state")
+    monkeypatch.setenv("HOME", str(tmp_path / "absolute-home"))
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_unsafe_state_root"
+    ):
+        runner._state_root(PROJECT_ROOT)
+
+    monkeypatch.setenv("XDG_STATE_HOME", "")
+    monkeypatch.setenv("HOME", "relative-home")
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_unsafe_state_root"
+    ):
+        runner._state_root(PROJECT_ROOT)
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    valid = {
+        "contract_version": "1.0",
+        "mode": "baseline",
+        "command_argv": ["/bin/true", "{prompt}", "{usage_file}"],
+        "executable_sha256": "0" * 64,
+        "stack_metadata": {
+            "cli": "fake-cli",
+            "framework": "fake-framework",
+            "model": "fake-model",
+            "provider": "fake-provider",
+            "version": "1.0",
+        },
+        "seed": "unsupported",
+        "decoding": "unsupported",
+        "caps": {
+            "turns": 1,
+            "tools": 1,
+            "tokens": 1,
+            "elapsed_seconds": 1,
+            "cost": "1",
+        },
+        "enforcement": {
+            "turns": "reported",
+            "tools": "reported",
+            "tokens": "reported",
+            "elapsed_seconds": "hard",
+            "cost": "reported",
+        },
+        "usage_report": {
+            "turns": True,
+            "tools": True,
+            "tokens": True,
+            "elapsed_seconds": True,
+            "cost": True,
+        },
+        "skill_absent": True,
+        "environment_allowlist": ["PRESSURE_ALLOWED"],
+    }
+    assert (
+        runner._validate_config(valid, _canonical_config_bytes(valid))["config"]
+        == valid
+    )
+    for names in (
+        ["PRESSURE_ALLOWED", "PRESSURE_ALLOWED"],
+        ["bad-name"],
+        ["A=BAD"],
+        ["A\u0000BAD"],
+    ):
+        invalid = copy.deepcopy(valid)
+        invalid["environment_allowlist"] = names
+        with pytest.raises(
+            runner.PressureProtocolError, match="pressure_invalid_config"
+        ):
+            runner._validate_config(invalid, _canonical_config_bytes(invalid))
+
+
+@pytest.mark.parametrize("xdg_state_home", (None, ""))
+def test_default_home_state_fallback_creates_private_missing_components(
+    xdg_state_home: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    if xdg_state_home is None:
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    else:
+        monkeypatch.setenv("XDG_STATE_HOME", xdg_state_home)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(runner, "_worktree_roots", lambda repo: (repo.resolve(),))
+
+    state_root = runner._state_root(PROJECT_ROOT)
+    try:
+        expected = (
+            home / ".local" / "state" / "semantic-reheating" / "pressure-baselines"
+        )
+        assert state_root.path == expected
+        assert all(
+            stat.S_IMODE(path.stat().st_mode) == 0o700
+            for path in (
+                home / ".local",
+                home / ".local" / "state",
+                home / ".local" / "state" / "semantic-reheating",
+                expected,
+            )
+        )
+    finally:
+        state_root.close()
+
+
+def _canonical_config_bytes(value: dict[str, Any]) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "base-link",
+        "project-link",
+        "baseline-link",
+        "file",
+        "fifo",
+        "permissive",
+        "readable",
+    ),
+)
+def test_state_root_rejects_symlink_special_and_permissive_components(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    state = tmp_path / "state"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if kind == "base-link":
+        state.symlink_to(outside, target_is_directory=True)
+    else:
+        state.mkdir(mode=0o700)
+        if kind == "project-link":
+            (state / "semantic-reheating").symlink_to(outside, target_is_directory=True)
+        elif kind == "baseline-link":
+            project = state / "semantic-reheating"
+            project.mkdir(mode=0o700)
+            (project / "pressure-baselines").symlink_to(
+                outside, target_is_directory=True
+            )
+        elif kind == "file":
+            state.rmdir()
+            state.write_text("not-a-directory", encoding="ascii")
+        elif kind == "fifo":
+            state.rmdir()
+            os.mkfifo(state)
+        elif kind == "permissive":
+            state.chmod(0o770)
+        elif kind == "readable":
+            project = state / "semantic-reheating"
+            baseline = project / "pressure-baselines"
+            project.mkdir(mode=0o700)
+            baseline.mkdir(mode=0o700)
+            baseline.chmod(0o750)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_unsafe_state_root"
+    ):
+        runner._state_root(PROJECT_ROOT)
+
+
+def test_selected_process_uses_only_minimal_and_explicit_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    receipt = tmp_path / "child-environment.json"
+    _write_fake_cli(fake)
+    _install_config(
+        tmp_path,
+        fake,
+        environment_allowlist=[
+            "PRESSURE_FAKE_MODE",
+            "PRESSURE_ENV_RECEIPT",
+            "PRESSURE_ALLOWED",
+        ],
+    )
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", "capture-env")
+    monkeypatch.setenv("PRESSURE_ENV_RECEIPT", str(receipt))
+    monkeypatch.setenv("PRESSURE_ALLOWED", "only-explicit")
+    monkeypatch.setenv("PRESSURE_AMBIENT_SECRET", "must-not-reach-child")
+
+    summary = runner.run_baseline(PROJECT_ROOT)
+
+    observed = json.loads(receipt.read_text(encoding="ascii"))
+    assert observed["PRESSURE_ALLOWED"] == "only-explicit"
+    assert "PRESSURE_AMBIENT_SECRET" not in observed
+    assert "only-explicit" not in json.dumps(summary)
+    state_root = tmp_path / "semantic-reheating" / "pressure-baselines"
+    run_dir = next(
+        path for path in state_root.iterdir() if path.name.startswith("run-")
+    )
+    assert "only-explicit" not in (
+        run_dir / "baseline-evidence-manifest.json"
+    ).read_text(encoding="ascii")
+    assert set(observed) == {
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PYTHONIOENCODING",
+        "PRESSURE_ALLOWED",
+        "PRESSURE_ENV_RECEIPT",
+        "PRESSURE_FAKE_MODE",
+    }
+
+
+def test_selected_usage_path_and_cwd_are_bound_to_retained_run_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    receipt = tmp_path / "child-run-context.json"
+    _write_fake_cli(fake)
+    _install_config(
+        tmp_path,
+        fake,
+        environment_allowlist=["PRESSURE_FAKE_MODE", "PRESSURE_ENV_RECEIPT"],
+    )
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", "capture-run-context")
+    monkeypatch.setenv("PRESSURE_ENV_RECEIPT", str(receipt))
+
+    runner.run_baseline(PROJECT_ROOT)
+
+    state_root = tmp_path / "semantic-reheating" / "pressure-baselines"
+    run_dir = next(
+        path.resolve() for path in state_root.iterdir() if path.name.startswith("run-")
+    )
+    observed = json.loads(receipt.read_text(encoding="ascii"))
+    assert Path(observed["cwd"]) == run_dir
+    assert Path(observed["usage_path"]).parent == run_dir
+    assert Path(observed["usage_path"]).name == "usage-6.json"
+
+
+def test_missing_allowlisted_environment_fails_before_selected_popen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    _install_config(tmp_path, fake, environment_allowlist=["PRESSURE_REQUIRED_SECRET"])
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.delenv("PRESSURE_REQUIRED_SECRET", raising=False)
+    monkeypatch.setattr(runner, "_worktree_roots", lambda repo: (repo.resolve(),))
+    monkeypatch.setattr(
+        runner.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("selected Popen")
+        ),
+    )
+
+    with pytest.raises(
+        runner.PressureProtocolError, match="pressure_environment_missing"
+    ) as error:
+        runner.run_baseline(PROJECT_ROOT)
+    assert "PRESSURE_REQUIRED_SECRET" not in str(error.value)
 
 
 @pytest.mark.pressure_live
@@ -745,6 +1019,7 @@ def test_usage_support_is_per_dimension_and_never_fabricated(
             "elapsed_seconds": "hard",
             "cost": "unsupported",
         },
+        environment_allowlist=["PRESSURE_FAKE_MODE"],
     )
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.setenv("PRESSURE_FAKE_MODE", "usage-unsupported")
@@ -762,7 +1037,7 @@ def test_selected_stack_fails_closed_without_two_failure_classes(
 ) -> None:
     fake = tmp_path / "fake_cli.py"
     _write_fake_cli(fake)
-    _install_config(tmp_path, fake)
+    _install_config(tmp_path, fake, environment_allowlist=["PRESSURE_FAKE_MODE"])
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.setenv("PRESSURE_FAKE_MODE", mode)
     with pytest.raises(
@@ -812,14 +1087,18 @@ def test_state_root_rejects_any_registered_git_worktree(
         runner._state_root(PROJECT_ROOT)
 
 
-def _write_fake_git(path: Path) -> None:
+def _write_fake_git(
+    path: Path, *, mode: str, root: Path | None = None, child_pids: Path | None = None
+) -> None:
+    root_literal = repr(str(root))
+    child_pids_literal = repr(str(child_pids))
     path.write_text(
         f"""#!{sys.executable}
 import os
 import subprocess
 import sys
 import time
-mode = os.environ['PRESSURE_FAKE_GIT_MODE']
+mode = {mode!r}
 if mode == 'timeout':
     time.sleep(3)
 elif mode == 'large':
@@ -833,10 +1112,10 @@ else:
     if mode == 'orphan':
         null = open(os.devnull, 'wb')
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], stdin=null, stdout=null, stderr=null)
-        with open(os.environ['PRESSURE_FAKE_GIT_CHILD_PID_FILE'], 'a', encoding='ascii') as receipt:
+        with open({child_pids_literal}, 'a', encoding='ascii') as receipt:
             receipt.write(str(child.pid) + '\\n')
         null.close()
-    sys.stdout.write('worktree ' + os.environ['PRESSURE_FAKE_GIT_ROOT'] + '\\nHEAD deadbeef\\n\\n')
+    sys.stdout.write('worktree ' + {root_literal} + '\\nHEAD deadbeef\\n\\n')
 """,
         encoding="ascii",
     )
@@ -850,7 +1129,7 @@ def test_worktree_discovery_is_bounded_fail_closed_and_never_uses_run(
     sibling = tmp_path / "controlled-sibling-worktree"
     sibling.mkdir()
     fake_git = tmp_path / "git"
-    _write_fake_git(fake_git)
+    _write_fake_git(fake_git, mode=mode)
     candidate = (
         sibling
         / "uncreated-pressure-state"
@@ -865,7 +1144,6 @@ def test_worktree_discovery_is_bounded_fail_closed_and_never_uses_run(
             AssertionError("unbounded run")
         ),
     )
-    monkeypatch.setenv("PRESSURE_FAKE_GIT_MODE", mode)
     monkeypatch.setenv("XDG_STATE_HOME", str(sibling / "uncreated-pressure-state"))
     with pytest.raises(
         runner.PressureProtocolError, match="pressure_worktree_discovery_failed"
@@ -888,7 +1166,12 @@ def test_worktree_discovery_reaps_normal_exit_group_child(
 ) -> None:
     fake_git = tmp_path / "git"
     child_pids = tmp_path / "git-children.pid"
-    _write_fake_git(fake_git)
+    _write_fake_git(
+        fake_git,
+        mode="orphan",
+        root=PROJECT_ROOT,
+        child_pids=child_pids,
+    )
     monkeypatch.setattr(runner.shutil, "which", lambda _name: str(fake_git))
     monkeypatch.setattr(
         runner.subprocess,
@@ -897,9 +1180,7 @@ def test_worktree_discovery_reaps_normal_exit_group_child(
             AssertionError("unbounded run")
         ),
     )
-    monkeypatch.setenv("PRESSURE_FAKE_GIT_MODE", "orphan")
-    monkeypatch.setenv("PRESSURE_FAKE_GIT_ROOT", str(PROJECT_ROOT))
-    monkeypatch.setenv("PRESSURE_FAKE_GIT_CHILD_PID_FILE", str(child_pids))
+
     pids: list[int] = []
     try:
         assert runner._worktree_roots(PROJECT_ROOT) == (PROJECT_ROOT.resolve(),)
@@ -913,6 +1194,48 @@ def test_worktree_discovery_reaps_normal_exit_group_child(
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_worktree_discovery_uses_fixed_environment_and_no_inherited_fds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def bounded(
+        _argv: list[str],
+        _cwd: Path | str,
+        _deadline: float,
+        maximum: int | None = None,
+        *,
+        env: dict[str, str],
+        pass_fds: tuple[int, ...] = (),
+    ) -> tuple[bytes, bytes, int]:
+        captured["env"] = env
+        captured["pass_fds"] = pass_fds
+        assert maximum == runner.MAX_PUBLIC_BYTES
+        return f"worktree {PROJECT_ROOT.resolve()}\nHEAD deadbeef\n\n".encode(), b"", 0
+
+    monkeypatch.setattr(runner, "_run_bounded", bounded)
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0"):
+        monkeypatch.setenv(name, "poisoned-git-input")
+
+    assert runner._worktree_roots(PROJECT_ROOT) == (PROJECT_ROOT.resolve(),)
+    assert captured == {"env": runner._safe_git_environment(), "pass_fds": ()}
+
+
+def test_real_git_worktree_discovery_ignores_poisoned_ambient_git_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+    ):
+        monkeypatch.setenv(name, "/nonexistent/poisoned-git-input")
+
+    assert PROJECT_ROOT.resolve() in runner._worktree_roots(PROJECT_ROOT)
 
 
 def test_runtime_outcome_uses_public_response_constraints() -> None:
@@ -1014,7 +1337,7 @@ def test_selected_stack_streams_only_bounded_output_without_subprocess_run(
 ) -> None:
     fake = tmp_path / "fake_cli.py"
     _write_fake_cli(fake)
-    _install_config(tmp_path, fake)
+    _install_config(tmp_path, fake, environment_allowlist=["PRESSURE_FAKE_MODE"])
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.setenv("PRESSURE_FAKE_MODE", "oversized")
     monkeypatch.setattr(runner, "MAX_CAPTURE_BYTES", 17)
@@ -1045,7 +1368,7 @@ def test_selected_stack_bounds_output_and_timeout(
 ) -> None:
     fake = tmp_path / "fake_cli.py"
     _write_fake_cli(fake)
-    _install_config(tmp_path, fake)
+    _install_config(tmp_path, fake, environment_allowlist=["PRESSURE_FAKE_MODE"])
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.setenv("PRESSURE_FAKE_MODE", mode)
     with pytest.raises(runner.PressureProtocolError, match=code):
@@ -1067,9 +1390,10 @@ def test_baseline_deadline_is_shared_and_uses_runner_measured_time(
 
     def fake_run(
         argv: list[str],
-        _cwd: Path,
+        _cwd: Path | str,
         _deadline: float,
         maximum: int = runner.MAX_CAPTURE_BYTES,
+        **_kwargs: object,
     ) -> tuple[bytes, bytes, int]:
         assert maximum in {runner.MAX_CAPTURE_BYTES, runner.MAX_PUBLIC_BYTES}
         calls[0] += 1
@@ -1167,6 +1491,53 @@ def _pid_is_live(pid: int) -> bool:
     return True
 
 
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(), reason="Linux descriptor accounting required"
+)
+def test_run_baseline_closes_retained_fds_for_repeated_success_and_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    monkeypatch.setattr(runner, "_worktree_roots", lambda repo: (repo.resolve(),))
+    before = len(os.listdir("/proc/self/fd"))
+
+    for index in range(3):
+        success_home = tmp_path / f"success-{index}"
+        _install_config(success_home, fake)
+        monkeypatch.setenv("XDG_STATE_HOME", str(success_home))
+        runner.run_baseline(PROJECT_ROOT)
+        with pytest.raises(runner.PressureProtocolError, match="pressure_run_exists"):
+            runner.run_baseline(PROJECT_ROOT)
+
+        missing_home = tmp_path / f"missing-{index}"
+        monkeypatch.setenv("XDG_STATE_HOME", str(missing_home))
+        with pytest.raises(
+            runner.PressureProtocolError, match="pressure_stack_missing"
+        ):
+            runner.run_baseline(PROJECT_ROOT)
+
+        invalid_home = tmp_path / f"invalid-{index}"
+        invalid_path = _install_config(invalid_home, fake)
+        invalid_path.write_text("{}", encoding="ascii")
+        monkeypatch.setenv("XDG_STATE_HOME", str(invalid_home))
+        with pytest.raises(
+            runner.PressureProtocolError, match="pressure_invalid_config"
+        ):
+            runner.run_baseline(PROJECT_ROOT)
+
+        failed_home = tmp_path / f"failed-{index}"
+        _install_config(failed_home, fake, environment_allowlist=["PRESSURE_FAKE_MODE"])
+        monkeypatch.setenv("XDG_STATE_HOME", str(failed_home))
+        monkeypatch.setenv("PRESSURE_FAKE_MODE", "oversized")
+        with pytest.raises(
+            runner.PressureProtocolError, match="pressure_output_too_large"
+        ):
+            runner.run_baseline(PROJECT_ROOT)
+
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
 def test_bounded_runner_never_retries_a_failed_group_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1180,7 +1551,12 @@ def test_bounded_runner_never_retries_a_failed_group_cleanup(
     with pytest.raises(
         runner.PressureProtocolError, match="pressure_process_group_cleanup_failed"
     ):
-        runner._run_bounded(["/bin/true"], tmp_path, runner.time.monotonic() + 1)
+        runner._run_bounded(
+            ["/bin/true"],
+            tmp_path,
+            runner.time.monotonic() + 1,
+            env=runner._selected_environment([]),
+        )
     assert calls == [1]
 
 
@@ -1190,7 +1566,11 @@ def test_successful_selected_stack_reaps_all_detached_group_children(
     fake = tmp_path / "fake_cli.py"
     child_pid = tmp_path / "children.pid"
     _write_fake_cli(fake)
-    _install_config(tmp_path, fake)
+    _install_config(
+        tmp_path,
+        fake,
+        environment_allowlist=["PRESSURE_FAKE_MODE", "PRESSURE_CHILD_PID_FILE"],
+    )
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.setenv("PRESSURE_FAKE_MODE", "orphan-success")
     monkeypatch.setenv("PRESSURE_CHILD_PID_FILE", str(child_pid))
@@ -1230,6 +1610,7 @@ def test_successful_selected_stack_reaps_inherited_stdio_children_promptly(
             "elapsed_seconds": 4,
             "cost": "9.0",
         },
+        environment_allowlist=["PRESSURE_FAKE_MODE", "PRESSURE_CHILD_PID_FILE"],
     )
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.setenv("PRESSURE_FAKE_MODE", mode)
@@ -1269,7 +1650,11 @@ def test_normal_exit_reaps_child_left_in_selected_process_group(
     fake = tmp_path / "fake_cli.py"
     child_pid = tmp_path / "child.pid"
     _write_fake_cli(fake)
-    _install_config(tmp_path, fake)
+    _install_config(
+        tmp_path,
+        fake,
+        environment_allowlist=["PRESSURE_FAKE_MODE", "PRESSURE_CHILD_PID_FILE"],
+    )
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.setenv("PRESSURE_FAKE_MODE", "orphan")
     monkeypatch.setenv("PRESSURE_CHILD_PID_FILE", str(child_pid))
@@ -1371,14 +1756,14 @@ def test_duplicate_cli_response_is_malformed_and_duplicate_usage_is_typed(
 ) -> None:
     fake = tmp_path / "fake_cli.py"
     _write_fake_cli(fake)
-    _install_config(tmp_path, fake)
+    _install_config(tmp_path, fake, environment_allowlist=["PRESSURE_FAKE_MODE"])
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.setenv("PRESSURE_FAKE_MODE", "duplicate-response")
     summary = runner.run_baseline(PROJECT_ROOT)
     assert summary["outcomes"][0]["outcome_code"] == "malformed-output"
 
     retry_home = tmp_path / "retry"
-    _install_config(retry_home, fake)
+    _install_config(retry_home, fake, environment_allowlist=["PRESSURE_FAKE_MODE"])
     monkeypatch.setenv("XDG_STATE_HOME", str(retry_home))
     monkeypatch.setenv("PRESSURE_FAKE_MODE", "duplicate-usage")
     with pytest.raises(runner.PressureProtocolError, match="pressure_invalid_usage"):

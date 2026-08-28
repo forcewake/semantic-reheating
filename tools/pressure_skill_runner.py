@@ -13,6 +13,7 @@ import signal
 import stat
 import subprocess
 import time
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,32 @@ SCENARIO_ORDER = (
     "exhausted-budget",
 )
 _PRIVATE_CONFIG_NAME = "pressure-stack.local.json"
+_PROJECT_STATE_COMPONENTS = ("semantic-reheating", "pressure-baselines")
+_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_MINIMAL_SELECTED_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PYTHONIOENCODING": "utf-8",
+}
+
+
+@dataclass
+class _StateRoot:
+    """A private state directory held open as an authority capability."""
+
+    fd: int
+    path: Path
+    children: list[int] = field(default_factory=list)
+
+    def close(self) -> None:
+        for child in reversed(self.children):
+            os.close(child)
+        self.children.clear()
+        os.close(self.fd)
+
+    def is_relative_to(self, other: Path) -> bool:
+        return self.path.is_relative_to(other)
 
 
 class PressureProtocolError(RuntimeError):
@@ -157,6 +184,81 @@ def _safe_regular_bytes(path: Path, maximum: int) -> bytes:
         os.close(descriptor)
 
 
+def _snapshot(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _private_name(name: str) -> str:
+    if not name or "/" in name or "\\" in name or "\x00" in name:
+        raise PressureProtocolError("pressure_private_path_escape")
+    return name
+
+
+def _safe_regular_bytes_at(directory: int, name: str, maximum: int) -> bytes:
+    """Read one non-link private leaf via an already-trusted directory FD."""
+    name = _private_name(name)
+    try:
+        before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise PressureProtocolError("pressure_file_missing") from error
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise PressureProtocolError("pressure_unsafe_file")
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+    except OSError as error:
+        raise PressureProtocolError("pressure_unsafe_file") from error
+    try:
+        opened = os.fstat(fd)
+        snapshot = _snapshot(opened)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or snapshot != _snapshot(before)
+        ):
+            raise PressureProtocolError("pressure_unsafe_file")
+        if opened.st_size > maximum:
+            raise PressureProtocolError("pressure_file_too_large")
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(fd)
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (
+            len(data) != opened.st_size
+            or len(data) > maximum
+            or _snapshot(after) != snapshot
+            or _snapshot(current) != snapshot
+        ):
+            raise PressureProtocolError("pressure_unsafe_file")
+        return data
+    finally:
+        os.close(fd)
+
+
+def _load_json_at(
+    directory: int, name: str, maximum: int = MAX_PUBLIC_BYTES
+) -> tuple[dict[str, Any], bytes]:
+    raw = _safe_regular_bytes_at(directory, name, maximum)
+    value = _strict_json_loads(raw)
+    if type(value) is not dict:
+        raise PressureProtocolError("pressure_invalid_json")
+    return value, raw
+
+
 def _strict_json_loads(raw: bytes) -> object:
     """Parse one RFC JSON value without duplicate-key last-wins behavior."""
 
@@ -232,11 +334,15 @@ def _worktree_roots(repo_root: Path) -> tuple[Path, ...]:
     if git is None:
         return (repo_root,)
     try:
+        git_path = Path(git).resolve(strict=True)
+        if not git_path.is_absolute() or not git_path.is_file():
+            raise OSError("git executable unavailable")
         stdout, _stderr, returncode = _run_bounded(
-            [git, "-C", str(repo_root), "worktree", "list", "--porcelain"],
+            [str(git_path), "-C", str(repo_root), "worktree", "list", "--porcelain"],
             repo_root,
             time.monotonic() + WORKTREE_DISCOVERY_TIMEOUT_SECONDS,
             maximum=MAX_PUBLIC_BYTES,
+            env=_safe_git_environment(),
         )
         if returncode != 0:
             raise PressureProtocolError("pressure_worktree_discovery_failed")
@@ -269,30 +375,118 @@ def _worktree_roots(repo_root: Path) -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def _state_root(repo_root: Path) -> Path:
-    base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
-    candidate = base / "semantic-reheating" / "pressure-baselines"
-    worktree_roots = _worktree_roots(repo_root)
-    precreation_target = candidate.resolve(strict=False)
-    if any(precreation_target.is_relative_to(root) for root in worktree_roots):
-        raise PressureProtocolError("pressure_state_inside_repository")
-    if candidate.exists():
-        metadata = candidate.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+def _state_base_path() -> Path:
+    """Implement the XDG shell contract without ever treating a relative value as CWD."""
+    configured = os.environ.get("XDG_STATE_HOME")
+    raw = configured if configured else os.environ.get("HOME", "") + "/.local/state"
+    base = Path(raw)
+    if not raw or not base.is_absolute():
+        raise PressureProtocolError("pressure_unsafe_state_root")
+    return base
+
+
+def _assert_private_directory(fd: int, *, final: bool, created: bool = False) -> None:
+    metadata = os.fstat(fd)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise PressureProtocolError("pressure_unsafe_state_root")
+    mode = stat.S_IMODE(metadata.st_mode)
+    uid = os.getuid()
+    if created:
+        if metadata.st_uid != uid or mode != 0o700:
             raise PressureProtocolError("pressure_unsafe_state_root")
-    else:
-        candidate.mkdir(mode=0o700, parents=True)
-    os.chmod(candidate, 0o700)
-    resolved = candidate.resolve(strict=True)
-    if any(resolved.is_relative_to(root) for root in worktree_roots):
-        raise PressureProtocolError("pressure_state_inside_repository")
+        return
+    if final:
+        if metadata.st_uid != uid or mode != 0o700:
+            raise PressureProtocolError("pressure_unsafe_state_root")
+        return
+    # System-owned ancestors are only accepted when non-writable or sticky (e.g. /tmp).
+    if metadata.st_uid == 0:
+        if mode & 0o022 and not (mode & stat.S_ISVTX):
+            raise PressureProtocolError("pressure_unsafe_state_root")
+    elif metadata.st_uid != uid or mode & 0o022:
+        raise PressureProtocolError("pressure_unsafe_state_root")
+
+
+def _open_state_component(
+    parent: int, name: str, *, final: bool = False
+) -> tuple[int, bool]:
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+        _assert_private_directory(fd, final=final)
+        return fd, False
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent,
+            )
+        except OSError as error:
+            raise PressureProtocolError("pressure_unsafe_state_root") from error
+        try:
+            _assert_private_directory(fd, final=final, created=True)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd, True
+    except OSError as error:
+        raise PressureProtocolError("pressure_unsafe_state_root") from error
+
+
+def _fd_path(fd: int) -> Path:
+    try:
+        resolved = Path(os.readlink(f"/proc/self/fd/{fd}"))
+    except OSError as error:
+        raise PressureProtocolError("pressure_unsafe_state_root") from error
+    if not resolved.is_absolute():
+        raise PressureProtocolError("pressure_unsafe_state_root")
     return resolved
 
 
-def _private_file(path: Path, root: Path) -> Path:
-    if not path.absolute().is_relative_to(root):
-        raise PressureProtocolError("pressure_private_path_escape")
-    return path
+def _state_root(repo_root: Path) -> _StateRoot:
+    """Descriptor-walk the state path and retain the final directory capability."""
+    base = _state_base_path()
+    worktree_roots = _worktree_roots(repo_root)
+    lexical_target = base.joinpath(*_PROJECT_STATE_COMPONENTS)
+    if any(lexical_target.is_relative_to(root) for root in worktree_roots):
+        raise PressureProtocolError("pressure_state_inside_repository")
+    try:
+        current = os.open(
+            "/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except OSError as error:
+        raise PressureProtocolError("pressure_unsafe_state_root") from error
+    try:
+        _assert_private_directory(current, final=False)
+        for component in base.parts[1:]:
+            next_fd, _created = _open_state_component(current, component)
+            os.close(current)
+            current = next_fd
+        _assert_private_directory(current, final=False)
+        base_path = _fd_path(current)
+        target = base_path.joinpath(*_PROJECT_STATE_COMPONENTS)
+        if any(target.is_relative_to(root) for root in worktree_roots):
+            raise PressureProtocolError("pressure_state_inside_repository")
+        for index, component in enumerate(_PROJECT_STATE_COMPONENTS):
+            next_fd, _created = _open_state_component(
+                current,
+                component,
+                final=index == len(_PROJECT_STATE_COMPONENTS) - 1,
+            )
+            os.close(current)
+            current = next_fd
+        final_path = _fd_path(current)
+        if any(final_path.is_relative_to(root) for root in worktree_roots):
+            raise PressureProtocolError("pressure_state_inside_repository")
+        return _StateRoot(current, final_path)
+    except BaseException:
+        os.close(current)
+        raise
 
 
 def _validate_config(config: dict[str, Any], config_raw: bytes) -> dict[str, Any]:
@@ -308,6 +502,7 @@ def _validate_config(config: dict[str, Any], config_raw: bytes) -> dict[str, Any
         "enforcement",
         "usage_report",
         "skill_absent",
+        "environment_allowlist",
     }
     if (
         set(config) != required
@@ -337,6 +532,19 @@ def _validate_config(config: dict[str, Any], config_raw: bytes) -> dict[str, Any
         or config["skill_absent"] is not True
     ):
         raise PressureProtocolError("pressure_skill_not_absent")
+    environment_allowlist = config["environment_allowlist"]
+    if (
+        type(environment_allowlist) is not list
+        or len(environment_allowlist) > 32
+        or any(
+            type(name) is not str
+            or _ENV_NAME_PATTERN.fullmatch(name) is None
+            or not name.isascii()
+            for name in environment_allowlist
+        )
+        or len(set(environment_allowlist)) != len(environment_allowlist)
+    ):
+        raise PressureProtocolError("pressure_invalid_config")
     metadata = config["stack_metadata"]
     if (
         type(metadata) is not dict
@@ -509,6 +717,29 @@ def _response_outcome(
     return "pass"
 
 
+def _selected_environment(allowlist: list[str]) -> dict[str, str]:
+    environment = dict(_MINIMAL_SELECTED_ENV)
+    for name in allowlist:
+        value = os.environ.get(name)
+        if value is None:
+            raise PressureProtocolError("pressure_environment_missing")
+        environment[name] = value
+    return environment
+
+
+def _safe_git_environment() -> dict[str, str]:
+    return {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
 def _write_all(descriptor: int, data: bytes) -> None:
     offset = 0
     while offset < len(data):
@@ -543,6 +774,79 @@ def _write_private_atomic(path: Path, data: bytes) -> str:
             pass
         raise
     return digest
+
+
+def _write_private_at(
+    directory: int, name: str, data: bytes, *, replace: bool = False
+) -> str:
+    name = _private_name(name)
+    temporary = f".{name}.tmp-{os.getpid()}"
+    target = temporary if replace else name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(target, flags, 0o600, dir_fd=directory)
+    except OSError as error:
+        raise PressureProtocolError("pressure_unsafe_file") from error
+    try:
+        _write_all(fd, data)
+        os.fsync(fd)
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise PressureProtocolError("pressure_unsafe_file")
+    finally:
+        os.close(fd)
+    if replace:
+        try:
+            os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        except BaseException:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            raise
+    return _sha256(data)
+
+
+def _assert_run_directory(root_fd: int, name: str, run_fd: int) -> None:
+    try:
+        named = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    except OSError as error:
+        raise PressureProtocolError("pressure_unsafe_state_root") from error
+    opened = os.fstat(run_fd)
+    if (
+        not stat.S_ISDIR(named.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or named.st_dev != opened.st_dev
+        or named.st_ino != opened.st_ino
+        or named.st_uid != os.getuid()
+        or stat.S_IMODE(named.st_mode) != 0o700
+        or stat.S_IMODE(opened.st_mode) != 0o700
+    ):
+        raise PressureProtocolError("pressure_unsafe_state_root")
+
+
+def _create_run_directory(root_fd: int, name: str) -> int:
+    try:
+        os.mkdir(name, 0o700, dir_fd=root_fd)
+        run_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_fd,
+        )
+    except FileExistsError as error:
+        raise PressureProtocolError("pressure_run_exists") from error
+    except OSError as error:
+        raise PressureProtocolError("pressure_unsafe_state_root") from error
+    try:
+        _assert_run_directory(root_fd, name, run_fd)
+        return run_fd
+    except BaseException:
+        os.close(run_fd)
+        raise
 
 
 def _usage(
@@ -804,7 +1108,13 @@ def _drain_closed_streams(
 
 
 def _run_bounded(
-    argv: list[str], cwd: Path, deadline: float, maximum: int | None = None
+    argv: list[str],
+    cwd: Path | str,
+    deadline: float,
+    maximum: int | None = None,
+    *,
+    env: dict[str, str],
+    pass_fds: tuple[int, ...] = (),
 ) -> tuple[bytes, bytes, int]:
     """Capture bounded output and terminate every member of the selected session."""
     maximum = MAX_CAPTURE_BYTES if maximum is None else maximum
@@ -818,6 +1128,8 @@ def _run_bounded(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            env=env,
+            pass_fds=pass_fds,
         )
     except BaseException:
         selector.close()
@@ -871,19 +1183,17 @@ def _run_bounded(
     return stdout, stderr, returncode
 
 
-def run_baseline(repo: Path) -> dict[str, Any]:
-    """Run all six scenarios only against an explicitly configured local stack."""
+def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]:
+    """Run the selected stack while all private I/O is descriptor-relative."""
     repo_root = _repo_root(repo)
     if any(repo_root.rglob("SKILL.md")):
         raise PressureProtocolError("pressure_skill_not_absent")
     protocol = load_public_protocol(repo_root)
-    state_root = _state_root(repo_root)
-    config_path = _private_file(state_root / _PRIVATE_CONFIG_NAME, state_root)
-    if not config_path.exists():
-        raise PressureProtocolError("pressure_stack_missing")
     try:
-        config, raw_config = _load_json(config_path)
+        config, raw_config = _load_json_at(state_root.fd, _PRIVATE_CONFIG_NAME)
     except PressureProtocolError as error:
+        if error.code == "pressure_file_missing":
+            raise PressureProtocolError("pressure_stack_missing") from error
         if error.code == "pressure_invalid_json":
             raise PressureProtocolError("pressure_invalid_config") from error
         raise
@@ -894,10 +1204,11 @@ def run_baseline(repo: Path) -> dict[str, Any]:
     command_hash = _sha256(
         _canonical_bytes({"argv": argv, "executable_sha256": executable_hash})
     )
-    run_dir = state_root / ("run-" + command_hash[:12])
-    if run_dir.exists():
-        raise PressureProtocolError("pressure_run_exists")
-    run_dir.mkdir(mode=0o700)
+    selected_environment = _selected_environment(config["environment_allowlist"])
+    run_name = "run-" + command_hash[:12]
+    run_fd = _create_run_directory(state_root.fd, run_name)
+    state_root.children.append(run_fd)
+    run_cwd = f"/proc/self/fd/{run_fd}"
     outcomes: list[dict[str, str]] = []
     evidence_entries: list[dict[str, str]] = []
     total_counts: dict[str, int] = {
@@ -913,7 +1224,8 @@ def run_baseline(repo: Path) -> dict[str, Any]:
         if time.monotonic() >= deadline:
             raise PressureProtocolError("pressure_timeout")
         scenario_id = scenario["scenario_id"]
-        usage_path = run_dir / f"usage-{position}.json"
+        usage_name = f"usage-{position}.json"
+        usage_path = f"{run_cwd}/{usage_name}"
         prompt = (
             "scenario_id: "
             + scenario_id
@@ -934,21 +1246,29 @@ def run_baseline(repo: Path) -> dict[str, Any]:
             for part in expanded
         ]
         try:
-            stdout, stderr, returncode = _run_bounded(expanded, run_dir, deadline)
-        except PressureProtocolError as error:
-            _write_private(
-                run_dir / f"stdout-{position}.bin", getattr(error, "stdout", b"")
+            _assert_run_directory(state_root.fd, run_name, run_fd)
+            stdout, stderr, returncode = _run_bounded(
+                expanded,
+                run_cwd,
+                deadline,
+                env=selected_environment,
+                pass_fds=(run_fd,),
             )
-            _write_private(
-                run_dir / f"stderr-{position}.bin", getattr(error, "stderr", b"")
+            _assert_run_directory(state_root.fd, run_name, run_fd)
+        except PressureProtocolError as error:
+            _write_private_at(
+                run_fd, f"stdout-{position}.bin", getattr(error, "stdout", b"")
+            )
+            _write_private_at(
+                run_fd, f"stderr-{position}.bin", getattr(error, "stderr", b"")
             )
             raise
-        stdout_digest = _write_private(run_dir / f"stdout-{position}.bin", stdout)
-        stderr_digest = _write_private(run_dir / f"stderr-{position}.bin", stderr)
+        stdout_digest = _write_private_at(run_fd, f"stdout-{position}.bin", stdout)
+        stderr_digest = _write_private_at(run_fd, f"stderr-{position}.bin", stderr)
         if returncode != 0:
             raise PressureProtocolError("pressure_subprocess_failed")
         try:
-            usage_value, usage_raw = _load_json(usage_path)
+            usage_value, usage_raw = _load_json_at(run_fd, usage_name)
         except PressureProtocolError as error:
             raise PressureProtocolError("pressure_invalid_usage") from error
         consumption = _usage(usage_value, config["caps"], config["usage_report"])
@@ -1012,8 +1332,11 @@ def run_baseline(repo: Path) -> dict[str, Any]:
             "entries": evidence_entries,
         }
     )
-    manifest_digest = _write_private_atomic(
-        run_dir / "baseline-evidence-manifest.json", _canonical_bytes(manifest)
+    manifest_digest = _write_private_at(
+        run_fd,
+        "baseline-evidence-manifest.json",
+        _canonical_bytes(manifest),
+        replace=True,
     )
     summary = {
         "contract_version": "1.0",
@@ -1048,3 +1371,13 @@ def run_baseline(repo: Path) -> dict[str, Any]:
         },
     }
     return summary
+
+
+def run_baseline(repo: Path) -> dict[str, Any]:
+    """Run all six scenarios only against an explicitly configured local stack."""
+    repo_root = _repo_root(repo)
+    state_root = _state_root(repo_root)
+    try:
+        return _run_baseline_in_state(repo_root, state_root)
+    finally:
+        state_root.close()
