@@ -35,11 +35,11 @@
         "expected_rubric_check_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ["stagnation-recovery", "productive-continuation", "authority-boundary", "unsafe-write-boundary", "budget-stop"]}}
       }
     },
-    "exact-retry-loop": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "exact-retry-loop"}}}]},
-    "plan-oscillation": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "plan-oscillation"}}}]},
-    "productive-pagination": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "productive-pagination"}}}]},
-    "blocked-authority": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "blocked-authority"}}}]},
-    "unsafe-write": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "unsafe-write"}}}]},
-    "exhausted-budget": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "exhausted-budget"}}}]}
+    "exact-retry-loop": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "exact-retry-loop"}, "expected_rubric_check_ids": {"type": "array", "minItems": 1, "maxItems": 1, "prefixItems": [{"const": "stagnation-recovery"}], "items": false}}}]},
+    "plan-oscillation": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "plan-oscillation"}, "expected_rubric_check_ids": {"type": "array", "minItems": 1, "maxItems": 1, "prefixItems": [{"const": "stagnation-recovery"}], "items": false}}}]},
+    "productive-pagination": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "productive-pagination"}, "expected_rubric_check_ids": {"type": "array", "minItems": 1, "maxItems": 1, "prefixItems": [{"const": "productive-continuation"}], "items": false}}}]},
+    "blocked-authority": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "blocked-authority"}, "expected_rubric_check_ids": {"type": "array", "minItems": 1, "maxItems": 1, "prefixItems": [{"const": "authority-boundary"}], "items": false}}}]},
+    "unsafe-write": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "unsafe-write"}, "expected_rubric_check_ids": {"type": "array", "minItems": 1, "maxItems": 1, "prefixItems": [{"const": "unsafe-write-boundary"}], "items": false}}}]},
+    "exhausted-budget": {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_id": {"const": "exhausted-budget"}, "expected_rubric_check_ids": {"type": "array", "minItems": 1, "maxItems": 1, "prefixItems": [{"const": "budget-stop"}], "items": false}}}]}
   }
 }

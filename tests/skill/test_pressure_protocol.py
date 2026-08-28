@@ -28,6 +28,14 @@ SCENARIO_IDS = [
     "unsafe-write",
     "exhausted-budget",
 ]
+SCENARIO_RUBRIC_CHECK_IDS = [
+    ("exact-retry-loop", "stagnation-recovery"),
+    ("plan-oscillation", "stagnation-recovery"),
+    ("productive-pagination", "productive-continuation"),
+    ("blocked-authority", "authority-boundary"),
+    ("unsafe-write", "unsafe-write-boundary"),
+    ("exhausted-budget", "budget-stop"),
+]
 
 
 def _load(name: str) -> dict[str, Any]:
@@ -224,6 +232,105 @@ def test_public_pressure_contracts_are_closed_versioned_and_ascii() -> None:
         malformed_response_contract = copy.deepcopy(rubric)
         malformed_response_contract["response_schema"]["required"] = required
         _invalid(response_contract_validator, malformed_response_contract)
+
+
+@pytest.mark.parametrize(
+    ("position", "scenario_id", "expected_check_id"),
+    [
+        (position, scenario_id, expected_check_id)
+        for position, (scenario_id, expected_check_id) in enumerate(
+            SCENARIO_RUBRIC_CHECK_IDS
+        )
+    ],
+)
+def test_each_scenario_position_requires_its_exact_single_rubric_check(
+    position: int, scenario_id: str, expected_check_id: str
+) -> None:
+    scenarios = _load("pressure-scenarios.json")
+    validator = Draft202012Validator(_load("pressure-scenarios.schema.json"))
+    wrong_check_id = next(
+        check_id
+        for _, check_id in SCENARIO_RUBRIC_CHECK_IDS
+        if check_id != expected_check_id
+    )
+
+    assert scenarios["scenarios"][position]["scenario_id"] == scenario_id
+    assert scenarios["scenarios"][position]["expected_rubric_check_ids"] == [
+        expected_check_id
+    ]
+    assert not list(validator.iter_errors(scenarios))
+    for expected_check_ids in (
+        [wrong_check_id],
+        [],
+        [expected_check_id, wrong_check_id],
+        [expected_check_id, expected_check_id],
+    ):
+        mutated = copy.deepcopy(scenarios)
+        mutated["scenarios"][position]["expected_rubric_check_ids"] = expected_check_ids
+        _invalid(validator, mutated)
+
+
+def test_current_scenario_fixtures_are_schema_valid_and_reject_wrong_relinks() -> None:
+    scenarios = _load("pressure-scenarios.json")
+    scenario_validator = Draft202012Validator(_load("pressure-scenarios.schema.json"))
+    Draft202012Validator.check_schema(scenario_validator.schema)
+    scenario_validator.validate(scenarios)
+
+    for position, (_, expected_check_id) in enumerate(SCENARIO_RUBRIC_CHECK_IDS):
+        wrong_check_id = next(
+            check_id
+            for _, check_id in SCENARIO_RUBRIC_CHECK_IDS
+            if check_id != expected_check_id
+        )
+        wrong_relink = copy.deepcopy(scenarios)
+        wrong_relink["scenarios"][position]["expected_rubric_check_ids"] = [
+            wrong_check_id
+        ]
+        _invalid(scenario_validator, wrong_relink)
+
+
+def test_current_scenarios_load_and_runtime_uses_their_exact_bound_check() -> None:
+    protocol = runner.load_public_protocol(PROJECT_ROOT)
+    checks = {item["check_id"]: item for item in protocol["rubric"]["checks"]}
+
+    assert [
+        (item["scenario_id"], item["expected_rubric_check_ids"][0])
+        for item in protocol["scenarios"]["scenarios"]
+    ] == SCENARIO_RUBRIC_CHECK_IDS
+    for position, (scenario_id, expected_check_id) in enumerate(
+        SCENARIO_RUBRIC_CHECK_IDS
+    ):
+        scenario = protocol["scenarios"]["scenarios"][position]
+        check = checks[expected_check_id]
+        response = {
+            "action": check["pass_actions"][0],
+            "authority_owner": check["response_constraints"]["authority_owner"][0],
+            "would_execute_write": check["response_constraints"]["would_execute_write"][
+                0
+            ],
+            "repeat_unknown_write": check["response_constraints"][
+                "repeat_unknown_write"
+            ][0],
+            "budget_state": check["response_constraints"]["budget_state"][0],
+            "evidence_ids": [],
+            "reason_codes": [],
+        }
+        assert (
+            runner._response_outcome(scenario, response, protocol["rubric"]) == "pass"
+        )
+
+        marker = f"{scenario_id}-bound-check"
+        mutated_rubric = copy.deepcopy(protocol["rubric"])
+        bound_check = next(
+            item
+            for item in mutated_rubric["checks"]
+            if item["check_id"] == expected_check_id
+        )
+        bound_check["pass_actions"] = [
+            "stop" if response["action"] != "stop" else "continue"
+        ]
+        bound_check["failure_code"] = marker
+        assert runner._response_outcome(scenario, response, mutated_rubric) == marker
 
 
 def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
