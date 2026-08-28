@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 from collections.abc import Sequence
 from itertools import pairwise
-from pathlib import Path
-from typing import Any
+from typing import Any, Never
 
 from . import ControllerError, DecisionEnvelope, RunPolicy, TraceEvent, analyze
 from .canonical import canonicalize_json
 from .models import ModelValidationError
+from .validation import ContractValidationError, load_public_json
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -31,6 +33,7 @@ MAX_JSONL_LINE_BYTES = 262_144
 MAX_JSONL_TOTAL_BYTES = 4_194_304
 
 _ERROR_NAMES = {
+    EXIT_USAGE: "usage",
     EXIT_INVALID_SCHEMA: "invalid_schema",
     EXIT_SEQUENCE_GAP: "sequence_gap",
     EXIT_INCOMPATIBLE_VERSION: "incompatible_version",
@@ -41,11 +44,33 @@ _ERROR_NAMES = {
 }
 
 
+class _UsageFailure(Exception):
+    """A parse failure whose diagnostic must not reflect untrusted argv."""
+
+
+class _HelpRequested(Exception):
+    """Normal argparse help completion without letting SystemExit escape main."""
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> Never:
+        del message
+        raise _UsageFailure
+
+    def exit(self, status: int = 0, message: str | None = None) -> Never:
+        del message
+        if status == EXIT_OK:
+            raise _HelpRequested
+        raise _UsageFailure
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _SafeArgumentParser(
         prog="reheat", description="Safe semantic reheating analysis."
     )
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(
+        dest="command", required=True, parser_class=_SafeArgumentParser
+    )
     validate = commands.add_parser("validate", help="validate a trace and policy")
     validate.add_argument("trace")
     validate.add_argument("--policy", required=True)
@@ -71,11 +96,34 @@ def _error(exit_code: int) -> int:
 
 
 def _read_bytes(path: str, limit: int) -> bytes:
+    """Read a bounded regular file through one verified descriptor.
+
+    On platforms without ``O_NOFOLLOW`` the lstat/open/fstat sequence is
+    best-effort: the opened descriptor is still verified, but a path can race
+    between the lstat and open calls. Platforms with ``O_NOFOLLOW`` reject that
+    swap at open time as well.
+    """
+    descriptor = -1
     try:
-        with Path(path).open("rb") as source:
-            data = source.read(limit + 1)
-    except (FileNotFoundError, PermissionError, IsADirectoryError, OSError) as error:
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            raise _CliFailure(EXIT_IO)
+        flags = os.O_RDONLY | os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _CliFailure(EXIT_IO)
+        if metadata.st_size > limit:
+            raise _CliFailure(EXIT_INVALID_SCHEMA)
+        data = os.read(descriptor, limit + 1)
+    except _CliFailure:
+        raise
+    except OSError as error:
         raise _CliFailure(EXIT_IO) from error
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
     if len(data) > limit:
         raise _CliFailure(EXIT_INVALID_SCHEMA)
     return data
@@ -83,8 +131,8 @@ def _read_bytes(path: str, limit: int) -> bytes:
 
 def _json_object_bytes(data: bytes) -> dict[str, Any]:
     try:
-        value = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = load_public_json(data)
+    except ContractValidationError as error:
         raise _CliFailure(EXIT_INVALID_SCHEMA) from error
     if type(value) is not dict:
         raise _CliFailure(EXIT_INVALID_SCHEMA)
@@ -141,6 +189,8 @@ def _parse_trace(raw_trace: list[dict[str, Any]]) -> tuple[TraceEvent, ...]:
         raise _CliFailure(EXIT_INVALID_SCHEMA)
     if any(event.run_id != parsed[0].run_id for event in parsed[1:]):
         raise _CliFailure(EXIT_INVALID_SCHEMA)
+    if parsed[0].sequence != 1:
+        raise _CliFailure(EXIT_SEQUENCE_GAP)
     if any(
         current.sequence != previous.sequence + 1
         for previous, current in pairwise(parsed)
@@ -189,7 +239,10 @@ def _text(envelope: DecisionEnvelope) -> str:
                 "reason_codes: " + (",".join(envelope.reason_codes) or "none"),
                 "evidence_event_ids: "
                 + (",".join(envelope.evidence_event_ids) or "none"),
-                "summary: " + json.dumps(envelope.human_summary, ensure_ascii=False),
+                "summary: "
+                + json.dumps(
+                    envelope.human_summary, ensure_ascii=True, separators=(",", ":")
+                ),
             )
         )
         + "\n"
@@ -247,6 +300,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run a bounded, side-effect-free CLI and return its process status."""
     try:
         arguments = _parser().parse_args(argv)
+    except _HelpRequested:
+        return EXIT_OK
+    except _UsageFailure:
+        return _error(EXIT_USAGE)
     except SystemExit as error:
         return error.code if type(error.code) is int else EXIT_USAGE
     try:

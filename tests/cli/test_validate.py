@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
@@ -8,6 +12,13 @@ import pytest
 from semantic_reheating import cli
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _main_in_child(argv: list[str], results: object) -> None:
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        result = cli.main(argv)
+    results.put((result, stdout.getvalue(), stderr.getvalue()))  # type: ignore[union-attr]
 
 
 def _policy() -> dict[str, object]:
@@ -32,6 +43,12 @@ def _write_trace(path: Path, *events: object) -> Path:
         "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
     )
     return path
+
+
+def _duplicate_json_key(data: dict[str, object], key: str) -> str:
+    encoded = json.dumps(data)
+    key_value = f'"{key}": {json.dumps(data[key])}'
+    return encoded.replace(key_value, f"{key_value}, {key_value}", 1)
 
 
 def test_exit_constants_are_stable() -> None:
@@ -59,6 +76,24 @@ def test_help_lists_all_supported_subcommands(
         command in captured.out
         for command in ("validate", "analyze", "explain", "benchmark")
     )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["validate", "/sensitive/path/payload", "--policy", "policy", "secret"],
+        ["validate", "trace", "--policy", "policy", "--token=secret"],
+        ["analyze", "trace", "--policy", "policy", "--format", "attacker-value"],
+        ["validate", "trace"],
+    ],
+)
+def test_usage_errors_do_not_echo_untrusted_arguments(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: usage\n"
 
 
 def test_benchmark_is_parsed_but_unavailable(
@@ -128,6 +163,54 @@ def test_validate_maps_sequence_gap_and_duplicate_to_distinct_safe_codes(
     assert capsys.readouterr().out == ""
 
 
+def test_validate_rejects_a_trace_starting_at_sequence_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    event = _event()
+    event["sequence"] = 2
+    trace = _write_trace(tmp_path / "trace.jsonl", event)
+    policy = _write_json(tmp_path / "policy.json", _policy())
+
+    assert cli.main(["validate", str(trace), "--policy", str(policy)]) == 4
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: sequence_gap\n"
+
+
+@pytest.mark.parametrize("duplicate_location", ["trace", "policy", "nested_policy"])
+def test_validate_rejects_duplicate_json_keys_at_ingress(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    duplicate_location: str,
+) -> None:
+    event = _event()
+    policy_data = _policy()
+    trace_text = json.dumps(event)
+    policy_text = json.dumps(policy_data)
+    if duplicate_location == "trace":
+        trace_text = _duplicate_json_key(event, "contract_version")
+    elif duplicate_location == "policy":
+        policy_text = _duplicate_json_key(policy_data, "contract_version")
+    else:
+        nested = policy_data["side_effect_rules"]  # type: ignore[index]
+        nested["unknown_treated_as_repeatable"] = False  # type: ignore[index]
+        policy_text = json.dumps(policy_data).replace(
+            '"unknown_treated_as_repeatable": false',
+            '"unknown_treated_as_repeatable": false, '
+            '"unknown_treated_as_repeatable": false',
+            1,
+        )
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(trace_text + "\n", encoding="utf-8")
+    policy = tmp_path / "policy.json"
+    policy.write_text(policy_text, encoding="utf-8")
+
+    assert cli.main(["validate", str(trace), "--policy", str(policy)]) == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: invalid_schema\n"
+
+
 def test_validate_hides_file_and_payload_data_on_invalid_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -164,6 +247,59 @@ def test_safe_loader_enforces_exact_byte_boundaries(tmp_path: Path) -> None:
     with pytest.raises(cli._CliFailure) as caught:
         cli._read_bytes(str(source), len(content) - 1)
     assert caught.value.exit_code == cli.EXIT_INVALID_SCHEMA
+
+
+def test_validate_rejects_a_fifo_without_blocking(
+    tmp_path: Path,
+) -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("FIFO promptness probe requires fork")
+    fifo = tmp_path / "trace.fifo"
+    os.mkfifo(fifo)
+    policy = _write_json(tmp_path / "policy.json", _policy())
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    worker = context.Process(
+        target=_main_in_child,
+        args=(["validate", str(fifo), "--policy", str(policy)], results),
+    )
+    worker.start()
+    try:
+        worker.join(1)
+        assert not worker.is_alive(), "CLI blocked while opening FIFO"
+        assert worker.exitcode == 0
+        assert results.get(timeout=1) == (9, "", "error: io_error\n")
+    finally:
+        if worker.is_alive():
+            worker.terminate()
+        worker.join()
+        results.close()
+
+
+@pytest.mark.parametrize("source_kind", ["directory", "dev_null", "symlink"])
+def test_validate_rejects_non_regular_or_symlinked_trace_inputs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source_kind: str,
+) -> None:
+    policy = _write_json(tmp_path / "policy.json", _policy())
+    if source_kind == "directory":
+        source = tmp_path / "trace-directory"
+        source.mkdir()
+    elif source_kind == "dev_null":
+        source = Path("/dev/null")
+        if not source.exists():
+            pytest.skip("/dev/null is unavailable")
+    else:
+        target = _write_trace(tmp_path / "valid-target.jsonl", _event())
+        source = tmp_path / "trace-link.jsonl"
+        source.symlink_to(target)
+
+    assert cli.main(["validate", str(source), "--policy", str(policy)]) == 9
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: io_error\n"
+    assert str(source) not in captured.err
 
 
 def test_validate_maps_unsafe_policy_and_io_without_leaking_paths(

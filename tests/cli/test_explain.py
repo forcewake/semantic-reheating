@@ -57,6 +57,50 @@ def test_explain_escapes_control_characters_in_human_summary(
     assert "\x1b" not in captured.out
 
 
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+def test_explain_escapes_all_unicode_line_separators_in_human_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], separator: str
+) -> None:
+    data = _decision()
+    data["human_summary"] = f"before{separator}after\n\x1b"
+    decision = tmp_path / "decision.json"
+    decision.write_text(json.dumps(data), encoding="utf-8")
+
+    assert cli.main(["explain", str(decision)]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    encoded_separator = json.dumps(separator)[1:-1]
+    assert captured.out.splitlines() == [
+        "decision: escalate",
+        "confidence: 0.8",
+        "requires_host_action: true",
+        "reason_codes: host_action_required",
+        "evidence_event_ids: event-001",
+        f'summary: "before{encoded_separator}after\\n\\u001b"',
+    ]
+    assert separator not in captured.out
+    assert "\x1b" not in captured.out
+
+
+def test_explain_rejects_a_duplicate_json_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = _decision()
+    contract_version = '"contract_version": "1.0"'
+    decision = tmp_path / "decision.json"
+    decision.write_text(
+        json.dumps(data).replace(
+            contract_version, f"{contract_version}, {contract_version}", 1
+        ),
+        encoding="utf-8",
+    )
+
+    assert cli.main(["explain", str(decision)]) == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: invalid_schema\n"
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [(None, 5), ("2.0", 5)],

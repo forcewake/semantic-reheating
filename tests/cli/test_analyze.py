@@ -86,3 +86,17 @@ def test_analyze_maps_required_detector_unavailable(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "error: required_detector_unavailable\n"
+
+
+def test_analyze_rejects_a_trace_starting_at_sequence_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    trace, policy = _inputs(tmp_path)
+    event = _missing_authority_event()
+    event["sequence"] = 2
+    trace.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+    assert cli.main(["analyze", str(trace), "--policy", str(policy)]) == 4
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: sequence_gap\n"
