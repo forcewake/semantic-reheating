@@ -5,11 +5,14 @@ import io
 import json
 import multiprocessing
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from semantic_reheating import cli
+from semantic_reheating.canonical import canonicalize_json
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -110,6 +113,204 @@ def test_validate_emits_only_canonical_status_record(
 ) -> None:
     trace = _write_trace(tmp_path / "trace.jsonl", _event())
     policy = _write_json(tmp_path / "policy.json", _policy())
+
+    assert cli.main(["validate", str(trace), "--policy", str(policy)]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == (
+        '{"contract_version":"1.0","event_count":1,"run_id":"run-example","status":"valid"}\n'
+    )
+
+
+def test_validate_emits_canonical_utf8_bytes_when_text_stdout_is_ascii(
+    tmp_path: Path,
+) -> None:
+    event = _event()
+    event["run_id"] = "run-é"
+    trace = _write_trace(tmp_path / "trace.jsonl", event)
+    policy = _write_json(tmp_path / "policy.json", _policy())
+    result = subprocess.run(
+        [
+            str(Path(sys.executable).with_name("reheat")),
+            "validate",
+            str(trace),
+            "--policy",
+            str(policy),
+        ],
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PYTHONIOENCODING": "ascii"},
+    )
+
+    assert result.returncode == 0
+    assert (
+        result.stdout
+        == canonicalize_json(
+            {
+                "contract_version": "1.0",
+                "event_count": 1,
+                "run_id": "run-é",
+                "status": "valid",
+            }
+        )
+        + b"\n"
+    )
+    assert result.stderr == b""
+
+
+def test_validate_broken_pipe_exits_successfully_without_a_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = _write_trace(tmp_path / "trace.jsonl", _event())
+    policy = _write_json(tmp_path / "policy.json", _policy())
+
+    class BrokenPipeBuffer:
+        def write(self, data: object) -> int:
+            del data
+            raise BrokenPipeError
+
+        def flush(self) -> None:
+            raise BrokenPipeError
+
+    class BrokenPipeStdout:
+        buffer = BrokenPipeBuffer()
+
+    stderr = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", BrokenPipeStdout())
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+
+    assert cli.main(["validate", str(trace), "--policy", str(policy)]) == 0
+    assert stderr.getvalue() == ""
+
+
+def test_validate_retries_binary_stdout_short_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = _write_trace(tmp_path / "trace.jsonl", _event())
+    policy = _write_json(tmp_path / "policy.json", _policy())
+
+    class ShortWriteBuffer:
+        def __init__(self) -> None:
+            self.output = bytearray()
+            self.flushed = False
+
+        def write(self, data: bytes | memoryview) -> int:
+            chunk = bytes(data)
+            written = min(len(chunk), 3)
+            self.output.extend(chunk[:written])
+            return written
+
+        def flush(self) -> None:
+            self.flushed = True
+
+    class ShortWriteStdout:
+        def __init__(self, buffer: ShortWriteBuffer) -> None:
+            self.buffer = buffer
+
+    buffer = ShortWriteBuffer()
+    stderr = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", ShortWriteStdout(buffer))
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+
+    assert cli.main(["validate", str(trace), "--policy", str(policy)]) == 0
+    assert (
+        bytes(buffer.output)
+        == canonicalize_json(
+            {
+                "contract_version": "1.0",
+                "event_count": 1,
+                "run_id": "run-example",
+                "status": "valid",
+            }
+        )
+        + b"\n"
+    )
+    assert buffer.flushed
+    assert stderr.getvalue() == ""
+
+
+def test_validate_rejects_indeterminate_binary_stdout_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = _write_trace(tmp_path / "trace.jsonl", _event())
+    policy = _write_json(tmp_path / "policy.json", _policy())
+
+    class IndeterminateBuffer:
+        def write(self, data: object) -> None:
+            del data
+
+        def flush(self) -> None:
+            pass
+
+    class IndeterminateStdout:
+        buffer = IndeterminateBuffer()
+
+    stderr = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stdout", IndeterminateStdout())
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+
+    assert cli.main(["validate", str(trace), "--policy", str(policy)]) == 10
+    assert stderr.getvalue() == "error: internal_error\n"
+
+
+def test_validate_reads_complete_documents_when_os_reads_are_short(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = _write_trace(tmp_path / "trace.jsonl", _event())
+    policy = _write_json(tmp_path / "policy.json", _policy())
+    original_read = cli.os.read
+    read_calls = 0
+
+    def short_read(descriptor: int, requested: int) -> bytes:
+        nonlocal read_calls
+        read_calls += 1
+        return original_read(descriptor, min(requested, 3))
+
+    monkeypatch.setattr(cli.os, "read", short_read)
+
+    assert cli.main(["validate", str(trace), "--policy", str(policy)]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == (
+        '{"contract_version":"1.0","event_count":1,"run_id":"run-example","status":"valid"}\n'
+    )
+    assert read_calls > 1
+
+
+def test_validate_rejects_garbage_after_a_short_valid_trace_prefix(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = tmp_path / "trace.jsonl"
+    valid_prefix = (json.dumps(_event()) + "\n").encode("utf-8")
+    trace.write_bytes(valid_prefix + b"garbage")
+    policy = _write_json(tmp_path / "policy.json", _policy())
+    trace_inode = trace.stat().st_ino
+    original_read = cli.os.read
+    trace_read_calls = 0
+
+    def prefix_then_remainder(descriptor: int, requested: int) -> bytes:
+        nonlocal trace_read_calls
+        if os.fstat(descriptor).st_ino == trace_inode:
+            trace_read_calls += 1
+            if trace_read_calls == 1:
+                return original_read(descriptor, min(requested, len(valid_prefix)))
+        return original_read(descriptor, requested)
+
+    monkeypatch.setattr(cli.os, "read", prefix_then_remainder)
+
+    assert cli.main(["validate", str(trace), "--policy", str(policy)]) == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: invalid_schema\n"
+    assert trace_read_calls > 1
+
+
+def test_validate_works_without_os_nonblock_flag(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = _write_trace(tmp_path / "trace.jsonl", _event())
+    policy = _write_json(tmp_path / "policy.json", _policy())
+    monkeypatch.delattr(cli.os, "O_NONBLOCK", raising=False)
 
     assert cli.main(["validate", str(trace), "--policy", str(policy)]) == 0
     captured = capsys.readouterr()

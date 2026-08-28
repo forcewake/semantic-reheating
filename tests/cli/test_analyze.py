@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from semantic_reheating import cli
+from semantic_reheating.canonical import canonicalize_json
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -51,6 +55,38 @@ def test_analyze_json_is_canonical_and_missing_authority_escalates(
 
     assert cli.main(args) == 0
     assert capsys.readouterr().out == first.out
+
+
+def test_analyze_json_emits_canonical_bytes_when_text_stdout_is_ascii(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    event = _missing_authority_event()
+    policy_data = _policy()
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps(policy_data), encoding="utf-8")
+    args = ["analyze", str(trace), "--policy", str(policy), "--format", "json"]
+    assert cli.main(args) == 0
+    expected = canonicalize_json(json.loads(capsys.readouterr().out)) + b"\n"
+    result = subprocess.run(
+        [
+            str(Path(sys.executable).with_name("reheat")),
+            "analyze",
+            str(trace),
+            "--policy",
+            str(policy),
+            "--format",
+            "json",
+        ],
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PYTHONIOENCODING": "ascii"},
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == expected
+    assert result.stderr == b""
 
 
 def test_analyze_text_is_stable_redacted_and_escalates(

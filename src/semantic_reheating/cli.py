@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import stat
@@ -107,16 +108,22 @@ def _read_bytes(path: str, limit: int) -> bytes:
     try:
         if stat.S_ISLNK(os.lstat(path).st_mode):
             raise _CliFailure(EXIT_IO)
-        flags = os.O_RDONLY | os.O_NONBLOCK
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise _CliFailure(EXIT_IO)
         if metadata.st_size > limit:
             raise _CliFailure(EXIT_INVALID_SCHEMA)
-        data = os.read(descriptor, limit + 1)
+        data = bytearray()
+        while len(data) <= limit:
+            chunk = os.read(descriptor, min(65_536, limit + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > limit:
+                raise _CliFailure(EXIT_INVALID_SCHEMA)
     except _CliFailure:
         raise
     except OSError as error:
@@ -126,7 +133,7 @@ def _read_bytes(path: str, limit: int) -> bytes:
             os.close(descriptor)
     if len(data) > limit:
         raise _CliFailure(EXIT_INVALID_SCHEMA)
-    return data
+    return bytes(data)
 
 
 def _json_object_bytes(data: bytes) -> dict[str, Any]:
@@ -229,6 +236,26 @@ def _canonical_line(value: dict[str, Any]) -> str:
     return canonicalize_json(value).decode("utf-8") + "\n"
 
 
+def _write_canonical_stdout(value: dict[str, Any]) -> None:
+    """Write one complete RFC 8785 record without text-stream transcoding."""
+    payload = canonicalize_json(value) + b"\n"
+    stdout = sys.stdout
+    buffer = getattr(stdout, "buffer", None)
+    if buffer is None:
+        if not isinstance(stdout, io.StringIO):
+            raise OSError("stdout does not provide a byte buffer")
+        stdout.write(payload.decode("utf-8"))
+        stdout.flush()
+        return
+    remaining = memoryview(payload)
+    while remaining:
+        written = buffer.write(remaining)
+        if not isinstance(written, int) or not 0 < written <= len(remaining):
+            raise OSError("stdout write failed")
+        remaining = remaining[written:]
+    buffer.flush()
+
+
 def _text(envelope: DecisionEnvelope) -> str:
     return (
         "\n".join(
@@ -251,16 +278,13 @@ def _text(envelope: DecisionEnvelope) -> str:
 
 def _validate(trace_path: str, policy_path: str) -> int:
     trace, _ = _inputs(trace_path, policy_path)
-    print(
-        _canonical_line(
-            {
-                "contract_version": "1.0",
-                "event_count": len(trace),
-                "run_id": trace[0].run_id,
-                "status": "valid",
-            }
-        ),
-        end="",
+    _write_canonical_stdout(
+        {
+            "contract_version": "1.0",
+            "event_count": len(trace),
+            "run_id": trace[0].run_id,
+            "status": "valid",
+        }
     )
     return EXIT_OK
 
@@ -280,7 +304,7 @@ def _analyze(trace_path: str, policy_path: str, output_format: str) -> int:
     except Exception as error:
         raise _CliFailure(EXIT_INTERNAL) from error
     if output_format == "json":
-        print(_canonical_line(envelope.to_dict()), end="")
+        _write_canonical_stdout(envelope.to_dict())
     else:
         print(_text(envelope), end="")
     return EXIT_OK
@@ -294,6 +318,14 @@ def _explain(decision_path: str) -> int:
 class _CliFailure(Exception):
     def __init__(self, exit_code: int) -> None:
         self.exit_code = exit_code
+
+
+def _silence_broken_pipe() -> None:
+    """Prevent interpreter teardown from retrying a failed stdout flush."""
+    try:
+        sys.stdout.close()
+    except (AttributeError, OSError):
+        pass
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -315,6 +347,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "analyze":
             return _analyze(arguments.trace, arguments.policy, arguments.format)
         return _explain(arguments.decision)
+    except BrokenPipeError:
+        _silence_broken_pipe()
+        return EXIT_OK
     except _CliFailure as error:
         return _error(error.exit_code)
     except (MemoryError, KeyboardInterrupt):
