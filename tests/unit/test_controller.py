@@ -73,6 +73,103 @@ def _repetition_and_stall_trace() -> list[Any]:
     ]
 
 
+def _refresh_decision_id(source: dict[str, Any]) -> None:
+    """Recompute the public RFC8785/SHA decision identifier after a mutation."""
+    from hashlib import sha256
+
+    from semantic_reheating.canonical import canonicalize_json
+
+    basis = {key: value for key, value in source.items() if key != "decision_id"}
+    source["decision_id"] = (
+        "decision-" + sha256(canonicalize_json(basis)).hexdigest()[:24]
+    )
+
+
+def _refresh_reheat_confidence_and_id(source: dict[str, Any]) -> None:
+    maxima = {"repetition": 0.0, "no_progress": 0.0}
+    for finding in source["confidence"]["contributing_findings"]:
+        if finding["matched"] is True and finding["finding_class"] in maxima:
+            maxima[finding["finding_class"]] = max(
+                maxima[finding["finding_class"]], finding["weighted_score"]
+            )
+    source["confidence"]["score"] = min(maxima["repetition"], maxima["no_progress"])
+    _refresh_decision_id(source)
+
+
+def _genuine_reheat_source(
+    *, semantic_repetition: bool = False, multiple_no_progress: bool = False
+) -> dict[str, Any]:
+    from semantic_reheating.controller import analyze
+
+    trace = _repetition_and_stall_trace()
+    if multiple_no_progress:
+        trace.extend(
+            (
+                _event(
+                    7,
+                    "tool_call",
+                    payload={"action": "observe"},
+                    state_fingerprint="state-a",
+                    expected_state_change=True,
+                ),
+                _event(
+                    8,
+                    "state_observation",
+                    payload={"state": "unchanged"},
+                    state_fingerprint="state-a",
+                ),
+            )
+        )
+    policy_changes: dict[str, Any] = {
+        "recovery_ladder__nudge__permitted": False,
+        "recovery_ladder__diagnose__permitted": False,
+    }
+    detector: Any = None
+    if semantic_repetition:
+        policy_changes.update(
+            {
+                "detectors__semantic_detector__enabled": True,
+                "detectors__semantic_detector__weight": 0.2,
+            }
+        )
+
+        class SemanticRepetition:
+            def detect(self, events: tuple[Any, ...], _: Any) -> dict[str, Any]:
+                return {
+                    "contract_version": "1.0",
+                    "run_id": events[0].run_id,
+                    "finding_id": "semantic-repetition",
+                    "detector_name": "semantic",
+                    "detector_version": "1.0",
+                    "matched": True,
+                    "score": 0.25,
+                    "finding_class": "repetition",
+                    "event_ids": [events[0].event_id],
+                    "reason_code": "repetition_detected",
+                    "explanation": "Redacted semantic repetition support.",
+                    "availability": {"status": "available", "notice": "Available."},
+                }
+
+        detector = SemanticRepetition()
+    return analyze(
+        trace, _policy(**policy_changes), semantic_detector=detector
+    ).to_dict()
+
+
+def _assert_invalid_recovery_decision(decision: Any) -> None:
+    from semantic_reheating.controller import (
+        ControllerError,
+        build_recovery_instruction,
+    )
+
+    with pytest.raises(ControllerError) as caught:
+        build_recovery_instruction(decision)
+    assert caught.value.code == "invalid_recovery_decision"
+    assert caught.value.args == ("Invalid controller input",)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
 def test_decision_envelope_preserves_raw_weight_and_weighted_scores() -> None:
     from semantic_reheating.models import DecisionEnvelope
 
@@ -459,6 +556,100 @@ def test_build_recovery_instruction_is_portable_and_advisory() -> None:
     with pytest.raises(ControllerError) as caught:
         build_recovery_instruction(decision)
     assert caught.value.code == "invalid_recovery_decision"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "empty_contributions",
+        "repetition_only",
+        "no_progress_only",
+        "weighted_score_mismatch",
+        "zero_weight_repetition",
+        "confidence_mismatch",
+        "unmatched_contributor",
+        "duplicate_finding_id",
+    ),
+)
+def test_build_recovery_instruction_rejects_semantically_inconsistent_reheat(
+    mutation: str,
+) -> None:
+    """Schema-valid serialized REHEAT support must remain internally consistent."""
+    from semantic_reheating.models import Decision, DecisionEnvelope
+
+    source = _genuine_reheat_source(
+        semantic_repetition=mutation == "unmatched_contributor"
+    )
+    contributions = source["confidence"]["contributing_findings"]
+    if mutation == "empty_contributions":
+        source["confidence"]["contributing_findings"] = []
+        source["confidence"]["score"] = 0.0
+        _refresh_decision_id(source)
+    elif mutation in {"repetition_only", "no_progress_only"}:
+        keep = "repetition" if mutation == "repetition_only" else "no_progress"
+        source["confidence"]["contributing_findings"] = [
+            item for item in contributions if item["finding_class"] == keep
+        ]
+        _refresh_reheat_confidence_and_id(source)
+    elif mutation == "weighted_score_mismatch":
+        repetition = next(
+            item for item in contributions if item["finding_class"] == "repetition"
+        )
+        repetition["weighted_score"] = 0.123
+        _refresh_reheat_confidence_and_id(source)
+    elif mutation == "zero_weight_repetition":
+        repetition = next(
+            item for item in contributions if item["finding_class"] == "repetition"
+        )
+        repetition["weight"] = 0.0
+        repetition["weighted_score"] = 0.0
+        _refresh_reheat_confidence_and_id(source)
+    elif mutation == "confidence_mismatch":
+        source["confidence"]["score"] = 0.123
+        _refresh_decision_id(source)
+    elif mutation == "unmatched_contributor":
+        repetition = next(
+            item
+            for item in contributions
+            if item["finding_id"] != "semantic-repetition"
+            and item["finding_class"] == "repetition"
+        )
+        repetition["matched"] = False
+        _refresh_reheat_confidence_and_id(source)
+    else:
+        source["confidence"]["contributing_findings"].append(dict(contributions[0]))
+        _refresh_reheat_confidence_and_id(source)
+
+    serialized = DecisionEnvelope.from_dict(source)
+    assert serialized.decision is Decision.REHEAT
+    _assert_invalid_recovery_decision(serialized)
+
+
+def test_build_recovery_instruction_accepts_multiple_genuine_semantic_supports() -> (
+    None
+):
+    from semantic_reheating.controller import build_recovery_instruction
+    from semantic_reheating.models import DecisionEnvelope
+
+    source = _genuine_reheat_source(semantic_repetition=True, multiple_no_progress=True)
+    decision = DecisionEnvelope.from_dict(source)
+    contributions = decision.confidence.contributing_findings
+    repetition = [
+        item.weighted_score
+        for item in contributions
+        if item.finding_class.value == "repetition"
+    ]
+    no_progress = [
+        item.weighted_score
+        for item in contributions
+        if item.finding_class.value == "no_progress"
+    ]
+
+    assert len(repetition) > 1
+    assert len(no_progress) > 1
+    assert len(set(repetition + no_progress)) > 1
+    assert decision.confidence.score == min(max(repetition), max(no_progress))
+    assert build_recovery_instruction(decision) is not None
 
 
 def test_shared_gap_basis_preserves_task10_cause_provenance() -> None:

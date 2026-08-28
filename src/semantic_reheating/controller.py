@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from hashlib import sha256
 from itertools import pairwise
+from math import isclose
 from re import compile as re_compile
 from types import MappingProxyType
 from typing import Any, NoReturn, Protocol
@@ -22,6 +23,7 @@ from .models import (
     Decision,
     DecisionEnvelope,
     EffectClass,
+    FindingClass,
     RunPolicy,
     TraceEvent,
     TraceKind,
@@ -569,37 +571,7 @@ def build_recovery_instruction(
         return None
     try:
         source = fresh.to_dict()
-        expected_id = (
-            "decision-"
-            + sha256(
-                canonicalize_json(
-                    {
-                        key: value
-                        for key, value in source.items()
-                        if key != "decision_id"
-                    }
-                )
-            ).hexdigest()[:24]
-        )
-        expected_reasons = (
-            "signals_agree",
-            "repetition_detected",
-            "no_progress_detected",
-        ) + (("host_action_required",) if fresh.requires_host_action else ())
-        invalid = (
-            source["decision_id"] != expected_id
-            or fresh.recovery_policy not in {"research", "branch", "model_switch"}
-            or fresh.reason_codes != expected_reasons
-            or not fresh.constraints.must_preserve_evidence
-            or not fresh.constraints.no_non_idempotent_repeat
-            or EffectClass.READ_ONLY not in fresh.constraints.allowed_effect_classes
-            or any(
-                item.finding_class.value in {"risk", "budget"}
-                for item in fresh.confidence.contributing_findings
-            )
-        )
-        if invalid:
-            _fail("invalid_recovery_decision")
+        _validate_recovery_decision(fresh, source)
         instruction_source = recovery_instruction_source(
             run_id=fresh.run_id,
             diagnosed_gaps=[
@@ -619,6 +591,72 @@ def build_recovery_instruction(
     except (MemoryError, SystemExit, ControllerError):
         raise
     except Exception:  # noqa: BLE001 - instruction assembly is sanitized.
+        _fail("invalid_recovery_decision")
+
+
+def _validate_recovery_decision(
+    fresh: DecisionEnvelope, source: dict[str, Any]
+) -> None:
+    expected_id = (
+        "decision-"
+        + sha256(
+            canonicalize_json(
+                {key: value for key, value in source.items() if key != "decision_id"}
+            )
+        ).hexdigest()[:24]
+    )
+    expected_reasons = (
+        "signals_agree",
+        "repetition_detected",
+        "no_progress_detected",
+    ) + (("host_action_required",) if fresh.requires_host_action else ())
+    if (
+        source["decision_id"] != expected_id
+        or fresh.recovery_policy not in {"research", "branch", "model_switch"}
+        or fresh.reason_codes != expected_reasons
+        or not fresh.constraints.must_preserve_evidence
+        or not fresh.constraints.no_non_idempotent_repeat
+        or EffectClass.READ_ONLY not in fresh.constraints.allowed_effect_classes
+    ):
+        _fail("invalid_recovery_decision")
+
+    contributions = fresh.confidence.contributing_findings
+    if len({item.finding_id for item in contributions}) != len(contributions):
+        _fail("invalid_recovery_decision")
+    maxima = {
+        FindingClass.REPETITION: 0.0,
+        FindingClass.NO_PROGRESS: 0.0,
+    }
+    for item in contributions:
+        if item.finding_class in {FindingClass.RISK, FindingClass.BUDGET}:
+            _fail("invalid_recovery_decision")
+        if item.matched is not True or item.finding_class not in maxima:
+            _fail("invalid_recovery_decision")
+        expected_weighted_score = min(1.0, max(0.0, item.weight * item.score))
+        if not isclose(
+            item.weighted_score,
+            expected_weighted_score,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            _fail("invalid_recovery_decision")
+        maxima[item.finding_class] = max(
+            maxima[item.finding_class], item.weighted_score
+        )
+    if (
+        maxima[FindingClass.REPETITION] <= 0.0
+        or maxima[FindingClass.NO_PROGRESS] <= 0.0
+    ):
+        _fail("invalid_recovery_decision")
+    expected_confidence = min(
+        maxima[FindingClass.REPETITION], maxima[FindingClass.NO_PROGRESS]
+    )
+    if not isclose(
+        fresh.confidence.score,
+        expected_confidence,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
         _fail("invalid_recovery_decision")
 
 
