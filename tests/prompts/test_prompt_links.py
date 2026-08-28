@@ -5,6 +5,7 @@ import re
 import stat
 import string
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -279,7 +280,7 @@ def _mask_opaque_html(text: str) -> str:
     characters = list(text)
     index = 0
     while index < len(text):
-        if text[index] == "<":
+        if text[index] == "<" and not _is_escaped(text, index):
             end = _consume_opaque_html_construct(text, index)
             if end is None:
                 end = _find_angle_end(text, index)
@@ -667,6 +668,48 @@ def test_link_parser_rejects_malformed_angle_input_deterministically(
 ) -> None:
     with pytest.raises(AssertionError, match="malformed_markdown_link"):
         _markdown_targets(source)
+
+
+def test_link_parser_skips_escaped_angle_literals_without_rescanning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    literal_count = (32 * 1024 - 2) // len(r"\<")
+    source = "<" + r"\<" * literal_count + ">"
+    assert len(source.encode("utf-8")) == 32 * 1024
+    assert set(source) <= set(string.printable)
+
+    calls = 0
+    original = _find_angle_end
+
+    def counted_angle_end(text: str, start: int) -> int:
+        nonlocal calls
+        calls += 1
+        return original(text, start)
+
+    monkeypatch.setattr(sys.modules[__name__], "_find_angle_end", counted_angle_end)
+    started = time.perf_counter()
+    assert _mask_opaque_html(source) == source
+    elapsed = time.perf_counter() - started
+    print(f"escaped-angle mask probe: calls={calls}, seconds={elapsed:.6f}")
+    assert calls <= 1
+
+    monkeypatch.setattr(sys.modules[__name__], "_find_angle_end", original)
+    assert _markdown_targets(source) == []
+
+
+def test_link_parser_preserves_escaped_angle_and_comment_literals() -> None:
+    local = "../contracts/v1/evidence-record.schema.json"
+    escaped_comment = r"\<!-- " + f"<{local}>" + " -->"
+    mixed = r"\<literal> " + escaped_comment + f" <{local}>"
+
+    assert _is_escaped(r"\<", 1)
+    assert not _is_escaped(r"\\<../contracts/v1/evidence-record.schema.json>", 2)
+    assert _mask_opaque_html(escaped_comment) == escaped_comment
+    assert _markdown_targets(escaped_comment) == [local]
+    assert _markdown_targets(mixed) == [local]
+    assert _markdown_targets(r"\\<../contracts/v1/evidence-record.schema.json>") == [
+        local
+    ]
 
 
 def test_link_parser_stops_after_one_generic_scan_for_malformed_nested_angle_input(
