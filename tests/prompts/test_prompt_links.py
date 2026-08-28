@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import stat
+import string
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -17,66 +18,299 @@ EXPECTED_PROMPTS = {
     "select-and-cool.md",
     "verify-or-stop.md",
 }
-INLINE_LINK = re.compile(
-    r"(?<!\\)!?\[[^]\n]*\]\(\s*(?:<([^>\n]+)>|([^\s)]+))(?:\s+[^)]*)?\s*\)"
-)
-REFERENCE_DEFINITION = re.compile(
-    r"^[ \t]*\[([^]\n]+)\]:[ \t]*(?:<([^>\n]+)>|(\S+))(?:[ \t]+.*)?$", re.MULTILINE
-)
-REFERENCE_USAGE = re.compile(r"(?<!\\)!?\[([^]\n]+)\]\[([^]\n]*)\]")
-SHORTCUT_REFERENCE = re.compile(r"(?<!\\)!?\[([^]\n]+)\]")
-ANGLE_AUTOLINK = re.compile(r"<([^ <>\n]+)>")
-FENCED_CODE = re.compile(r"^```[^\n]*\n.*?^```\s*$", re.MULTILINE | re.DOTALL)
-INLINE_CODE = re.compile(r"`[^`]*`")
 HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+_MAX_PROMPT_BYTES = 64 * 1024
+_PUNCTUATION = frozenset(string.punctuation)
 
 
-def _without_code_spans(markdown: str) -> str:
-    return INLINE_CODE.sub("", FENCED_CODE.sub("", markdown))
+def _malformed(detail: str) -> AssertionError:
+    return AssertionError(f"malformed_markdown_link: {detail}")
+
+
+def _is_escaped(text: str, index: int) -> bool:
+    backslashes = 0
+    index -= 1
+    while index >= 0 and text[index] == "\\":
+        backslashes += 1
+        index -= 1
+    return bool(backslashes % 2)
+
+
+def _mask_range(characters: list[str], start: int, end: int) -> None:
+    for index in range(start, end):
+        if characters[index] not in "\r\n":
+            characters[index] = " "
+
+
+def _mask_code(markdown: str) -> str:
+    """Mask code while retaining offsets and line boundaries for the scanner."""
+    characters = list(markdown)
+    line_start = 0
+    open_fence: tuple[str, int, int] | None = None
+    while line_start < len(markdown):
+        line_end = markdown.find("\n", line_start)
+        if line_end == -1:
+            line_end = len(markdown)
+        line = markdown[line_start:line_end]
+        leading = len(line) - len(line.lstrip(" "))
+        marker_start = line_start + leading
+        if (
+            leading <= 3
+            and marker_start < line_end
+            and not _is_escaped(markdown, marker_start)
+        ):
+            marker = markdown[marker_start]
+            run_end = marker_start
+            while run_end < line_end and markdown[run_end] == marker:
+                run_end += 1
+            run_length = run_end - marker_start
+            if marker in "`~" and run_length >= 3:
+                if open_fence is None:
+                    open_fence = (marker, run_length, line_start)
+                elif (
+                    marker == open_fence[0]
+                    and run_length >= open_fence[1]
+                    and not line[leading + run_length :].strip(" ")
+                ):
+                    _mask_range(characters, open_fence[2], line_end)
+                    open_fence = None
+        line_start = line_end + 1
+    if open_fence is not None:
+        raise _malformed("unclosed fenced code block")
+
+    index = 0
+    while index < len(markdown):
+        if characters[index] != "`" or _is_escaped(markdown, index):
+            index += 1
+            continue
+        end = index
+        while end < len(markdown) and characters[end] == "`":
+            end += 1
+        run_length = end - index
+        closing = markdown.find("`" * run_length, end)
+        while closing != -1:
+            closing_end = closing + run_length
+            if (closing == 0 or markdown[closing - 1] != "`") and (
+                closing_end == len(markdown) or markdown[closing_end] != "`"
+            ):
+                break
+            closing = markdown.find("`" * run_length, closing + 1)
+        if closing == -1:
+            raise _malformed("unclosed inline code span")
+        _mask_range(characters, index, closing + run_length)
+        index = closing + run_length
+    return "".join(characters)
+
+
+def _parse_bracket(text: str, start: int) -> tuple[int, str]:
+    """Return the exact end and content for an escape-aware bracket group."""
+    assert text[start] == "["
+    depth = 1
+    index = start + 1
+    while index < len(text):
+        character = text[index]
+        if character == "\\":
+            if index + 1 < len(text) and text[index + 1] == "[":
+                depth += 1
+            index += 2
+            continue
+        if character == "\n":
+            raise _malformed("newline in bracket label")
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth -= 1
+            if depth == 0:
+                return index + 1, text[start + 1 : index]
+        index += 1
+    raise _malformed("unclosed bracket label")
 
 
 def _reference_label(label: str) -> str:
-    return " ".join(label.split()).casefold()
+    normalized: list[str] = []
+    index = 0
+    while index < len(label):
+        if (
+            index + 1 < len(label)
+            and label[index] == "\\"
+            and label[index + 1] in _PUNCTUATION
+        ):
+            normalized.append(label[index + 1])
+            index += 2
+        else:
+            normalized.append(label[index])
+            index += 1
+    unescaped = "".join(normalized)
+    return re.sub(r"[ \t\n\r\f\v]+", " ", unescaped).strip().casefold()
 
 
-def _mask_matches(text: str, matches: list[re.Match[str]]) -> str:
-    masked = list(text)
-    for match in matches:
-        masked[match.start() : match.end()] = " " * (match.end() - match.start())
-    return "".join(masked)
+def _parse_bare_destination(text: str, start: int, limit: int) -> tuple[int, str]:
+    index = start
+    depth = 0
+    while index < limit:
+        character = text[index]
+        if character == "\\":
+            if index + 1 >= limit:
+                raise _malformed("trailing destination escape")
+            index += 2
+            continue
+        if character in " \t\r\n":
+            break
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        index += 1
+    if index == start or depth:
+        raise _malformed("unbalanced destination")
+    return index, text[start:index]
+
+
+def _parse_parenthesized_destination(text: str, start: int) -> tuple[int, str]:
+    assert text[start] == "("
+    index = start + 1
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    if index >= len(text):
+        raise _malformed("unclosed inline destination")
+    if text[index] == "<":
+        destination_start = index + 1
+        index = destination_start
+        while index < len(text) and text[index] != ">":
+            if text[index] == "\\":
+                index += 2
+            else:
+                index += 1
+        if index >= len(text) or index == destination_start:
+            raise _malformed("malformed angle destination")
+        destination = text[destination_start:index]
+        index += 1
+    else:
+        index, destination = _parse_bare_destination(text, index, len(text))
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    if index >= len(text) or text[index] != ")":
+        raise _malformed("unsupported inline destination tail")
+    return index + 1, destination
+
+
+def _parse_reference_destination(text: str, start: int, limit: int) -> tuple[int, str]:
+    while start < limit and text[start] in " \t":
+        start += 1
+    if start >= limit:
+        raise _malformed("missing reference destination")
+    if text[start] == "<":
+        end = text.find(">", start + 1, limit)
+        if end == -1 or end == start + 1:
+            raise _malformed("malformed reference angle destination")
+        return end + 1, text[start + 1 : end]
+    return _parse_bare_destination(text, start, limit)
+
+
+def _is_html_closing_tag(candidate: str) -> bool:
+    name = candidate.removeprefix("/").replace("-", "").replace(":", "")
+    return candidate.startswith("/") and bool(name) and name.isidentifier()
+
+
+def _mask_definitions(visible: str) -> tuple[str, dict[str, str]]:
+    characters = list(visible)
+    definitions: dict[str, str] = {}
+    line_start = 0
+    while line_start < len(visible):
+        line_end = visible.find("\n", line_start)
+        if line_end == -1:
+            line_end = len(visible)
+        index = line_start
+        while index < line_end and visible[index] == " " and index - line_start < 3:
+            index += 1
+        if (
+            index < line_end
+            and visible[index] == "["
+            and not _is_escaped(visible, index)
+        ):
+            label_end, raw_label = _parse_bracket(visible, index)
+            if label_end < line_end and visible[label_end] == ":":
+                destination_end, destination = _parse_reference_destination(
+                    visible, label_end + 1, line_end
+                )
+                if visible[destination_end:line_end].strip(" \t\r"):
+                    raise _malformed("unsupported reference definition tail")
+                label = _reference_label(raw_label)
+                assert label, "malformed_markdown_link: empty reference label"
+                assert label not in definitions, (
+                    f"duplicate reference definition: {label!r}"
+                )
+                definitions[label] = destination
+                _mask_range(characters, line_start, line_end)
+        line_start = line_end + 1
+    return "".join(characters), definitions
 
 
 def _markdown_targets(markdown: str) -> list[str]:
-    """Extract every local Markdown destination after excluding code samples."""
-    visible = _without_code_spans(markdown)
-    definition_matches = list(REFERENCE_DEFINITION.finditer(visible))
-    definitions: dict[str, str] = {}
-    for match in definition_matches:
-        label = _reference_label(match.group(1))
-        assert label not in definitions, f"duplicate reference definition: {label!r}"
-        definitions[label] = match.group(2) or match.group(3)
-
-    non_definitions = _mask_matches(visible, definition_matches)
-    inline_matches = list(INLINE_LINK.finditer(non_definitions))
-    targets = [match.group(1) or match.group(2) for match in inline_matches]
-    without_inline_links = _mask_matches(non_definitions, inline_matches)
-    targets.extend(ANGLE_AUTOLINK.findall(without_inline_links))
-    without_autolinks = _mask_matches(
-        without_inline_links, list(ANGLE_AUTOLINK.finditer(without_inline_links))
-    )
-
-    reference_matches = list(REFERENCE_USAGE.finditer(without_autolinks))
-    for match in reference_matches:
-        label = _reference_label(match.group(2) or match.group(1))
-        assert label in definitions, f"unresolved reference usage: {match.group(0)!r}"
-    without_reference_usages = _mask_matches(without_autolinks, reference_matches)
-    for match in SHORTCUT_REFERENCE.finditer(without_reference_usages):
-        label = _reference_label(match.group(1))
-        assert label in definitions, f"unresolved reference usage: {match.group(0)!r}"
-
+    """Extract local targets with a bounded, escape-aware Markdown scanner."""
+    assert len(markdown.encode("utf-8")) <= _MAX_PROMPT_BYTES, "prompt exceeds 64KiB"
+    visible, definitions = _mask_definitions(_mask_code(markdown))
+    targets: list[str] = []
+    index = 0
+    while index < len(visible):
+        character = visible[index]
+        if character == "\\":
+            index += 2
+            continue
+        image = (
+            character == "!" and index + 1 < len(visible) and visible[index + 1] == "["
+        )
+        if character == "[" or image:
+            start = index
+            bracket_start = index + 1 if image else index
+            label_end, raw_label = _parse_bracket(visible, bracket_start)
+            if label_end < len(visible) and visible[label_end] == "(":
+                index, destination = _parse_parenthesized_destination(
+                    visible, label_end
+                )
+                targets.append(destination)
+                continue
+            if label_end < len(visible) and visible[label_end] == "[":
+                reference_end, reference_label = _parse_bracket(visible, label_end)
+                raw_reference = reference_label or raw_label
+                index = reference_end
+            else:
+                raw_reference = raw_label
+                index = label_end
+            label = _reference_label(raw_reference)
+            assert label, "malformed_markdown_link: empty reference label"
+            assert label in definitions, (
+                f"unresolved reference usage: {visible[start:index]!r}"
+            )
+            targets.append(definitions[label])
+            continue
+        if character == "]":
+            raise _malformed("stray closing bracket")
+        if character == "<":
+            end = visible.find(">", index + 1)
+            if end != -1:
+                candidate = visible[index + 1 : end]
+                parsed = urlsplit(candidate)
+                if (
+                    candidate
+                    and not any(value in candidate for value in " \t\r\n=<")
+                    and not _is_html_closing_tag(candidate)
+                    and (
+                        parsed.scheme
+                        or candidate.startswith(("/", "."))
+                        or "/" in candidate
+                        or "." in candidate
+                        or "#" in candidate
+                    )
+                ):
+                    targets.append(candidate)
+                    index = end + 1
+                    continue
+        index += 1
     # Definitions are destinations too. Preserve them even when unused, so a
-    # hidden unsafe destination cannot be silently ignored. Deduplicate because
-    # each resolved destination needs one lexical safety check.
+    # hidden unsafe destination cannot be silently ignored.
     targets.extend(definitions.values())
     return list(dict.fromkeys(targets))
 
@@ -206,6 +440,76 @@ def test_link_parser_ignores_code_spans_and_captures_all_markdown_link_forms() -
     ]
 
 
+def test_link_parser_keeps_escaped_brackets_in_an_inline_label() -> None:
+    assert _markdown_targets(
+        "[" + "\\" + "[label]](../contracts/v1/evidence-record.schema.json)"
+    ) == ["../contracts/v1/evidence-record.schema.json"]
+
+
+def test_link_parser_keeps_nested_brackets_in_an_inline_label() -> None:
+    assert _markdown_targets(
+        "[one [two]](../contracts/v1/evidence-record.schema.json)"
+    ) == ["../contracts/v1/evidence-record.schema.json"]
+
+
+def test_link_parser_keeps_balanced_parentheses_in_destination() -> None:
+    assert _markdown_targets(
+        "[label](../contracts/v1/evidence-record.schema.json?x=(y))"
+    ) == ["../contracts/v1/evidence-record.schema.json?x=(y)"]
+
+
+def test_link_parser_rejects_an_unclosed_bracket() -> None:
+    with pytest.raises(AssertionError, match="malformed_markdown_link"):
+        _markdown_targets("before [unclosed after")
+
+
+def test_link_parser_ignores_tilde_fenced_code_blocks() -> None:
+    assert _markdown_targets("~~~\n[not-a-link](/outside.md)\n~~~\n") == []
+
+
+def test_link_parser_resolves_nested_and_escaped_reference_labels_for_images() -> None:
+    source = (
+        "[ ID "
+        + "\\"
+        + "[Part]]: ../contracts/v1/evidence-record.schema.json\n"
+        + "![alt][id [part]] [ ID [PART] ][] [id [part]]\n"
+    )
+    assert _markdown_targets(source) == ["../contracts/v1/evidence-record.schema.json"]
+
+
+def test_link_parser_rejects_unbalanced_destinations_and_stray_closings() -> None:
+    for source in (
+        "[label](../contracts/v1/evidence-record.schema.json?x=(y)",
+        "before ] after",
+    ):
+        with pytest.raises(AssertionError, match="malformed_markdown_link"):
+            _markdown_targets(source)
+
+
+def test_link_parser_ignores_html_but_collects_local_angle_autolinks() -> None:
+    assert _markdown_targets(
+        "<span class=note>not a link</span> <../contracts/v1/evidence-record.schema.json>"
+    ) == ["../contracts/v1/evidence-record.schema.json"]
+
+
+def test_current_prompt_assets_have_the_exact_seven_schema_targets() -> None:
+    targets: list[str] = []
+    for path in sorted(PROMPTS_DIR.glob("*.md")):
+        markdown = path.read_text(encoding="utf-8")
+        _validate_links(path, markdown)
+        targets.extend(_markdown_targets(markdown))
+    assert targets == [
+        "../contracts/v1/recovery-instruction.schema.json",
+        "../contracts/v1/decision-envelope.schema.json",
+        "../contracts/v1/decision-envelope.schema.json",
+        "../contracts/v1/recovery-instruction.schema.json",
+        "../contracts/v1/recovery-instruction.schema.json",
+        "../contracts/v1/recovery-outcome.schema.json",
+        "../contracts/v1/evidence-record.schema.json",
+    ]
+    assert len(targets) == 7
+
+
 def test_link_parser_resolves_full_collapsed_shortcut_and_image_references() -> None:
     source = (
         "[ Schema   ID ]: ../contracts/v1/evidence-record.schema.json\n"
@@ -237,7 +541,7 @@ def test_link_parser_does_not_reparse_definitions_or_inline_links_as_shortcuts()
         "[definition]: ../contracts/v1/evidence-record.schema.json\n"
         "[inline](../contracts/v1/evidence-record.schema.json)\n"
         "![image](../contracts/v1/evidence-record.schema.json)\n"
-        "`[missing]` and \\[ignored]\n"
+        "`[missing]` and " + "\\" + "[ignored" + "\\" + "]\n"
         "```md\n[also missing][]\n```\n"
         "[definition][]\n"
     )
