@@ -72,9 +72,11 @@ def write_release_receipt(
         raise ReceiptError("origin is not public remote metadata")
     if "?" in remote_url or "#" in remote_url:
         raise ReceiptError("origin URL includes disallowed sensitive components")
-    if remote_url.startswith("https://"):
+    if remote_url.startswith(("https://", "ssh://")):
         parsed_origin = urlsplit(remote_url)
-        if parsed_origin.username is not None or parsed_origin.password is not None:
+        if parsed_origin.password is not None:
+            raise ReceiptError("origin URL includes disallowed sensitive components")
+        if remote_url.startswith("https://") and parsed_origin.username is not None:
             raise ReceiptError(
                 "origin HTTPS URL includes disallowed sensitive components"
             )

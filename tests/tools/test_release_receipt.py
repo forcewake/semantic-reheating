@@ -67,6 +67,25 @@ def test_receipt_writes_closed_external_record_only_after_verified_readback(
     assert json.loads(output.read_text()) == receipt
 
 
+def test_receipt_rejects_credential_bearing_ssh_origin_before_output_write(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_bytes(b"public bytes\n")
+    credential = "-".join(("release", "credential", "probe"))  # noqa: FLY002
+    origin_url = f"ssh://user:{credential}@github.com/example/public-repo.git"
+    output = tmp_path / "unsafe-ssh.json"
+
+    with pytest.raises(ReceiptError) as error:
+        write_release_receipt(
+            repo, output, ["README.md"], runner=Runner(origin_url=origin_url)
+        )
+
+    assert credential not in str(error.value)
+    assert not output.exists()
+
+
 def test_receipt_rejects_sensitive_https_origins_before_output_write(
     tmp_path: Path,
 ) -> None:
