@@ -1041,12 +1041,10 @@ set -euo pipefail
 FINAL_PUBLICATION_RECEIPT="${XDG_STATE_HOME:-$HOME/.local/state}/semantic-reheating/releases/publication-${LOCAL_SHA}.json"
 uv run python tools/release_receipt.py \
   --output "$FINAL_PUBLICATION_RECEIPT" \
-  --local-sha "$LOCAL_SHA" \
-  --remote-sha "$REMOTE_SHA" \
-  --repository-url https://github.com/forcewake/semantic-reheating \
-  --readback README.md \
-  --readback contracts/v1/trace-event.schema.json \
-  --readback article/semantic-reheating/index.md
+  --repo . \
+  --path README.md \
+  --path contracts/v1/trace-event.schema.json \
+  --path article/semantic-reheating/index.md
 test -z "$(git status --porcelain)"
 test "$(git rev-parse HEAD)" = "$LOCAL_SHA"
 ```

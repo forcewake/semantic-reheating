@@ -69,6 +69,26 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _cover_pixels(path: Path) -> tuple[tuple[int, int], bytes]:
+    with Image.open(path) as image:
+        rgba = image.convert("RGBA")
+        return rgba.size, rgba.tobytes()
+
+
+def _assert_packaged_parity(
+    generated_architecture: Path,
+    generated_cover: Path,
+    packaged_architecture: Path,
+    packaged_cover: Path,
+) -> None:
+    if generated_architecture.read_bytes() != packaged_architecture.read_bytes():
+        raise ValueError("generated architecture.svg differs from packaged bytes")
+    if _cover_pixels(generated_cover) != _cover_pixels(packaged_cover):
+        raise ValueError(
+            "generated cover.png pixels differ from packaged visual content"
+        )
+
+
 def verify_render() -> None:
     with tempfile.TemporaryDirectory(prefix="semantic-reheating-assets-") as temporary:
         root = Path(temporary)
@@ -88,6 +108,12 @@ def verify_render() -> None:
             raise ValueError(
                 "article asset rendering is not byte-stable in this environment"
             )
+        _assert_packaged_parity(
+            first / "architecture.svg",
+            first / "cover.png",
+            BUNDLE / "architecture.svg",
+            BUNDLE / "cover.png",
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -105,7 +131,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.verify_render:
         verify_render()
-        print("article asset rendering is deterministic in this environment")
+        print(
+            "article asset rendering is deterministic and matches packaged visual content"
+        )
         return 0
     _render_generated_assets(BUNDLE / "architecture.svg", BUNDLE / "cover.png")
     check_assets()

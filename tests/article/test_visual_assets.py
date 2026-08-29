@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from tools import render_assets
+
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "article/semantic-reheating"
 
@@ -42,7 +44,9 @@ def test_cover_png_has_required_mode_dimensions_and_local_provenance() -> None:
     assert "@resvg/resvg-js" in assets
     assert "ImageMagick" not in assets
     assert "within-environment byte stability" in assets
-    assert "Cross-environment byte equality is not claimed" in assets
+    assert "exact SVG bytes" in assets
+    assert "decoded RGBA pixels" in assets
+    assert "Cross-environment PNG-container byte equality is not claimed" in assets
 
 
 def test_cover_renderer_is_repo_local_and_lockfile_pinned() -> None:
@@ -107,6 +111,58 @@ def test_repository_ignores_local_asset_dependencies() -> None:
     assert result.returncode == 0
 
 
+def test_packaged_parity_rejects_architecture_drift(tmp_path: Path) -> None:
+    generated_architecture = tmp_path / "generated.svg"
+    packaged_architecture = tmp_path / "packaged.svg"
+    generated_architecture.write_text('<svg id="generated"/>', encoding="utf-8")
+    packaged_architecture.write_text('<svg id="packaged"/>', encoding="utf-8")
+    generated_cover = tmp_path / "generated.png"
+    packaged_cover = tmp_path / "packaged.png"
+    Image.new("RGBA", (1, 1), "black").save(generated_cover)
+    Image.new("RGBA", (1, 1), "black").save(packaged_cover)
+
+    with pytest.raises(ValueError, match="architecture.svg differs"):
+        render_assets._assert_packaged_parity(
+            generated_architecture,
+            generated_cover,
+            packaged_architecture,
+            packaged_cover,
+        )
+
+
+def test_packaged_parity_rejects_cover_pixel_drift(tmp_path: Path) -> None:
+    generated_architecture = tmp_path / "generated.svg"
+    packaged_architecture = tmp_path / "packaged.svg"
+    generated_architecture.write_text("<svg/>", encoding="utf-8")
+    packaged_architecture.write_text("<svg/>", encoding="utf-8")
+    generated_cover = tmp_path / "generated.png"
+    packaged_cover = tmp_path / "packaged.png"
+    Image.new("RGBA", (1, 1), "black").save(generated_cover)
+    Image.new("RGBA", (1, 1), "white").save(packaged_cover)
+
+    with pytest.raises(ValueError, match="cover.png pixels differ"):
+        render_assets._assert_packaged_parity(
+            generated_architecture,
+            generated_cover,
+            packaged_architecture,
+            packaged_cover,
+        )
+
+
+def test_verify_render_rejects_packaged_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not (ROOT / "tools/assets/node_modules/.bin/mmdc").exists():
+        pytest.skip("requires npm ci --prefix tools/assets")
+    (tmp_path / "cover.svg").write_bytes((BUNDLE / "cover.svg").read_bytes())
+    (tmp_path / "cover.png").write_bytes((BUNDLE / "cover.png").read_bytes())
+    (tmp_path / "architecture.svg").write_text("<svg/>", encoding="utf-8")
+    monkeypatch.setattr(render_assets, "BUNDLE", tmp_path)
+
+    with pytest.raises(ValueError, match="architecture.svg differs"):
+        render_assets.verify_render()
+
+
 def test_verify_render_is_non_mutating_and_deterministic() -> None:
     if not (ROOT / "tools/assets/node_modules/.bin/mmdc").exists():
         pytest.skip("requires npm ci --prefix tools/assets")
@@ -121,30 +177,8 @@ def test_verify_render_is_non_mutating_and_deterministic() -> None:
     )
     after = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in assets}
     assert result.returncode == 0, result.stderr
-    assert "article asset rendering is deterministic" in result.stdout
-    assert after == before
-
-
-def test_renderer_is_byte_stable_for_packaged_cover() -> None:
-    if not (ROOT / "tools/assets/node_modules/.bin/mmdc").exists():
-        pytest.skip("requires npm ci --prefix tools/assets")
-    cover = BUNDLE / "cover.png"
-    for _ in range(2):
-        result = subprocess.run(
-            ["python", "tools/render_assets.py"],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stderr
-    before = hashlib.sha256(cover.read_bytes()).hexdigest()
-    result = subprocess.run(
-        ["python", "tools/render_assets.py"],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
+    assert (
+        "article asset rendering is deterministic and matches packaged visual content"
+        in result.stdout
     )
-    assert result.returncode == 0, result.stderr
-    assert hashlib.sha256(cover.read_bytes()).hexdigest() == before
+    assert after == before

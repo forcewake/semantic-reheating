@@ -134,3 +134,21 @@ def test_receipt_refuses_unsafe_or_unverified_inputs(tmp_path: Path, kind: str) 
     with pytest.raises(ReceiptError):
         write_release_receipt(repo, output, ["README.md"], runner=runner)
     assert not output.exists()
+
+
+def test_task28_uses_the_current_release_receipt_cli_contract() -> None:
+    plan = (
+        Path("docs/plans/2026-08-27-semantic-reheating-reference-kit.md")
+        .read_text(encoding="utf-8")
+        .split("### Task 28:", maxsplit=1)[1]
+    )
+    assert "uv run python tools/release_receipt.py" in plan
+    assert "--repo ." in plan
+    assert plan.count("--path ") == 3
+    for stale_option in (
+        "--local-sha",
+        "--remote-sha",
+        "--repository-url",
+        "--readback",
+    ):
+        assert stale_option not in plan

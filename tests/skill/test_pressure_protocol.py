@@ -850,6 +850,7 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         ".github/workflows/ci.yml",
         "article/semantic-reheating/ASSETS.md",
         "article/semantic-reheating/cover.png",
+        "docs/plans/2026-08-27-semantic-reheating-reference-kit.md",
         "tests/article/test_visual_assets.py",
         "tools/assets/package-lock.json",
         "tools/assets/package.json",
