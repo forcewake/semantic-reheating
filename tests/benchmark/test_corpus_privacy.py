@@ -16,6 +16,10 @@ MANIFEST_PATH = PROJECT_ROOT / "benchmark/scenarios/manifest.json"
 SCHEMA_PATH = PROJECT_ROOT / "benchmark/schemas/v1/corpus-manifest.schema.json"
 RESULT_SCHEMA_PATH = PROJECT_ROOT / "benchmark/schemas/v1/replay-result.schema.json"
 RESULT_PATH = PROJECT_ROOT / "benchmark/results/deterministic-results.json"
+LIVE_CAMPAIGN_SCHEMA_PATH = PROJECT_ROOT / "benchmark/live/campaign.schema.json"
+LIVE_STACKS_SCHEMA_PATH = PROJECT_ROOT / "benchmark/live/stacks.schema.json"
+LIVE_CAMPAIGN_EXAMPLE_PATH = PROJECT_ROOT / "benchmark/live/campaign.example.json"
+LIVE_STACKS_EXAMPLE_PATH = PROJECT_ROOT / "benchmark/live/stacks.example.json"
 
 _FORBIDDEN_TEXT = re.compile(
     r"(?:\.hermes|/home/|/Users/|(?:^|[\s\"'])[A-Za-z]:\\|\\\\[A-Za-z0-9_.-]+\\|"
@@ -108,6 +112,10 @@ def _public_paths() -> list[Path]:
         RESULT_SCHEMA_PATH,
         MANIFEST_PATH,
         RESULT_PATH,
+        LIVE_CAMPAIGN_SCHEMA_PATH,
+        LIVE_STACKS_SCHEMA_PATH,
+        LIVE_CAMPAIGN_EXAMPLE_PATH,
+        LIVE_STACKS_EXAMPLE_PATH,
         *(PROJECT_ROOT / entry["trace_path"] for entry in manifest["entries"]),
     ]
 
@@ -130,7 +138,7 @@ def test_public_corpus_bytes_and_json_values_are_redacted_and_deterministic() ->
         budget=CorpusBudget(),
     )
     traces = {trace.trace_path: trace for trace in corpus.traces}
-    assert len(paths) == 33
+    assert len(paths) == 37
     assert len(traces) == 29
     assert set(paths) == {
         path
@@ -150,7 +158,13 @@ def test_public_corpus_bytes_and_json_values_are_redacted_and_deterministic() ->
             assert_public_json(
                 load_public_json(raw),
                 str(path),
-                allow_schema_urls=path in {SCHEMA_PATH, RESULT_SCHEMA_PATH},
+                allow_schema_urls=path
+                in {
+                    SCHEMA_PATH,
+                    RESULT_SCHEMA_PATH,
+                    LIVE_CAMPAIGN_SCHEMA_PATH,
+                    LIVE_STACKS_SCHEMA_PATH,
+                },
             )
 
 

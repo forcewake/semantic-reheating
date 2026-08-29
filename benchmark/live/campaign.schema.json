@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/benchmark/live/campaign.schema.json",
+  "title": "Bounded Synthetic Live Campaign",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "campaign_id", "tasks", "arms", "replicates", "per_run_caps", "campaign_caps"],
+  "properties": {
+    "contract_version": {"const": "1.0"},
+    "campaign_id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+    "tasks": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {"$ref": "#/$defs/task"}
+    },
+    "arms": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {"enum": ["hard_stop_only", "generic_rethink", "semantic_reheating"]}
+    },
+    "replicates": {"const": 3},
+    "per_run_caps": {"$ref": "#/$defs/perRunCaps"},
+    "campaign_caps": {"$ref": "#/$defs/campaignCaps"}
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_id", "fixture_path", "sandbox", "tools"],
+      "properties": {
+        "task_id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+        "fixture_path": {"type": "string", "pattern": "^benchmark/corpus/[a-z0-9]+(?:-[a-z0-9]+)*\\.jsonl$"},
+        "sandbox": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "root", "external_side_effect_capability"],
+          "properties": {
+            "kind": {"const": "fixture_owned_isolated"},
+            "root": {"type": "string", "pattern": "^\\$TASK_SANDBOX/[a-z0-9]+(?:-[a-z0-9]+)*$"},
+            "external_side_effect_capability": {"const": false}
+          }
+        },
+        "tools": {"$ref": "#/$defs/readOnlyTools"}
+      }
+    },
+    "readOnlyTools": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowlist", "external_side_effect_capability"],
+      "properties": {
+        "allowlist": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {"enum": ["synthetic_trace_read", "fixture_read"]}
+        },
+        "external_side_effect_capability": {"const": false}
+      }
+    },
+    "perRunCaps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["turns", "tool_calls", "tokens", "elapsed_seconds", "cost_usd"],
+      "properties": {
+        "turns": {"const": 30},
+        "tool_calls": {"const": 40},
+        "tokens": {"const": 50000},
+        "elapsed_seconds": {"const": 1200},
+        "cost_usd": {"const": 1.0}
+      }
+    },
+    "campaignCaps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tokens", "tool_calls", "elapsed_seconds", "cost_usd"],
+      "properties": {
+        "tokens": {"const": 2000000},
+        "tool_calls": {"const": 4320},
+        "elapsed_seconds": {"const": 86400},
+        "cost_usd": {"const": 40.0}
+      }
+    }
+  }
+}

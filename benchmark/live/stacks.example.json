@@ -1,0 +1,35 @@
+{
+  "contract_version": "1.0",
+  "stacks": [
+    {
+      "stack_id": "local-synthetic-a",
+      "kind": "local",
+      "status": "selected",
+      "provider": {"name": "synthetic-provider", "version": "1.0.0"},
+      "model": {"name": "synthetic-model", "version": "2026-08"},
+      "cli": {"name": "synthetic-agent", "version": "1.0.0"},
+      "framework": {"name": "synthetic-framework", "version": "1.0.0"},
+      "command": ["synthetic-agent", "--offline", "--read-only", "--sandbox=$TASK_SANDBOX"],
+      "sandbox": {"mode": "task_local_isolated", "writable_scope": "task_sandbox_only", "network": "disabled", "external_side_effect_capability": false},
+      "tools": {"allowlist": ["synthetic_trace_read", "fixture_read"], "external_side_effect_capability": false},
+      "controls": {"decoding": {"status": "fixed", "temperature": 0.0, "top_p": 1.0}, "seed": {"status": "fixed", "value": 7}},
+      "telemetry": {"token_reporting": "available", "time_reporting": "available", "compute_metadata": {"runtime": "synthetic", "hardware": "none"}},
+      "pricing": {"cost_reporting": "local_zero", "direct_api_cost_usd": 0.0}
+    },
+    {
+      "stack_id": "remote-synthetic-b",
+      "kind": "paid_remote",
+      "status": "selected",
+      "provider": {"name": "synthetic-provider", "version": "1.0.0"},
+      "model": {"name": "synthetic-model", "version": "2026-08"},
+      "cli": {"name": "synthetic-agent", "version": "1.0.0"},
+      "framework": {"name": "synthetic-framework", "version": "1.0.0"},
+      "command": ["synthetic-agent", "--offline", "--read-only", "--sandbox=$TASK_SANDBOX"],
+      "sandbox": {"mode": "task_local_isolated", "writable_scope": "task_sandbox_only", "network": "disabled", "external_side_effect_capability": false},
+      "tools": {"allowlist": ["synthetic_trace_read", "fixture_read"], "external_side_effect_capability": false},
+      "controls": {"decoding": {"status": "fixed", "temperature": 0.0, "top_p": 1.0}, "seed": {"status": "fixed", "value": 7}},
+      "telemetry": {"token_reporting": "available", "time_reporting": "available", "compute_metadata": {"runtime": "synthetic", "hardware": "none"}},
+      "pricing": {"cost_reporting": "not_available", "static_schedule": {"status": "reviewed", "input_usd_per_million": 1.0, "output_usd_per_million": 2.0, "conservative_token_upper_bound": 50000}}
+    }
+  ]
+}

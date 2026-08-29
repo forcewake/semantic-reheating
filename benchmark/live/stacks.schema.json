@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/benchmark/live/stacks.schema.json",
+  "title": "Bounded Live Stack Selection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "stacks"],
+  "properties": {
+    "contract_version": {"const": "1.0"},
+    "stacks": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {"$ref": "#/$defs/stack"}
+    }
+  },
+  "$defs": {
+    "namedVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "version": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    },
+    "readOnlyTools": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowlist", "external_side_effect_capability"],
+      "properties": {
+        "allowlist": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {"enum": ["synthetic_trace_read", "fixture_read"]}
+        },
+        "external_side_effect_capability": {"const": false}
+      }
+    },
+    "sandbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "writable_scope", "network", "external_side_effect_capability"],
+      "properties": {
+        "mode": {"const": "task_local_isolated"},
+        "writable_scope": {"const": "task_sandbox_only"},
+        "network": {"const": "disabled"},
+        "external_side_effect_capability": {"const": false}
+      }
+    },
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decoding", "seed"],
+      "properties": {
+        "decoding": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "temperature", "top_p"],
+              "properties": {
+                "status": {"const": "fixed"},
+                "temperature": {"type": "number", "minimum": 0, "maximum": 2},
+                "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "reason"],
+              "properties": {
+                "status": {"const": "unsupported"},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 256}
+              }
+            }
+          ]
+        },
+        "seed": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value"],
+              "properties": {
+                "status": {"const": "fixed"},
+                "value": {"type": "integer", "minimum": 0, "maximum": 2147483647}
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "reason"],
+              "properties": {
+                "status": {"const": "unsupported"},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 256}
+              }
+            }
+          ]
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["token_reporting", "time_reporting", "compute_metadata"],
+      "properties": {
+        "token_reporting": {"enum": ["available", "unavailable"]},
+        "time_reporting": {"enum": ["available", "unavailable"]},
+        "compute_metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["runtime", "hardware"],
+          "properties": {
+            "runtime": {"type": "string", "minLength": 1, "maxLength": 128},
+            "hardware": {"type": "string", "minLength": 1, "maxLength": 128}
+          }
+        }
+      }
+    },
+    "pricing": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cost_reporting", "direct_api_cost_usd"],
+          "properties": {
+            "cost_reporting": {"const": "local_zero"},
+            "direct_api_cost_usd": {"const": 0.0}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cost_reporting"],
+          "properties": {"cost_reporting": {"const": "provider_reported"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cost_reporting", "static_schedule"],
+          "properties": {
+            "cost_reporting": {"const": "not_available"},
+            "static_schedule": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "input_usd_per_million", "output_usd_per_million", "conservative_token_upper_bound"],
+              "properties": {
+                "status": {"const": "reviewed"},
+                "input_usd_per_million": {"type": "number", "exclusiveMinimum": 0},
+                "output_usd_per_million": {"type": "number", "exclusiveMinimum": 0},
+                "conservative_token_upper_bound": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
+        }
+      ]
+    },
+    "stack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stack_id", "kind", "status", "provider", "model", "cli", "framework", "command", "sandbox", "tools", "controls", "telemetry", "pricing"],
+      "properties": {
+        "stack_id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+        "kind": {"enum": ["local", "paid_remote"]},
+        "status": {"enum": ["candidate", "selected", "blocked"]},
+        "provider": {"$ref": "#/$defs/namedVersion"},
+        "model": {"$ref": "#/$defs/namedVersion"},
+        "cli": {"$ref": "#/$defs/namedVersion"},
+        "framework": {"$ref": "#/$defs/namedVersion"},
+        "command": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 16,
+          "items": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "sandbox": {"$ref": "#/$defs/sandbox"},
+        "tools": {"$ref": "#/$defs/readOnlyTools"},
+        "controls": {"$ref": "#/$defs/controls"},
+        "telemetry": {"$ref": "#/$defs/telemetry"},
+        "pricing": {"$ref": "#/$defs/pricing"}
+      }
+    }
+  }
+}

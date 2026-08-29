@@ -1,0 +1,16 @@
+{
+  "contract_version": "1.0",
+  "campaign_id": "synthetic-bounded-campaign",
+  "tasks": [
+    {"task_id": "exact-repetition-stall", "fixture_path": "benchmark/corpus/exact-repetition-stall.jsonl", "sandbox": {"kind": "fixture_owned_isolated", "root": "$TASK_SANDBOX/exact-repetition-stall", "external_side_effect_capability": false}, "tools": {"allowlist": ["synthetic_trace_read", "fixture_read"], "external_side_effect_capability": false}},
+    {"task_id": "cycle-two-step", "fixture_path": "benchmark/corpus/cycle-two-step.jsonl", "sandbox": {"kind": "fixture_owned_isolated", "root": "$TASK_SANDBOX/cycle-two-step", "external_side_effect_capability": false}, "tools": {"allowlist": ["synthetic_trace_read", "fixture_read"], "external_side_effect_capability": false}},
+    {"task_id": "unchanged-state", "fixture_path": "benchmark/corpus/unchanged-state.jsonl", "sandbox": {"kind": "fixture_owned_isolated", "root": "$TASK_SANDBOX/unchanged-state", "external_side_effect_capability": false}, "tools": {"allowlist": ["synthetic_trace_read", "fixture_read"], "external_side_effect_capability": false}},
+    {"task_id": "repeated-error", "fixture_path": "benchmark/corpus/repeated-error.jsonl", "sandbox": {"kind": "fixture_owned_isolated", "root": "$TASK_SANDBOX/repeated-error", "external_side_effect_capability": false}, "tools": {"allowlist": ["synthetic_trace_read", "fixture_read"], "external_side_effect_capability": false}},
+    {"task_id": "budget-burn-turns", "fixture_path": "benchmark/corpus/budget-burn-turns.jsonl", "sandbox": {"kind": "fixture_owned_isolated", "root": "$TASK_SANDBOX/budget-burn-turns", "external_side_effect_capability": false}, "tools": {"allowlist": ["synthetic_trace_read", "fixture_read"], "external_side_effect_capability": false}},
+    {"task_id": "blocked-authority", "fixture_path": "benchmark/corpus/blocked-authority.jsonl", "sandbox": {"kind": "fixture_owned_isolated", "root": "$TASK_SANDBOX/blocked-authority", "external_side_effect_capability": false}, "tools": {"allowlist": ["synthetic_trace_read", "fixture_read"], "external_side_effect_capability": false}}
+  ],
+  "arms": ["hard_stop_only", "generic_rethink", "semantic_reheating"],
+  "replicates": 3,
+  "per_run_caps": {"turns": 30, "tool_calls": 40, "tokens": 50000, "elapsed_seconds": 1200, "cost_usd": 1.0},
+  "campaign_caps": {"tokens": 2000000, "tool_calls": 4320, "elapsed_seconds": 86400, "cost_usd": 40.0}
+}
