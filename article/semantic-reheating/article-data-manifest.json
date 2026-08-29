@@ -1,0 +1,50 @@
+{
+  "schema_version": "1.0",
+  "artifacts": [
+    {
+      "artifact_id": "article-source-1",
+      "order": 1,
+      "path": "benchmark/results/deterministic-results.json",
+      "sha256": "b3a15c9db4f805b6eac9fc8a440a876b38ce4fc094ca64b0593458019fd765c1",
+      "source_kind": "deterministic_benchmark",
+      "status": "completed",
+      "include": true
+    },
+    {
+      "artifact_id": "article-source-2",
+      "order": 2,
+      "path": "benchmark/live/results/campaign-2026-08-29-manifest.json",
+      "sha256": "34bbe539f657f87d5dd3d8efc0eef031d297f8588ca6a6c304bf905d5cde9e9c",
+      "source_kind": "blocked_campaign",
+      "status": "blocked",
+      "include": true
+    },
+    {
+      "artifact_id": "article-source-3",
+      "order": 3,
+      "path": "benchmark/live/results/campaign-2026-08-29.json",
+      "sha256": "bbde728c21ab611528c903390675d78235cbadf8939861204da10bf13ab6a7f8",
+      "source_kind": "blocked_campaign",
+      "status": "blocked",
+      "include": true
+    },
+    {
+      "artifact_id": "article-source-4",
+      "order": 4,
+      "path": "benchmark/live/results/example-redacted-results.json",
+      "sha256": "979c13b2a7884e560009a89efb0b5d9620148fdddb4c50ffd15d607b91c72574",
+      "source_kind": "synthetic_example",
+      "status": "completed",
+      "include": false
+    },
+    {
+      "artifact_id": "article-source-5",
+      "order": 5,
+      "path": "skills/semantic-reheating/references/results.json",
+      "sha256": "805717b351f1224188a8f72004ed3c630dc3849827452f0eb1a7d7d1419ebf36",
+      "source_kind": "deterministic_benchmark",
+      "status": "completed",
+      "include": true
+    }
+  ]
+}

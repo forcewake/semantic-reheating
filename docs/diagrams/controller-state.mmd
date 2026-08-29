@@ -1,0 +1,11 @@
+stateDiagram-v2
+    [*] --> Observe
+    Observe --> Continue: evidence insufficient
+    Observe --> Diagnose: signals agree
+    Diagnose --> Reheat: bounded proposal
+    Reheat --> Cool: host accepts
+    Cool --> Observe: new evidence
+    Diagnose --> Stop: budget or risk stop
+    Reheat --> Escalate: host action required
+    Stop --> [*]
+    Escalate --> [*]

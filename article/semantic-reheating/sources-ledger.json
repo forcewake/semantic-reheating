@@ -1,0 +1,29 @@
+{
+  "schema_version": "1.0",
+  "sources": [
+    {
+      "citation_key": "repo-architecture",
+      "url": "https://github.com/forcewake/semantic-reheating",
+      "title": "Semantic Reheating Reference Kit: architecture boundary",
+      "author_or_publisher": "Semantic Reheating contributors",
+      "accessed": "2026-08-29",
+      "claim_scope": "Repository contract and host-authority observations."
+    },
+    {
+      "citation_key": "json-schema",
+      "url": "https://json-schema.org/draft/2020-12/json-schema-core.html",
+      "title": "JSON Schema Core: Draft 2020-12",
+      "author_or_publisher": "JSON Schema",
+      "accessed": "2026-08-29",
+      "claim_scope": "Documented semantics of the Draft 2020-12 schema vocabulary."
+    },
+    {
+      "citation_key": "kirkpatrick",
+      "url": "https://doi.org/10.1126/science.220.4598.671",
+      "title": "Optimization by Simulated Annealing",
+      "author_or_publisher": "Kirkpatrick, Gelatt, and Vecchi",
+      "accessed": "2026-08-29",
+      "claim_scope": "Historical scope of strict simulated annealing."
+    }
+  ]
+}
