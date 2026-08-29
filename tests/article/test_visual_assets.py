@@ -42,6 +42,8 @@ def test_cover_png_has_required_mode_dimensions_and_local_provenance() -> None:
         assert name in assets
     assert "local" in assets.lower()
     assert "@resvg/resvg-js" in assets
+    assert "bundled DejaVu Sans" in assets
+    assert "@fontsource/inter" not in assets
     assert "ImageMagick" not in assets
     assert "within-environment byte stability" in assets
     assert "exact SVG bytes" in assets
@@ -57,7 +59,21 @@ def test_cover_renderer_is_repo_local_and_lockfile_pinned() -> None:
         (ROOT / "tools/assets/package-lock.json").read_text(encoding="utf-8")
     )
     assert package["devDependencies"]["@resvg/resvg-js"] == "2.6.2"
+    assert "@fontsource/inter" not in package["devDependencies"]
     assert lock["packages"][""]["devDependencies"]["@resvg/resvg-js"] == "2.6.2"
+    assert "@fontsource/inter" not in lock["packages"][""]["devDependencies"]
+    font_dir = ROOT / "tools/assets/fonts"
+    assert hashlib.sha256((font_dir / "DejaVuSans.ttf").read_bytes()).hexdigest() == (
+        "ae7b7855e115a5966d8b1b3f80f254ccc117ec86f9965e202ee2940453837280"
+    )
+    assert hashlib.sha256(
+        (font_dir / "DejaVuSans-Bold.ttf").read_bytes()
+    ).hexdigest() == (
+        "5c1247acef7f2b8522a31742c76d6adcb5569bacc0be7ceaa4dc39dd252ce895"
+    )
+    license_text = (font_dir / "LICENSE-DejaVu.txt").read_text(encoding="utf-8")
+    assert "Permission is hereby granted" in license_text
+    assert "Copyright (c) 2003 by Bitstream, Inc." in license_text
     locked_renderer = lock["packages"]["node_modules/@resvg/resvg-js"]
     assert locked_renderer["version"] == "2.6.2"
     assert locked_renderer["integrity"].startswith("sha512-")
@@ -65,7 +81,18 @@ def test_cover_renderer_is_repo_local_and_lockfile_pinned() -> None:
     assert renderer.is_file()
     renderer_source = renderer.read_text(encoding="utf-8")
     assert '"@resvg/resvg-js"' in renderer_source
+    assert "DejaVuSans.ttf" in renderer_source
+    assert "DejaVuSans-Bold.ttf" in renderer_source
+    assert "fontFiles" in renderer_source
+    assert "fontBuffers" not in renderer_source
+    assert "loadSystemFonts: false" in renderer_source
+    assert "node_modules/@fontsource" not in renderer_source
     assert "magick" not in renderer_source.lower()
+    cover_source = (BUNDLE / "cover.svg").read_text(encoding="utf-8")
+    assert 'font-family="DejaVu Sans"' in cover_source
+    assert "Arial" not in cover_source
+    assert "Helvetica" not in cover_source
+    assert 'font-family="Inter"' not in cover_source
 
 
 def test_cover_renderer_rejects_missing_paths() -> None:
