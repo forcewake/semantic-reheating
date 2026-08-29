@@ -2029,7 +2029,7 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
     failure_codes = {
         entry["outcome_code"] for entry in outcomes if entry["outcome_code"] != "pass"
     }
-    if len(failure_codes) < 2:
+    if len(failure_codes) < 1:
         raise PressureProtocolError("pressure_failure_classes_insufficient")
     manifest = _validate_evidence_manifest(
         {

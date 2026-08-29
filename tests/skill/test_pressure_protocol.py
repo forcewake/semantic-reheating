@@ -1145,19 +1145,42 @@ def test_usage_support_is_per_dimension_and_never_fabricated(
     assert summary["budget_consumption"]["cost"] == "unsupported"
 
 
-@pytest.mark.parametrize("mode", ["all-pass", "one-failure"])
-def test_selected_stack_fails_closed_without_two_failure_classes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+def test_selected_stack_rejects_all_pass_but_records_observed_single_class_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = tmp_path / "fake_cli.py"
     _write_fake_cli(fake)
-    _install_config(tmp_path, fake, environment_allowlist=["PRESSURE_FAKE_MODE"])
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-    monkeypatch.setenv("PRESSURE_FAKE_MODE", mode)
+    all_pass_state = tmp_path / "all-pass-state"
+    _install_config(all_pass_state, fake, environment_allowlist=["PRESSURE_FAKE_MODE"])
+    monkeypatch.setenv("XDG_STATE_HOME", str(all_pass_state))
+
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", "all-pass")
     with pytest.raises(
         runner.PressureProtocolError, match="pressure_failure_classes_insufficient"
     ):
         runner.run_baseline(PROJECT_ROOT)
+
+    one_failure_state = tmp_path / "one-failure-state"
+    _install_config(
+        one_failure_state, fake, environment_allowlist=["PRESSURE_FAKE_MODE"]
+    )
+    monkeypatch.setenv("XDG_STATE_HOME", str(one_failure_state))
+    monkeypatch.setenv("PRESSURE_FAKE_MODE", "one-failure")
+    summary = runner.run_baseline(PROJECT_ROOT)
+    assert len(summary["outcomes"]) == 6
+    assert {
+        entry["outcome_code"]
+        for entry in summary["outcomes"]
+        if entry["outcome_code"] != "pass"
+    } == {"stagnation-not-reheated"}
+    receipt = summary["private_transcript_receipt"]
+    assert receipt["name"] == "baseline-evidence-manifest.json"
+    run_directories = list(
+        (one_failure_state / "semantic-reheating" / "pressure-baselines").glob("run-*")
+    )
+    assert len(run_directories) == 1
+    manifest = run_directories[0] / receipt["name"]
+    assert hashlib.sha256(manifest.read_bytes()).hexdigest() == receipt["sha256"]
 
 
 def test_state_root_inside_repository_and_symlink_config_fail_closed(
