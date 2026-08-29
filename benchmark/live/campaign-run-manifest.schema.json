@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/benchmark/live/campaign-run-manifest.schema.json",
+  "title": "Bounded Campaign Run Manifest",
+  "description": "Closed, redacted binding for a bounded campaign result artifact.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "manifest_id",
+    "campaign_id",
+    "status",
+    "blockers",
+    "result_path",
+    "result_sha256",
+    "result_size",
+    "planned_run_count",
+    "recorded_run_count",
+    "planned_cells",
+    "recorded_cells"
+  ],
+  "properties": {
+    "contract_version": {"const": "1.0"},
+    "manifest_id": {"$ref": "#/$defs/id"},
+    "campaign_id": {"$ref": "#/$defs/id"},
+    "status": {"enum": ["blocked", "partial", "completed"]},
+    "blockers": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "campaign_tokens_cap_reached",
+          "campaign_tool_calls_cap_reached",
+          "campaign_elapsed_seconds_cap_reached",
+          "campaign_cost_usd_cap_reached",
+          "second_selected_executable_stack_absent",
+          "paid_execution_not_authorized"
+        ]
+      }
+    },
+    "result_path": {
+      "type": "string",
+      "pattern": "^benchmark/live/results/[a-z0-9]+(?:-[a-z0-9]+)*\\.json$"
+    },
+    "result_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "result_size": {"type": "integer", "minimum": 2},
+    "planned_run_count": {"type": "integer", "minimum": 1, "maximum": 108},
+    "recorded_run_count": {"type": "integer", "minimum": 0, "maximum": 108},
+    "planned_cells": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 108,
+      "items": {"$ref": "#/$defs/cell"}
+    },
+    "recorded_cells": {
+      "type": "array",
+      "maxItems": 108,
+      "items": {"$ref": "#/$defs/cell"}
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stack_id", "task_id", "arm", "replicate"],
+      "properties": {
+        "stack_id": {"$ref": "#/$defs/id"},
+        "task_id": {"$ref": "#/$defs/id"},
+        "arm": {
+          "enum": ["hard_stop_only", "generic_rethink", "semantic_reheating"]
+        },
+        "replicate": {"type": "integer", "minimum": 1, "maximum": 3}
+      }
+    }
+  }
+}

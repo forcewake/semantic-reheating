@@ -1,0 +1,35 @@
+{
+  "contract_version": "1.0",
+  "stacks": [
+    {
+      "stack_id": "claude-code-zai-glm-5-3",
+      "kind": "paid_remote",
+      "status": "selected",
+      "provider": {"name": "z-ai", "version": "not-invoked"},
+      "model": {"name": "glm-5-3", "version": "not-invoked"},
+      "cli": {"name": "claude-code", "version": "not-invoked"},
+      "framework": {"name": "claude-code", "version": "not-invoked"},
+      "command": ["claude", "--offline", "--read-only", "--sandbox=$TASK_SANDBOX"],
+      "sandbox": {"mode": "task_local_isolated", "writable_scope": "task_sandbox_only", "network": "disabled", "external_side_effect_capability": false},
+      "tools": {"allowlist": ["synthetic_trace_read", "fixture_read"], "external_side_effect_capability": false},
+      "controls": {"decoding": {"status": "unsupported", "reason": "not queried: no-call evidence"}, "seed": {"status": "unsupported", "reason": "not queried: no-call evidence"}},
+      "telemetry": {"token_reporting": "unavailable", "time_reporting": "unavailable", "compute_metadata": {"runtime": "not-invoked", "hardware": "not-invoked"}},
+      "pricing": {"cost_reporting": "provider_reported"}
+    },
+    {
+      "stack_id": "second-executable-stack-unavailable",
+      "kind": "local",
+      "status": "blocked",
+      "provider": {"name": "unavailable", "version": "not-invoked"},
+      "model": {"name": "unavailable", "version": "not-invoked"},
+      "cli": {"name": "unavailable", "version": "not-invoked"},
+      "framework": {"name": "unavailable", "version": "not-invoked"},
+      "command": ["unavailable-stack", "--offline", "--read-only", "--sandbox=$TASK_SANDBOX"],
+      "sandbox": {"mode": "task_local_isolated", "writable_scope": "task_sandbox_only", "network": "disabled", "external_side_effect_capability": false},
+      "tools": {"allowlist": ["synthetic_trace_read", "fixture_read"], "external_side_effect_capability": false},
+      "controls": {"decoding": {"status": "unsupported", "reason": "no second executable stack"}, "seed": {"status": "unsupported", "reason": "no second executable stack"}},
+      "telemetry": {"token_reporting": "unavailable", "time_reporting": "unavailable", "compute_metadata": {"runtime": "unavailable", "hardware": "unavailable"}},
+      "pricing": {"cost_reporting": "local_zero", "direct_api_cost_usd": 0.0}
+    }
+  ]
+}

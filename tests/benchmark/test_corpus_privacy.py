@@ -24,6 +24,16 @@ LIVE_RESULTS_SCHEMA_PATH = PROJECT_ROOT / "benchmark/live/results.schema.json"
 LIVE_RESULTS_EXAMPLE_PATH = (
     PROJECT_ROOT / "benchmark/live/results/example-redacted-results.json"
 )
+LIVE_RUN_MANIFEST_SCHEMA_PATH = (
+    PROJECT_ROOT / "benchmark/live/campaign-run-manifest.schema.json"
+)
+LIVE_SELECTED_STACKS_PATH = PROJECT_ROOT / "benchmark/live/stacks.selected.json"
+LIVE_BLOCKED_RESULTS_PATH = (
+    PROJECT_ROOT / "benchmark/live/results/campaign-2026-08-29.json"
+)
+LIVE_BLOCKED_MANIFEST_PATH = (
+    PROJECT_ROOT / "benchmark/live/results/campaign-2026-08-29-manifest.json"
+)
 
 _FORBIDDEN_TEXT = re.compile(
     r"(?:\.hermes|/home/|/Users/|(?:^|[\s\"'])[A-Za-z]:\\|\\\\[A-Za-z0-9_.-]+\\|"
@@ -57,6 +67,11 @@ _HASH_BACKED_FINDING_ID = re.compile(
     rf"(?:{'|'.join(_HASH_BACKED_FINDING_PREFIXES)})-[0-9a-f]{{64}}$"
 )
 _DECISION_ID = re.compile(r"decision-[0-9a-f]{24}(?:[0-9a-f]{40})?$")
+_CAMPAIGN_RESULT_ID = re.compile(r"campaign-[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+_CAMPAIGN_MANIFEST_ID = re.compile(r"campaign-[0-9]{4}-[0-9]{2}-[0-9]{2}-manifest$")
+_CAMPAIGN_RESULT_PATH = re.compile(
+    r"benchmark/live/results/campaign-[0-9]{4}-[0-9]{2}-[0-9]{2}\.json$"
+)
 
 
 def _is_safe_hash_identifier(value: str, pointer: str) -> bool:
@@ -65,6 +80,12 @@ def _is_safe_hash_identifier(value: str, pointer: str) -> bool:
         return _HASH_BACKED_FINDING_ID.fullmatch(value) is not None
     if pointer.endswith(".decision_id"):
         return _DECISION_ID.fullmatch(value) is not None
+    if pointer.endswith(".result_set_id"):
+        return _CAMPAIGN_RESULT_ID.fullmatch(value) is not None
+    if pointer.endswith(".manifest_id") or ".matched_run_manifest_ids[" in pointer:
+        return _CAMPAIGN_MANIFEST_ID.fullmatch(value) is not None
+    if pointer.endswith(".result_path"):
+        return _CAMPAIGN_RESULT_PATH.fullmatch(value) is not None
     return re.fullmatch(r"[0-9a-f]{64}", value) is not None and pointer.endswith(
         ("_sha256", ".corpus_revision", ".policy_sha256")
     )
@@ -122,6 +143,10 @@ def _public_paths() -> list[Path]:
         LIVE_STACKS_EXAMPLE_PATH,
         LIVE_RESULTS_SCHEMA_PATH,
         LIVE_RESULTS_EXAMPLE_PATH,
+        LIVE_RUN_MANIFEST_SCHEMA_PATH,
+        LIVE_SELECTED_STACKS_PATH,
+        LIVE_BLOCKED_RESULTS_PATH,
+        LIVE_BLOCKED_MANIFEST_PATH,
         *(PROJECT_ROOT / entry["trace_path"] for entry in manifest["entries"]),
     ]
 
@@ -144,7 +169,7 @@ def test_public_corpus_bytes_and_json_values_are_redacted_and_deterministic() ->
         budget=CorpusBudget(),
     )
     traces = {trace.trace_path: trace for trace in corpus.traces}
-    assert len(paths) == 39
+    assert len(paths) == 43
     assert len(traces) == 29
     assert set(paths) == {
         path
@@ -171,6 +196,7 @@ def test_public_corpus_bytes_and_json_values_are_redacted_and_deterministic() ->
                     LIVE_CAMPAIGN_SCHEMA_PATH,
                     LIVE_STACKS_SCHEMA_PATH,
                     LIVE_RESULTS_SCHEMA_PATH,
+                    LIVE_RUN_MANIFEST_SCHEMA_PATH,
                 },
             )
 
