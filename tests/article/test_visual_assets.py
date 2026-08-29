@@ -7,6 +7,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +41,8 @@ def test_cover_png_has_required_mode_dimensions_and_local_provenance() -> None:
 
 
 def test_renderer_is_byte_stable_for_packaged_cover() -> None:
+    if not (ROOT / "tools/assets/node_modules/.bin/mmdc").exists():
+        pytest.skip("requires npm ci --prefix tools/assets")
     cover = BUNDLE / "cover.png"
     for _ in range(2):
         result = subprocess.run(
