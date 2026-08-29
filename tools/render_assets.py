@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -18,25 +19,21 @@ MMDC = ROOT / "tools" / "assets" / "node_modules" / ".bin" / "mmdc"
 COVER_RENDERER = ROOT / "tools" / "assets" / "render-cover.mjs"
 
 
-def check_assets() -> None:
-    for path in (BUNDLE / "architecture.svg", BUNDLE / "cover.svg"):
-        ET.parse(path)
-    with Image.open(BUNDLE / "cover.png") as image:
+def _check_generated_assets(architecture: Path, cover: Path) -> None:
+    ET.parse(architecture)
+    with Image.open(cover) as image:
         if image.size != (1600, 900) or image.mode not in {"RGB", "RGBA"}:
             raise ValueError("cover.png must be an RGB/RGBA 1600x900 image")
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--check", action="store_true")
-    args = parser.parse_args(argv)
-    if args.check:
-        check_assets()
-        print("article assets validate")
-        return 0
-    if not MMDC.exists():
-        print(f"missing repository-local Mermaid CLI: {MMDC}", file=sys.stderr)
-        return 1
+def check_assets() -> None:
+    ET.parse(BUNDLE / "cover.svg")
+    _check_generated_assets(BUNDLE / "architecture.svg", BUNDLE / "cover.png")
+
+
+def _render_generated_assets(architecture: Path, cover: Path) -> None:
+    architecture.parent.mkdir(parents=True, exist_ok=True)
+    cover.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", encoding="utf-8"
     ) as config:
@@ -48,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
                 "-i",
                 str(ROOT / "docs/diagrams/controller-state.mmd"),
                 "-o",
-                str(BUNDLE / "architecture.svg"),
+                str(architecture),
                 "-b",
                 "transparent",
                 "-p",
@@ -61,10 +58,56 @@ def main(argv: list[str] | None = None) -> int:
             "node",
             str(COVER_RENDERER),
             str(BUNDLE / "cover.svg"),
-            str(BUNDLE / "cover.png"),
+            str(cover),
         ],
         check=True,
     )
+    _check_generated_assets(architecture, cover)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def verify_render() -> None:
+    with tempfile.TemporaryDirectory(prefix="semantic-reheating-assets-") as temporary:
+        root = Path(temporary)
+        first = root / "first"
+        second = root / "second"
+        _render_generated_assets(first / "architecture.svg", first / "cover.png")
+        _render_generated_assets(second / "architecture.svg", second / "cover.png")
+        first_hashes = (
+            _sha256(first / "architecture.svg"),
+            _sha256(first / "cover.png"),
+        )
+        second_hashes = (
+            _sha256(second / "architecture.svg"),
+            _sha256(second / "cover.png"),
+        )
+        if first_hashes != second_hashes:
+            raise ValueError(
+                "article asset rendering is not byte-stable in this environment"
+            )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true")
+    mode.add_argument("--verify-render", action="store_true")
+    args = parser.parse_args(argv)
+    if args.check:
+        check_assets()
+        print("article assets validate")
+        return 0
+    if not MMDC.exists():
+        print(f"missing repository-local Mermaid CLI: {MMDC}", file=sys.stderr)
+        return 1
+    if args.verify_render:
+        verify_render()
+        print("article asset rendering is deterministic in this environment")
+        return 0
+    _render_generated_assets(BUNDLE / "architecture.svg", BUNDLE / "cover.png")
     check_assets()
     print("rendered article assets")
     return 0

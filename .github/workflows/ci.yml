@@ -43,7 +43,7 @@ jobs:
       - name: Render checked-in visual assets locally
         run: |
           npm ci --prefix tools/assets
-          uv run python tools/render_assets.py
+          uv run python tools/render_assets.py --verify-render
       - name: Run Python example and static checks
         run: |
           uv run python examples/python-generic-agent/main.py

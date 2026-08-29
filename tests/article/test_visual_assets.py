@@ -41,6 +41,8 @@ def test_cover_png_has_required_mode_dimensions_and_local_provenance() -> None:
     assert "local" in assets.lower()
     assert "@resvg/resvg-js" in assets
     assert "ImageMagick" not in assets
+    assert "within-environment byte stability" in assets
+    assert "Cross-environment byte equality is not claimed" in assets
 
 
 def test_cover_renderer_is_repo_local_and_lockfile_pinned() -> None:
@@ -79,6 +81,7 @@ def test_ci_uses_locked_renderer_without_system_imagemagick() -> None:
     assert "ubuntu-24.04" in workflow
     assert "apt-get install -y imagemagick" not in workflow
     assert "npm ci --prefix tools/assets" in workflow
+    assert "uv run python tools/render_assets.py --verify-render" in workflow
 
 
 def test_ci_reports_tree_drift_before_clean_checkout() -> None:
@@ -102,6 +105,24 @@ def test_repository_ignores_local_asset_dependencies() -> None:
         check=False,
     )
     assert result.returncode == 0
+
+
+def test_verify_render_is_non_mutating_and_deterministic() -> None:
+    if not (ROOT / "tools/assets/node_modules/.bin/mmdc").exists():
+        pytest.skip("requires npm ci --prefix tools/assets")
+    assets = (BUNDLE / "architecture.svg", BUNDLE / "cover.png")
+    before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in assets}
+    result = subprocess.run(
+        ["python", "tools/render_assets.py", "--verify-render"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    after = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in assets}
+    assert result.returncode == 0, result.stderr
+    assert "article asset rendering is deterministic" in result.stdout
+    assert after == before
 
 
 def test_renderer_is_byte_stable_for_packaged_cover() -> None:
