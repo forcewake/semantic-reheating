@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 from PIL import Image
-
-from tools import render_assets
 
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "article/semantic-reheating"
@@ -40,22 +39,46 @@ def test_cover_png_has_required_mode_dimensions_and_local_provenance() -> None:
     for name in ("cover.svg", "cover.png", "architecture.svg", "controller-state.mmd"):
         assert name in assets
     assert "local" in assets.lower()
+    assert "@resvg/resvg-js" in assets
+    assert "ImageMagick" not in assets
 
 
-def test_renderer_selects_installed_imagemagick_command(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        render_assets.shutil,
-        "which",
-        lambda command: "/usr/bin/convert" if command == "convert" else None,
+def test_cover_renderer_is_repo_local_and_lockfile_pinned() -> None:
+    package = json.loads(
+        (ROOT / "tools/assets/package.json").read_text(encoding="utf-8")
     )
-    assert render_assets._image_renderer() == "/usr/bin/convert"
+    lock = json.loads(
+        (ROOT / "tools/assets/package-lock.json").read_text(encoding="utf-8")
+    )
+    assert package["devDependencies"]["@resvg/resvg-js"] == "2.6.2"
+    assert lock["packages"][""]["devDependencies"]["@resvg/resvg-js"] == "2.6.2"
+    locked_renderer = lock["packages"]["node_modules/@resvg/resvg-js"]
+    assert locked_renderer["version"] == "2.6.2"
+    assert locked_renderer["integrity"].startswith("sha512-")
+    renderer = ROOT / "tools/assets/render-cover.mjs"
+    assert renderer.is_file()
+    renderer_source = renderer.read_text(encoding="utf-8")
+    assert '"@resvg/resvg-js"' in renderer_source
+    assert "magick" not in renderer_source.lower()
 
 
-def test_ci_installs_the_declared_image_renderer() -> None:
+def test_cover_renderer_rejects_missing_paths() -> None:
+    result = subprocess.run(
+        ["node", "tools/assets/render-cover.mjs"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "usage: node render-cover.mjs SOURCE.svg DESTINATION.png" in result.stderr
+
+
+def test_ci_uses_locked_renderer_without_system_imagemagick() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-    assert "apt-get install -y imagemagick" in workflow
+    assert "ubuntu-24.04" in workflow
+    assert "apt-get install -y imagemagick" not in workflow
+    assert "npm ci --prefix tools/assets" in workflow
 
 
 def test_renderer_is_byte_stable_for_packaged_cover() -> None:

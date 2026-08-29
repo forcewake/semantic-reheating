@@ -848,7 +848,12 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
     }
     task28_staged_allowed = {
         ".github/workflows/ci.yml",
+        "article/semantic-reheating/ASSETS.md",
+        "article/semantic-reheating/cover.png",
         "tests/article/test_visual_assets.py",
+        "tools/assets/package-lock.json",
+        "tools/assets/package.json",
+        "tools/assets/render-cover.mjs",
         "tools/render_assets.py",
     }
     allowed = (
