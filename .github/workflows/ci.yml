@@ -42,6 +42,8 @@ jobs:
           uv run python tools/validate_article.py article/semantic-reheating
       - name: Render checked-in visual assets locally
         run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
           npm ci --prefix tools/assets
           uv run python tools/render_assets.py
       - name: Run Python example and static checks

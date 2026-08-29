@@ -846,11 +846,17 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         "tests/tools/test_clean_checkout_verify.py",
         "tools/clean_checkout_verify.py",
     }
+    task28_staged_allowed = {
+        ".github/workflows/ci.yml",
+        "tests/article/test_visual_assets.py",
+        "tools/render_assets.py",
+    }
     allowed = (
         tracked_allowed
         | task25_staged_allowed
         | task26_staged_allowed
         | task27_staged_allowed
+        | task28_staged_allowed
         | {
             "tests/skill/test_skill_package.py",
             "tests/skill/test_sanitized_rubric.py",

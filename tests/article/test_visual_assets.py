@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from tools import render_assets
+
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "article/semantic-reheating"
 
@@ -38,6 +40,22 @@ def test_cover_png_has_required_mode_dimensions_and_local_provenance() -> None:
     for name in ("cover.svg", "cover.png", "architecture.svg", "controller-state.mmd"):
         assert name in assets
     assert "local" in assets.lower()
+
+
+def test_renderer_selects_installed_imagemagick_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        render_assets.shutil,
+        "which",
+        lambda command: "/usr/bin/convert" if command == "convert" else None,
+    )
+    assert render_assets._image_renderer() == "/usr/bin/convert"
+
+
+def test_ci_installs_the_declared_image_renderer() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "apt-get install -y imagemagick" in workflow
 
 
 def test_renderer_is_byte_stable_for_packaged_cover() -> None:

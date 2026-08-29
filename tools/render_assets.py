@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,14 @@ def check_assets() -> None:
     with Image.open(BUNDLE / "cover.png") as image:
         if image.size != (1600, 900) or image.mode not in {"RGB", "RGBA"}:
             raise ValueError("cover.png must be an RGB/RGBA 1600x900 image")
+
+
+def _image_renderer() -> str:
+    for command in ("magick", "convert"):
+        executable = shutil.which(command)
+        if executable is not None:
+            return executable
+    raise FileNotFoundError("ImageMagick command is required to render cover.png")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     subprocess.run(
         [
-            "magick",
+            _image_renderer(),
             str(BUNDLE / "cover.svg"),
             "-strip",
             "-define",
