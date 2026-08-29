@@ -19,6 +19,7 @@ from .metrics import validate_results
 from .runner import CampaignConfigurationError, build_run_matrix, configuration_blockers
 
 _USAGE_FIELDS = ("tokens", "tool_calls", "elapsed_seconds", "cost_usd")
+_CAP_FIELDS = ("turns", *_USAGE_FIELDS)
 _ENV_KEYS = (
     "TASK_SANDBOX",
     "FIXTURE_PATH",
@@ -190,6 +191,7 @@ def _manifest_document(
         "contract_version": "1.0",
         "manifest_id": _manifest_id(result_id),
         "campaign_id": campaign["campaign_id"],
+        "result_source_kind": result["source_kind"],
         "status": status,
         "blockers": sorted(set(blockers)),
         "result_path": result_path,
@@ -205,8 +207,8 @@ def _manifest_document(
 def _cap_reached(
     usage: Mapping[str, int | float], caps: Mapping[str, Any]
 ) -> str | None:
-    for field in _USAGE_FIELDS:
-        if usage[field] >= caps[field]:
+    for field in _CAP_FIELDS:
+        if field in caps and usage[field] >= caps[field]:
             return field
     return None
 
@@ -242,7 +244,7 @@ def _record_for_run(
         response.get("events"), Sequence
     ):
         raise CampaignConfigurationError("runner_response_invalid")
-    usage = _empty_usage()
+    usage: dict[str, int | float] = {"turns": 0, **_empty_usage()}
     outcome = "not_accepted"
     first_cap: str | None = None
     for event in response["events"]:
@@ -252,13 +254,11 @@ def _record_for_run(
         if event_outcome not in _OUTCOMES:
             raise CampaignConfigurationError("runner_outcome_invalid")
         event_usage = _event_usage(event, clock)
-        for field in _USAGE_FIELDS:
+        for field in _CAP_FIELDS:
             usage[field] += event_usage[field]
         outcome = event_outcome
-        if any(usage[field] >= per_run_caps[field] for field in _USAGE_FIELDS):
-            first_cap = next(
-                field for field in _USAGE_FIELDS if usage[field] >= per_run_caps[field]
-            )
+        first_cap = _cap_reached(usage, per_run_caps)
+        if first_cap:
             break
     if first_cap:
         status, failure_kind, intervention = "interrupted", "controller_failure", "stop"
@@ -278,7 +278,7 @@ def _record_for_run(
         "degraded_mode": False,
         "evidence_gain": 0,
         "repeated_side_effects_prevented": 0,
-        "usage": usage,
+        "usage": {field: usage[field] for field in _USAGE_FIELDS},
     }
 
 
@@ -316,10 +316,11 @@ def execute_campaign(
     limit_matrix: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run only a configuration-approved finite matrix through injected commands."""
-    matrix = build_run_matrix(campaign, stacks)
+    full_matrix = build_run_matrix(campaign, stacks)
+    matrix = full_matrix
     if limit_matrix is not None:
         matrix = matrix[:limit_matrix]
-    if not matrix or len(matrix) > 108:
+    if not matrix or len(full_matrix) > 108:
         raise CampaignConfigurationError("matrix_not_bounded")
     results: list[dict[str, object]] = []
     campaign_usage = _empty_usage()
@@ -346,16 +347,21 @@ def execute_campaign(
     result_path, result_id = _result_path_id(None)
     source_kind = (
         "partial_campaign"
-        if blockers or len(results) < len(matrix)
+        if blockers or len(results) < len(full_matrix)
         else "executed_campaign"
     )
     result = _result_document(
-        campaign, stacks, matrix, results, source_kind=source_kind, result_id=result_id
+        campaign,
+        stacks,
+        full_matrix,
+        results,
+        source_kind=source_kind,
+        result_id=result_id,
     )
     validate_results(result)
     manifest = _manifest_document(
         campaign,
-        matrix,
+        full_matrix,
         results,
         result,
         result_path=result_path,
@@ -447,6 +453,26 @@ def validate_selected_artifacts(
         raise ManifestArtifactError(
             "result stack metadata does not bind selected stacks"
         )
+    if result["source_kind"] == "synthetic_example":
+        raise ManifestArtifactError(
+            "synthetic example cannot bind selected campaign artifacts"
+        )
+    if result["campaign_id"] != manifest["campaign_id"]:
+        raise ManifestArtifactError("result campaign does not bind manifest campaign")
+    if result["matched_run_manifest_ids"] != [manifest["manifest_id"]]:
+        raise ManifestArtifactError("result manifest ids do not bind manifest")
+    if manifest["result_source_kind"] != result["source_kind"]:
+        raise ManifestArtifactError(
+            "manifest source kind does not bind result source kind"
+        )
+    if manifest["planned_run_count"] != len(result["planned_cells"]):
+        raise ManifestArtifactError("manifest planned count does not bind result cells")
+    if manifest["recorded_run_count"] != len(result["results"]):
+        raise ManifestArtifactError(
+            "manifest recorded count does not bind result records"
+        )
+    if manifest["planned_cells"] != result["planned_cells"]:
+        raise ManifestArtifactError("manifest planned cells do not bind result cells")
     result_bytes = result_path.read_bytes()
     if manifest["result_sha256"] != hashlib.sha256(result_bytes).hexdigest():
         raise ManifestArtifactError("result hash does not bind result bytes")

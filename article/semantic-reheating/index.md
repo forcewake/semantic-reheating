@@ -35,7 +35,7 @@ Semantic reheating names that move: a host-advisory policy that can recommend a 
 | Evidence class | Bound artifact | Sample size / observed cells | Missing cells | Scope |
 | --- | --- | ---: | ---: | --- |
 | Deterministic benchmark | `benchmark/results/deterministic-results.json` (`sha256:b3a15c9db4f805b6eac9fc8a440a876b38ce4fc094ca64b0593458019fd765c1`) | 29 traces | 0 | fixed corpus replay; 29/29 decisions and 29/29 safety outcomes match |
-| Blocked campaign status | `benchmark/live/results/campaign-2026-08-29-manifest.json` (`sha256:34bbe539f657f87d5dd3d8efc0eef031d297f8588ca6a6c304bf905d5cde9e9c`) | 0 / 108 cells | 108 | blocked; caps consumed 0; not an efficacy experiment |
+| Blocked campaign status | `benchmark/live/results/campaign-2026-08-29-manifest.json` (`sha256:13b982b661a0e7f4e98922682b338db39dba8cc520e714da3136ea6f65bb97d0`) | 0 / 108 cells | 108 | blocked; caps consumed 0; not an efficacy experiment |
 | Blocked campaign status | `benchmark/live/results/campaign-2026-08-29.json` (`sha256:bbde728c21ab611528c903390675d78235cbadf8939861204da10bf13ab6a7f8`) | 0 / 108 cells | 108 | blocked; caps consumed 0; not an efficacy experiment |
 | Skill A/B (single replicate) | `skills/semantic-reheating/references/results.json` (`sha256:805717b351f1224188a8f72004ed3c630dc3849827452f0eb1a7d7d1419ebf36`) | 6 scenarios | 0 | baseline 5/6 → post-Skill 6/6; bounded scenario set |
 

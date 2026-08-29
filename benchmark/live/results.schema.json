@@ -59,6 +59,25 @@
       "items": {"$ref": "#/$defs/result"}
     }
   },
+  "allOf": [
+    {
+      "if": {"properties": {"source_kind": {"const": "blocked_campaign"}}},
+      "then": {"properties": {"results": {"maxItems": 0}}}
+    },
+    {
+      "if": {"properties": {"source_kind": {"const": "partial_campaign"}}},
+      "then": {"properties": {"results": {"minItems": 1}}}
+    },
+    {
+      "if": {"properties": {"source_kind": {"const": "executed_campaign"}}},
+      "then": {
+        "properties": {
+          "planned_cells": {"minItems": 108},
+          "results": {"minItems": 108}
+        }
+      }
+    }
+  ],
   "$defs": {
     "id": {
       "type": "string",

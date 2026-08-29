@@ -16,12 +16,14 @@ class Runner:
         dirty: bool = False,
         mismatch: bool = False,
         missing_readback: bool = False,
+        origin_url: str = "https://github.com/example/public-repo.git",
     ) -> None:
         self.dirty, self.mismatch, self.missing_readback = (
             dirty,
             mismatch,
             missing_readback,
         )
+        self.origin_url = origin_url
 
     def __call__(self, args: list[str], root: Path) -> bytes:
         command = tuple(args)
@@ -32,7 +34,7 @@ class Runner:
         if command == ("rev-parse", "origin/main"):
             return (b"b" if self.mismatch else b"a") * 40 + b"\n"
         if command == ("remote", "get-url", "origin"):
-            return b"https://github.com/example/public-repo.git\n"
+            return f"{self.origin_url}\n".encode()
         if command == ("remote", "show", "origin"):
             return b"HEAD branch: main\n"
         if command == ("rev-parse", "origin/main:README.md"):
@@ -63,6 +65,40 @@ def test_receipt_writes_closed_external_record_only_after_verified_readback(
         }
     ]
     assert json.loads(output.read_text()) == receipt
+
+
+def test_receipt_rejects_sensitive_https_origins_before_output_write(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_bytes(b"public bytes\n")
+    secret = "-".join(("release", "secret", "fragment"))  # noqa: FLY002
+    unsafe_origins = [
+        f"https://user:{secret}@github.com/example/public-repo.git",
+        f"https://github.com/example/public-repo.git?token={secret}",
+        f"https://github.com/example/public-repo.git#{secret}",
+        f"ssh://git@github.com/example/public-repo.git?token={secret}",
+        f"git@github.com:example/public-repo.git#{secret}",
+    ]
+
+    for number, origin_url in enumerate(unsafe_origins):
+        output = tmp_path / f"unsafe-{number}.json"
+        with pytest.raises(ReceiptError):
+            write_release_receipt(
+                repo, output, ["README.md"], runner=Runner(origin_url=origin_url)
+            )
+        assert not output.exists()
+
+    output = tmp_path / "public.json"
+    receipt = write_release_receipt(
+        repo,
+        output,
+        ["README.md"],
+        runner=Runner(origin_url="https://github.com/example/public-repo.git"),
+    )
+    assert receipt["origin"] == "https://github.com/example/public-repo.git"
+    assert secret not in output.read_text()
 
 
 @pytest.mark.parametrize("kind", ["inside", "mismatch", "readback", "dirty"])

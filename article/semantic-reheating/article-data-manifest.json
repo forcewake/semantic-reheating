@@ -14,7 +14,7 @@
       "artifact_id": "article-source-2",
       "order": 2,
       "path": "benchmark/live/results/campaign-2026-08-29-manifest.json",
-      "sha256": "34bbe539f657f87d5dd3d8efc0eef031d297f8588ca6a6c304bf905d5cde9e9c",
+      "sha256": "13b982b661a0e7f4e98922682b338db39dba8cc520e714da3136ea6f65bb97d0",
       "source_kind": "blocked_campaign",
       "status": "blocked",
       "include": true

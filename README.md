@@ -14,6 +14,7 @@ The controller is advisory. The host retains authority over credentials, tools, 
 - [Recovery policies, ladder, and cooling](docs/recovery-policies.md)
 - [Synthetic corpus and bounded evaluation](docs/evaluation.md)
 - [Prior-art boundary](docs/prior-art.md)
+- [Evidence-led article](article/semantic-reheating/index.md)
 
 ## Non-goals
 
@@ -28,7 +29,7 @@ uv sync --all-groups
 uv run reheat --help
 ```
 
-The initial command only presents help. Later releases may add deterministic validation and decision capabilities while preserving host authority.
+The current CLI provides local, advisory operations: `reheat validate` validates a trace and policy, `reheat analyze` analyzes them, `reheat explain` renders a validated decision, and `reheat benchmark` replays the committed synthetic benchmark corpus. These commands do not grant host authority or execute host tools.
 
 ## Examples
 

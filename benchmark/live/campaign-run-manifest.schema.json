@@ -9,6 +9,7 @@
     "contract_version",
     "manifest_id",
     "campaign_id",
+    "result_source_kind",
     "status",
     "blockers",
     "result_path",
@@ -23,6 +24,9 @@
     "contract_version": {"const": "1.0"},
     "manifest_id": {"$ref": "#/$defs/id"},
     "campaign_id": {"$ref": "#/$defs/id"},
+    "result_source_kind": {
+      "enum": ["blocked_campaign", "partial_campaign", "executed_campaign"]
+    },
     "status": {"enum": ["blocked", "partial", "completed"]},
     "blockers": {
       "type": "array",
@@ -59,6 +63,40 @@
       "items": {"$ref": "#/$defs/cell"}
     }
   },
+  "allOf": [
+    {
+      "if": {"properties": {"result_source_kind": {"const": "blocked_campaign"}}},
+      "then": {
+        "properties": {
+          "status": {"const": "blocked"},
+          "recorded_run_count": {"const": 0},
+          "recorded_cells": {"maxItems": 0}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"result_source_kind": {"const": "partial_campaign"}}},
+      "then": {
+        "properties": {
+          "status": {"const": "partial"},
+          "recorded_run_count": {"minimum": 1},
+          "recorded_cells": {"minItems": 1}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"result_source_kind": {"const": "executed_campaign"}}},
+      "then": {
+        "properties": {
+          "status": {"const": "completed"},
+          "planned_run_count": {"const": 108},
+          "recorded_run_count": {"const": 108},
+          "planned_cells": {"minItems": 108},
+          "recorded_cells": {"minItems": 108}
+        }
+      }
+    }
+  ],
   "$defs": {
     "id": {
       "type": "string",

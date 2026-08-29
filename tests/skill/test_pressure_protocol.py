@@ -820,9 +820,28 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         "tools/public_hygiene.py",
         "tools/release_receipt.py",
     }
+    task26_staged_allowed = {
+        "README.md",
+        "SECURITY.md",
+        "article/semantic-reheating/article-data-manifest.json",
+        "article/semantic-reheating/index.md",
+        "benchmark/live/campaign-run-manifest.schema.json",
+        "benchmark/live/executor.py",
+        "benchmark/live/metrics.py",
+        "benchmark/live/results.schema.json",
+        "benchmark/live/results/campaign-2026-08-29-manifest.json",
+        "tests/docs/test_publication_documentation.py",
+        "tests/live/test_campaign_executor.py",
+        "tests/live/test_results_metrics.py",
+        "tests/live/test_selected_campaign_artifacts.py",
+        "tests/skill/test_pressure_protocol.py",
+        "tests/tools/test_release_receipt.py",
+        "tools/release_receipt.py",
+    }
     allowed = (
         tracked_allowed
         | task25_staged_allowed
+        | task26_staged_allowed
         | {
             "tests/skill/test_skill_package.py",
             "tests/skill/test_sanitized_rubric.py",

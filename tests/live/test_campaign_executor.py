@@ -87,6 +87,50 @@ def test_executor_counts_nested_work_in_one_envelope_and_stops_on_first_run_cap(
     assert "raw-transcript" not in json.dumps(manifest)
 
 
+def test_executor_counts_turns_across_retries_handoffs_and_reentry_before_stopping(
+    tmp_path: Path,
+) -> None:
+    from benchmark.live.executor import execute_campaign
+
+    campaign, stacks = _documents()
+    runner_calls = 0
+
+    def runner(command: tuple[str, ...], env: Mapping[str, str]) -> dict[str, object]:
+        nonlocal runner_calls
+        runner_calls += 1
+        return {
+            "events": [
+                {"usage": _usage(tokens=1, turns=10), "outcome": "not_accepted"},
+                {"usage": _usage(tokens=1, turns=10), "outcome": "not_accepted"},
+                {"usage": _usage(tokens=1, turns=11), "outcome": "accepted"},
+            ]
+        }
+
+    result, manifest = execute_campaign(
+        campaign,
+        stacks,
+        command_runner=runner,
+        clock=lambda: 1.0,
+        result_sink=lambda document: None,
+        sandbox_root=tmp_path,
+        limit_matrix=1,
+    )
+
+    assert runner_calls == 1
+    assert result["source_kind"] == "partial_campaign"
+    assert result["results"][0]["intervention"] == "stop"
+    assert result["results"][0]["failure_kind"] == "controller_failure"
+    assert result["results"][0]["usage"] == {
+        "tokens": 3,
+        "tool_calls": 0,
+        "elapsed_seconds": 3.0,
+        "cost_usd": 0.0,
+    }
+    assert "turns" not in result["results"][0]["usage"]
+    assert manifest["blockers"] == []
+    assert manifest["status"] == "partial"
+
+
 def test_executor_stops_scheduling_at_first_campaign_cap_and_never_exceeds_matrix(
     tmp_path: Path,
 ) -> None:

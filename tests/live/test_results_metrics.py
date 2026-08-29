@@ -53,6 +53,24 @@ def test_results_schema_rejects_unknowns_missing_wrong_types_and_unknown_vocabul
         Draft202012Validator(schema).validate(document)
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update(source_kind="blocked_campaign"),
+        lambda value: value.update(source_kind="partial_campaign", results=[]),
+        lambda value: value.update(source_kind="executed_campaign"),
+    ],
+)
+def test_results_schema_rejects_source_kind_count_mismatches(mutate: object) -> None:
+    document = deepcopy(results_document())
+    assert callable(mutate)
+    mutate(document)
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
+
+
 def test_compute_metrics_preserves_partial_matrix_and_recomputes_all_public_measures() -> (
     None
 ):

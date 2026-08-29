@@ -108,6 +108,22 @@ def validate_results(document: object) -> None:
     if usage_totals != dict(caps_consumed):
         raise ResultArtifactError("caps consumed do not equal recorded result usage")
 
+    source_kind = document["source_kind"]
+    if source_kind == "blocked_campaign" and result_keys:
+        raise ResultArtifactError("blocked campaign cannot record result cells")
+    if source_kind == "partial_campaign" and (
+        not result_keys or result_keys == planned_keys
+    ):
+        raise ResultArtifactError(
+            "partial campaign requires nonzero incomplete records"
+        )
+    if source_kind == "executed_campaign" and (
+        len(planned_keys) != 108 or result_keys != planned_keys
+    ):
+        raise ResultArtifactError(
+            "executed campaign requires complete 108-cell recorded coverage"
+        )
+
 
 def compute_metrics(document: Mapping[str, Any]) -> dict[str, object]:
     """Validate and recompute public aggregate metrics without provider interaction."""

@@ -9,6 +9,7 @@ import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 class ReceiptError(RuntimeError):
@@ -69,6 +70,14 @@ def write_release_receipt(
     remote_url = _text(command, repo, ["remote", "get-url", "origin"])
     if not remote_url.startswith(("https://", "ssh://", "git@")):
         raise ReceiptError("origin is not public remote metadata")
+    if "?" in remote_url or "#" in remote_url:
+        raise ReceiptError("origin URL includes disallowed sensitive components")
+    if remote_url.startswith("https://"):
+        parsed_origin = urlsplit(remote_url)
+        if parsed_origin.username is not None or parsed_origin.password is not None:
+            raise ReceiptError(
+                "origin HTTPS URL includes disallowed sensitive components"
+            )
     remote_metadata = _text(command, repo, ["remote", "show", "origin"])
     if "HEAD branch: main" not in remote_metadata:
         raise ReceiptError("origin default branch is not main")

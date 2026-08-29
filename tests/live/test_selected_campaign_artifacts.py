@@ -23,11 +23,32 @@ def _cell() -> dict[str, object]:
     }
 
 
+def _result_record(cell: dict[str, object]) -> dict[str, object]:
+    return {
+        **cell,
+        "status": "accepted",
+        "failure_kind": "none",
+        "recovery": "not_attempted",
+        "intervention": "none",
+        "detector_contribution": "not_applicable",
+        "degraded_mode": False,
+        "evidence_gain": 0,
+        "repeated_side_effects_prevented": 0,
+        "usage": {
+            "tokens": 0,
+            "tool_calls": 0,
+            "elapsed_seconds": 0.0,
+            "cost_usd": 0.0,
+        },
+    }
+
+
 def manifest_document() -> dict[str, Any]:
     return {
         "contract_version": "1.0",
         "manifest_id": "campaign-2026-08-29-manifest",
         "campaign_id": "synthetic-bounded-campaign",
+        "result_source_kind": "blocked_campaign",
         "status": "blocked",
         "blockers": ["paid_execution_not_authorized"],
         "result_path": "benchmark/live/results/campaign-2026-08-29.json",
@@ -82,6 +103,102 @@ def test_manifest_validator_rejects_semantic_duplicate_cells() -> None:
 
     with pytest.raises(ManifestArtifactError, match="duplicate planned cell"):
         validate_manifest(document)
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "status", "recorded_count", "recorded_cells"),
+    [
+        ("blocked_campaign", "partial", 0, []),
+        ("blocked_campaign", "blocked", 1, [_cell()]),
+        ("partial_campaign", "completed", 1, [_cell()]),
+        ("partial_campaign", "partial", 0, []),
+        ("executed_campaign", "completed", 0, []),
+    ],
+)
+def test_manifest_schema_rejects_source_status_and_count_mismatches(
+    source_kind: str,
+    status: str,
+    recorded_count: int,
+    recorded_cells: list[dict[str, object]],
+) -> None:
+    document = manifest_document()
+    document.update(
+        result_source_kind=source_kind,
+        status=status,
+        recorded_run_count=recorded_count,
+        recorded_cells=recorded_cells,
+    )
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(document)
+
+
+@pytest.mark.parametrize("recorded_count", [0, 1])
+def test_selected_artifact_rejects_fabricated_completed_execution_evidence(
+    tmp_path: Path, recorded_count: int
+) -> None:
+    from benchmark.live.executor import validate_selected_artifacts
+
+    selected = json.loads(SELECTED_PATH.read_text(encoding="utf-8"))
+    result_path = PROJECT_ROOT / "benchmark/live/results/campaign-2026-08-29.json"
+    manifest_path = (
+        PROJECT_ROOT / "benchmark/live/results/campaign-2026-08-29-manifest.json"
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    result["source_kind"] = "executed_campaign"
+    if recorded_count:
+        result["results"] = [_result_record(result["planned_cells"][0])]
+    manifest["result_source_kind"] = "executed_campaign"
+    manifest["status"] = "completed"
+    manifest["recorded_run_count"] = recorded_count
+    manifest["recorded_cells"] = [
+        {key: record[key] for key in ("stack_id", "task_id", "arm", "replicate")}
+        for record in result["results"]
+    ]
+    result_bytes = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+    manifest["result_sha256"] = hashlib.sha256(result_bytes).hexdigest()
+    manifest["result_size"] = len(result_bytes)
+    forged_path = tmp_path / result_path.name
+    forged_path.write_bytes(result_bytes)
+
+    with pytest.raises(ValueError):
+        validate_selected_artifacts(selected, result, manifest, result_path=forged_path)
+
+
+def test_selected_artifact_requires_the_exact_executed_planned_cell_set(
+    tmp_path: Path,
+) -> None:
+    from benchmark.live.executor import validate_selected_artifacts
+
+    selected = json.loads(SELECTED_PATH.read_text(encoding="utf-8"))
+    result_path = PROJECT_ROOT / "benchmark/live/results/campaign-2026-08-29.json"
+    manifest_path = (
+        PROJECT_ROOT / "benchmark/live/results/campaign-2026-08-29-manifest.json"
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    result["source_kind"] = "executed_campaign"
+    result["results"] = [_result_record(cell) for cell in result["planned_cells"]]
+    result["results"][-1]["task_id"] = "unplanned-task"
+    manifest.update(
+        result_source_kind="executed_campaign",
+        status="completed",
+        recorded_run_count=len(result["results"]),
+        recorded_cells=[
+            {key: record[key] for key in ("stack_id", "task_id", "arm", "replicate")}
+            for record in result["results"]
+        ],
+    )
+    result_bytes = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+    manifest["result_sha256"] = hashlib.sha256(result_bytes).hexdigest()
+    manifest["result_size"] = len(result_bytes)
+    forged_path = tmp_path / result_path.name
+    forged_path.write_bytes(result_bytes)
+
+    with pytest.raises(ValueError, match="result cell is not planned"):
+        validate_selected_artifacts(selected, result, manifest, result_path=forged_path)
 
 
 def test_selected_stacks_and_blocked_artifacts_are_valid_and_metadata_is_explicit() -> (
