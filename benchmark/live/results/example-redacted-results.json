@@ -1,0 +1,125 @@
+{
+  "contract_version": "1.0",
+  "result_set_id": "synthetic-redacted-partial-results",
+  "source_kind": "synthetic_example",
+  "campaign_id": "synthetic-bounded-campaign",
+  "matched_run_manifest_ids": ["synthetic-bounded-campaign-manifest-v1"],
+  "execution_scope": {
+    "task_ids": ["exact-repetition-stall", "cycle-two-step"],
+    "arms": ["hard_stop_only", "generic_rethink", "semantic_reheating"],
+    "replicates": [1],
+    "network": "disabled",
+    "external_side_effect_capability": false
+  },
+  "stacks": [
+    {
+      "stack_id": "local-synthetic-a",
+      "kind": "local",
+      "provider": {"name": "synthetic-provider", "version": "1.0.0"},
+      "model": {"name": "synthetic-model", "version": "2026-08"},
+      "cli": {"name": "synthetic-agent", "version": "1.0.0"},
+      "framework": {"name": "synthetic-framework", "version": "1.0.0"}
+    },
+    {
+      "stack_id": "remote-synthetic-b",
+      "kind": "paid_remote",
+      "provider": {"name": "synthetic-provider", "version": "1.0.0"},
+      "model": {"name": "synthetic-model", "version": "2026-08"},
+      "cli": {"name": "synthetic-agent", "version": "1.0.0"},
+      "framework": {"name": "synthetic-framework", "version": "1.0.0"}
+    }
+  ],
+  "caps_consumed": {
+    "tokens": 1450,
+    "tool_calls": 9,
+    "elapsed_seconds": 46.0,
+    "cost_usd": 0.24
+  },
+  "planned_cells": [
+    {"stack_id": "local-synthetic-a", "task_id": "exact-repetition-stall", "arm": "semantic_reheating", "replicate": 1},
+    {"stack_id": "local-synthetic-a", "task_id": "exact-repetition-stall", "arm": "generic_rethink", "replicate": 1},
+    {"stack_id": "local-synthetic-a", "task_id": "cycle-two-step", "arm": "hard_stop_only", "replicate": 1},
+    {"stack_id": "local-synthetic-a", "task_id": "cycle-two-step", "arm": "generic_rethink", "replicate": 1},
+    {"stack_id": "remote-synthetic-b", "task_id": "exact-repetition-stall", "arm": "hard_stop_only", "replicate": 1},
+    {"stack_id": "remote-synthetic-b", "task_id": "exact-repetition-stall", "arm": "generic_rethink", "replicate": 1},
+    {"stack_id": "remote-synthetic-b", "task_id": "cycle-two-step", "arm": "hard_stop_only", "replicate": 1},
+    {"stack_id": "remote-synthetic-b", "task_id": "cycle-two-step", "arm": "semantic_reheating", "replicate": 1}
+  ],
+  "results": [
+    {
+      "stack_id": "local-synthetic-a",
+      "task_id": "exact-repetition-stall",
+      "arm": "semantic_reheating",
+      "replicate": 1,
+      "status": "accepted",
+      "failure_kind": "none",
+      "recovery": "recovered",
+      "intervention": "restart",
+      "detector_contribution": "helped",
+      "degraded_mode": false,
+      "evidence_gain": 3,
+      "repeated_side_effects_prevented": 1,
+      "usage": {"tokens": 400, "tool_calls": 3, "elapsed_seconds": 16.0, "cost_usd": 0.06}
+    },
+    {
+      "stack_id": "local-synthetic-a",
+      "task_id": "exact-repetition-stall",
+      "arm": "generic_rethink",
+      "replicate": 1,
+      "status": "failed",
+      "failure_kind": "controller_failure",
+      "recovery": "not_recovered",
+      "intervention": "stop",
+      "detector_contribution": "not_helped",
+      "degraded_mode": false,
+      "evidence_gain": 1,
+      "repeated_side_effects_prevented": 0,
+      "usage": {"tokens": 250, "tool_calls": 2, "elapsed_seconds": 10.0, "cost_usd": 0.04}
+    },
+    {
+      "stack_id": "local-synthetic-a",
+      "task_id": "cycle-two-step",
+      "arm": "generic_rethink",
+      "replicate": 1,
+      "status": "accepted",
+      "failure_kind": "none",
+      "recovery": "not_attempted",
+      "intervention": "none",
+      "detector_contribution": "not_applicable",
+      "degraded_mode": false,
+      "evidence_gain": 2,
+      "repeated_side_effects_prevented": 1,
+      "usage": {"tokens": 500, "tool_calls": 3, "elapsed_seconds": 20.0, "cost_usd": 0.08}
+    },
+    {
+      "stack_id": "remote-synthetic-b",
+      "task_id": "exact-repetition-stall",
+      "arm": "hard_stop_only",
+      "replicate": 1,
+      "status": "failed",
+      "failure_kind": "provider_error",
+      "recovery": "not_attempted",
+      "intervention": "none",
+      "detector_contribution": "unavailable",
+      "degraded_mode": true,
+      "evidence_gain": 1,
+      "repeated_side_effects_prevented": 0,
+      "usage": {"tokens": 200, "tool_calls": 1, "elapsed_seconds": 0.0, "cost_usd": 0.03}
+    },
+    {
+      "stack_id": "remote-synthetic-b",
+      "task_id": "cycle-two-step",
+      "arm": "hard_stop_only",
+      "replicate": 1,
+      "status": "interrupted",
+      "failure_kind": "infrastructure_failure",
+      "recovery": "not_attempted",
+      "intervention": "none",
+      "detector_contribution": "unavailable",
+      "degraded_mode": false,
+      "evidence_gain": 0,
+      "repeated_side_effects_prevented": 0,
+      "usage": {"tokens": 100, "tool_calls": 0, "elapsed_seconds": 0.0, "cost_usd": 0.03}
+    }
+  ]
+}

@@ -820,10 +820,15 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         "benchmark/live/stacks.schema.json",
         "benchmark/live/campaign.example.json",
         "benchmark/live/stacks.example.json",
+        "benchmark/live/results.schema.json",
+        "benchmark/live/results/example-redacted-results.json",
         "benchmark/live/runner.py",
         "benchmark/live/preflight.py",
+        "benchmark/live/metrics.py",
         "tests/live/test_campaign_preflight.py",
         "tests/live/test_campaign_matrix.py",
+        "tests/live/test_results_metrics.py",
+        "tests/live/test_results_privacy.py",
         "tests/benchmark/test_corpus_privacy.py",
     }
     untracked = subprocess.run(

@@ -20,6 +20,10 @@ LIVE_CAMPAIGN_SCHEMA_PATH = PROJECT_ROOT / "benchmark/live/campaign.schema.json"
 LIVE_STACKS_SCHEMA_PATH = PROJECT_ROOT / "benchmark/live/stacks.schema.json"
 LIVE_CAMPAIGN_EXAMPLE_PATH = PROJECT_ROOT / "benchmark/live/campaign.example.json"
 LIVE_STACKS_EXAMPLE_PATH = PROJECT_ROOT / "benchmark/live/stacks.example.json"
+LIVE_RESULTS_SCHEMA_PATH = PROJECT_ROOT / "benchmark/live/results.schema.json"
+LIVE_RESULTS_EXAMPLE_PATH = (
+    PROJECT_ROOT / "benchmark/live/results/example-redacted-results.json"
+)
 
 _FORBIDDEN_TEXT = re.compile(
     r"(?:\.hermes|/home/|/Users/|(?:^|[\s\"'])[A-Za-z]:\\|\\\\[A-Za-z0-9_.-]+\\|"
@@ -116,6 +120,8 @@ def _public_paths() -> list[Path]:
         LIVE_STACKS_SCHEMA_PATH,
         LIVE_CAMPAIGN_EXAMPLE_PATH,
         LIVE_STACKS_EXAMPLE_PATH,
+        LIVE_RESULTS_SCHEMA_PATH,
+        LIVE_RESULTS_EXAMPLE_PATH,
         *(PROJECT_ROOT / entry["trace_path"] for entry in manifest["entries"]),
     ]
 
@@ -138,7 +144,7 @@ def test_public_corpus_bytes_and_json_values_are_redacted_and_deterministic() ->
         budget=CorpusBudget(),
     )
     traces = {trace.trace_path: trace for trace in corpus.traces}
-    assert len(paths) == 37
+    assert len(paths) == 39
     assert len(traces) == 29
     assert set(paths) == {
         path
@@ -164,6 +170,7 @@ def test_public_corpus_bytes_and_json_values_are_redacted_and_deterministic() ->
                     RESULT_SCHEMA_PATH,
                     LIVE_CAMPAIGN_SCHEMA_PATH,
                     LIVE_STACKS_SCHEMA_PATH,
+                    LIVE_RESULTS_SCHEMA_PATH,
                 },
             )
 

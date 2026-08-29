@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/benchmark/live/results.schema.json",
+  "title": "Redacted Bounded Campaign Results",
+  "description": "Closed public aggregate results. It intentionally excludes credentials, private provider metadata, prompts, transcripts, and raw outputs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "result_set_id",
+    "source_kind",
+    "campaign_id",
+    "matched_run_manifest_ids",
+    "execution_scope",
+    "stacks",
+    "caps_consumed",
+    "planned_cells",
+    "results"
+  ],
+  "properties": {
+    "contract_version": {"const": "1.0"},
+    "result_set_id": {"$ref": "#/$defs/id"},
+    "source_kind": {
+      "enum": [
+        "synthetic_example",
+        "blocked_campaign",
+        "partial_campaign",
+        "executed_campaign"
+      ]
+    },
+    "campaign_id": {"$ref": "#/$defs/id"},
+    "matched_run_manifest_ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 108,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/id"}
+    },
+    "execution_scope": {"$ref": "#/$defs/executionScope"},
+    "stacks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 108,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/stackMetadata"}
+    },
+    "caps_consumed": {"$ref": "#/$defs/usage"},
+    "planned_cells": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 108,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/cell"}
+    },
+    "results": {
+      "type": "array",
+      "maxItems": 108,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/result"}
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "namedVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "version": {"type": "string", "minLength": 1, "maxLength": 128}
+      }
+    },
+    "executionScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_ids",
+        "arms",
+        "replicates",
+        "network",
+        "external_side_effect_capability"
+      ],
+      "properties": {
+        "task_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/id"}
+        },
+        "arms": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["hard_stop_only", "generic_rethink", "semantic_reheating"]
+          }
+        },
+        "replicates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1, "maximum": 3}
+        },
+        "network": {"const": "disabled"},
+        "external_side_effect_capability": {"const": false}
+      }
+    },
+    "stackMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stack_id", "kind", "provider", "model", "cli", "framework"],
+      "properties": {
+        "stack_id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["local", "paid_remote"]},
+        "provider": {"$ref": "#/$defs/namedVersion"},
+        "model": {"$ref": "#/$defs/namedVersion"},
+        "cli": {"$ref": "#/$defs/namedVersion"},
+        "framework": {"$ref": "#/$defs/namedVersion"}
+      }
+    },
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stack_id", "task_id", "arm", "replicate"],
+      "properties": {
+        "stack_id": {"$ref": "#/$defs/id"},
+        "task_id": {"$ref": "#/$defs/id"},
+        "arm": {
+          "enum": ["hard_stop_only", "generic_rethink", "semantic_reheating"]
+        },
+        "replicate": {"type": "integer", "minimum": 1, "maximum": 3}
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tokens", "tool_calls", "elapsed_seconds", "cost_usd"],
+      "properties": {
+        "tokens": {"type": "integer", "minimum": 0, "maximum": 2000000},
+        "tool_calls": {"type": "integer", "minimum": 0, "maximum": 4320},
+        "elapsed_seconds": {"type": "number", "minimum": 0, "maximum": 86400},
+        "cost_usd": {"type": "number", "minimum": 0, "maximum": 40}
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stack_id",
+        "task_id",
+        "arm",
+        "replicate",
+        "status",
+        "failure_kind",
+        "recovery",
+        "intervention",
+        "detector_contribution",
+        "degraded_mode",
+        "evidence_gain",
+        "repeated_side_effects_prevented",
+        "usage"
+      ],
+      "properties": {
+        "stack_id": {"$ref": "#/$defs/id"},
+        "task_id": {"$ref": "#/$defs/id"},
+        "arm": {
+          "enum": ["hard_stop_only", "generic_rethink", "semantic_reheating"]
+        },
+        "replicate": {"type": "integer", "minimum": 1, "maximum": 3},
+        "status": {
+          "enum": ["accepted", "not_accepted", "failed", "interrupted"]
+        },
+        "failure_kind": {
+          "enum": [
+            "none",
+            "provider_error",
+            "safety_refusal",
+            "infrastructure_failure",
+            "controller_failure"
+          ]
+        },
+        "recovery": {"enum": ["not_attempted", "recovered", "not_recovered"]},
+        "intervention": {"enum": ["none", "restart", "stop"]},
+        "detector_contribution": {
+          "enum": ["helped", "not_helped", "unavailable", "not_applicable"]
+        },
+        "degraded_mode": {"type": "boolean"},
+        "evidence_gain": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "repeated_side_effects_prevented": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "usage": {"$ref": "#/$defs/usage"}
+      }
+    }
+  }
+}
