@@ -841,10 +841,16 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         "docs/reviews/2026-08-27-publication-readiness.md",
         "tools/release_receipt.py",
     }
+    task27_staged_allowed = {
+        "docs/reproduction/2026-08-27-clean-checkout.md",
+        "tests/tools/test_clean_checkout_verify.py",
+        "tools/clean_checkout_verify.py",
+    }
     allowed = (
         tracked_allowed
         | task25_staged_allowed
         | task26_staged_allowed
+        | task27_staged_allowed
         | {
             "tests/skill/test_skill_package.py",
             "tests/skill/test_sanitized_rubric.py",
