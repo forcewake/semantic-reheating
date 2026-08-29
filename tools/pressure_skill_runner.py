@@ -40,6 +40,7 @@ SCENARIO_ORDER = (
     "exhausted-budget",
 )
 _PRIVATE_CONFIG_NAME = "pressure-stack.local.json"
+_PRIVATE_POSTSKILL_CONFIG_NAME = "pressure-postskill.local.json"
 _PROJECT_STATE_COMPONENTS = ("semantic-reheating", "pressure-baselines")
 _ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _MINIMAL_SELECTED_ENV = {
@@ -720,7 +721,9 @@ def _state_root(repo_root: Path) -> _StateRoot:
         raise
 
 
-def _validate_config(config: dict[str, Any], config_raw: bytes) -> dict[str, Any]:
+def _validate_config(
+    config: dict[str, Any], config_raw: bytes, *, expected_mode: str = "baseline"
+) -> dict[str, Any]:
     required = {
         "contract_version",
         "mode",
@@ -738,7 +741,7 @@ def _validate_config(config: dict[str, Any], config_raw: bytes) -> dict[str, Any
     if (
         set(config) != required
         or config.get("contract_version") != "1.0"
-        or config.get("mode") != "baseline"
+        or config.get("mode") != expected_mode
     ):
         raise PressureProtocolError("pressure_invalid_config")
     argv = config["command_argv"]
@@ -758,11 +761,12 @@ def _validate_config(config: dict[str, Any], config_raw: bytes) -> dict[str, Any
         raise PressureProtocolError("pressure_invalid_config")
     if any(any(character in forbidden for character in part) for part in argv):
         raise PressureProtocolError("pressure_invalid_config")
-    if (
-        any("skill" in part.lower() for part in argv)
-        or config["skill_absent"] is not True
-    ):
+    if type(config["skill_absent"]) is not bool:
+        raise PressureProtocolError("pressure_invalid_config")
+    if expected_mode == "baseline" and config["skill_absent"] is not True:
         raise PressureProtocolError("pressure_skill_not_absent")
+    if expected_mode == "postskill" and config["skill_absent"] is not False:
+        raise PressureProtocolError("pressure_invalid_config")
     environment_allowlist = config["environment_allowlist"]
     if (
         type(environment_allowlist) is not list
@@ -1135,7 +1139,7 @@ def _supports(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_evidence_manifest(value: object) -> dict[str, Any]:
+def _validate_evidence_manifest(value: object, *, mode: str) -> dict[str, Any]:
     """Keep the private transcript evidence closed and in public scenario order."""
     required = {
         "contract_version",
@@ -1152,7 +1156,7 @@ def _validate_evidence_manifest(value: object) -> dict[str, Any]:
     }
     if type(value) is not dict or set(value) != required:
         raise PressureProtocolError("pressure_evidence_manifest_invalid")
-    if value["contract_version"] != "1.0" or value["mode"] != "baseline":
+    if value["contract_version"] != "1.0" or value["mode"] != mode:
         raise PressureProtocolError("pressure_evidence_manifest_invalid")
     hash_names = required - {"contract_version", "mode", "entries"}
     if any(
@@ -1880,23 +1884,39 @@ def _run_bounded(
     return stdout, stderr, returncode
 
 
-def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]:
-    """Run the selected stack while all private I/O is descriptor-relative."""
+def _run_pressure_in_state(
+    repo: Path,
+    state_root: _StateRoot,
+    *,
+    mode: str,
+    config_name: str,
+    skill_bytes: bytes | None = None,
+) -> dict[str, Any]:
+    """Run one sealed selected stack while all private I/O is descriptor-relative."""
     repo_root = _repo_root(repo)
     try:
-        config, raw_config = _load_json_at(state_root.fd, _PRIVATE_CONFIG_NAME)
+        config, raw_config = _load_json_at(state_root.fd, config_name)
     except PressureProtocolError as error:
         if error.code == "pressure_file_missing":
             raise PressureProtocolError("pressure_stack_missing") from error
         if error.code == "pressure_invalid_json":
             raise PressureProtocolError("pressure_invalid_config") from error
         raise
-    validated = _validate_config(config, raw_config)
+    validated = _validate_config(config, raw_config, expected_mode=mode)
     config = validated["config"]
+    if mode == "baseline" and skill_bytes is not None:
+        raise PressureProtocolError("pressure_skill_not_absent")
+    if mode == "postskill" and skill_bytes is None:
+        raise PressureProtocolError("pressure_skill_missing")
+    try:
+        skill_text = (
+            "" if skill_bytes is None else skill_bytes.decode("utf-8", "strict")
+        )
+    except UnicodeDecodeError as error:
+        raise PressureProtocolError("pressure_skill_invalid") from error
+    skill_sha256 = "" if skill_bytes is None else _sha256(skill_bytes)
     baseline_started = time.monotonic()
     deadline = baseline_started + config["caps"]["elapsed_seconds"]
-    if any(repo_root.rglob("SKILL.md")):
-        raise PressureProtocolError("pressure_skill_not_absent")
     if time.monotonic() >= deadline:
         raise PressureProtocolError("pressure_timeout")
     protocol = load_public_protocol(repo_root)
@@ -1913,7 +1933,7 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
     selected_environment = _selected_environment(config["environment_allowlist"])
     if time.monotonic() >= deadline:
         raise PressureProtocolError("pressure_timeout")
-    run_name = "run-" + command_hash[:12]
+    run_name = "run-" + ("" if mode == "baseline" else mode + "-") + command_hash[:12]
     run_fd = _create_run_directory(state_root.fd, run_name)
     state_root.children.append(run_fd)
     run_path = _fd_path(run_fd)
@@ -1943,6 +1963,11 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
             "scenario_id: "
             + scenario_id
             + "\n"
+            + (
+                "skill_sha256: " + skill_sha256 + "\n" + skill_text + "\n"
+                if skill_text
+                else ""
+            )
             + scenario["prompt"]
             + "\n"
             + scenario["task_pressure"]
@@ -2029,12 +2054,12 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
     failure_codes = {
         entry["outcome_code"] for entry in outcomes if entry["outcome_code"] != "pass"
     }
-    if len(failure_codes) < 1:
+    if mode == "baseline" and len(failure_codes) < 1:
         raise PressureProtocolError("pressure_failure_classes_insufficient")
     manifest = _validate_evidence_manifest(
         {
             "contract_version": "1.0",
-            "mode": "baseline",
+            "mode": mode,
             "scenario_set_sha256": protocol["hashes"]["scenarios"],
             "rubric_sha256": protocol["hashes"]["rubric"],
             "scenario_schema_sha256": protocol["hashes"]["scenarios_schema"],
@@ -2046,17 +2071,19 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
             "stack_config_sha256": validated["config_sha256"],
             "command_sha256": command_hash,
             "entries": evidence_entries,
-        }
+        },
+        mode=mode,
     )
+    manifest_name = f"{mode}-evidence-manifest.json"
     manifest_digest = _write_private_at(
         run_fd,
-        "baseline-evidence-manifest.json",
+        manifest_name,
         _canonical_bytes(manifest),
         replace=True,
     )
     summary = {
         "contract_version": "1.0",
-        "mode": "baseline",
+        "mode": mode,
         "scenario_set_sha256": protocol["hashes"]["scenarios"],
         "rubric_sha256": protocol["hashes"]["rubric"],
         "scenario_schema_sha256": protocol["hashes"]["scenarios_schema"],
@@ -2082,10 +2109,12 @@ def _run_baseline_in_state(repo: Path, state_root: _StateRoot) -> dict[str, Any]
             ),
         },
         "private_transcript_receipt": {
-            "name": "baseline-evidence-manifest.json",
+            "name": manifest_name,
             "sha256": manifest_digest,
         },
     }
+    if skill_bytes is not None:
+        summary["skill_sha256"] = skill_sha256
     return summary
 
 
@@ -2094,7 +2123,33 @@ def run_baseline(repo: Path) -> dict[str, Any]:
     repo_root = _repo_root(repo)
     state_root = _state_root(repo_root)
     try:
-        return _run_baseline_in_state(repo_root, state_root)
+        return _run_pressure_in_state(
+            repo_root,
+            state_root,
+            mode="baseline",
+            config_name=_PRIVATE_CONFIG_NAME,
+        )
+    finally:
+        state_root.close()
+
+
+def run_with_skill(repo: Path) -> dict[str, Any]:
+    """Run the sealed postskill stack once with exact package bytes injected."""
+    repo_root = _repo_root(repo)
+    skill_path = repo_root / "skills" / "semantic-reheating" / "SKILL.md"
+    try:
+        skill_bytes = _safe_regular_bytes(skill_path, MAX_PUBLIC_BYTES)
+    except PressureProtocolError as error:
+        raise PressureProtocolError("pressure_skill_missing") from error
+    state_root = _state_root(repo_root)
+    try:
+        return _run_pressure_in_state(
+            repo_root,
+            state_root,
+            mode="postskill",
+            config_name=_PRIVATE_POSTSKILL_CONFIG_NAME,
+            skill_bytes=skill_bytes,
+        )
     finally:
         state_root.close()
 

@@ -1,0 +1,35 @@
+{
+  "contract_version": "1.0",
+  "mode": "baseline",
+  "command_sha256": "9683f9e588ce4db086ca12973c08aa5ce134605ae0bd149007e797576963d877",
+  "scenario_schema_sha256": "d69534b142967120b816aaa28e22858e571511eea423eb5fa615068026c925a5",
+  "rubric_schema_sha256": "5b42c90bd4732e9367e4af6fce20ef47524ca0c7e9213d085ec35531d220379b",
+  "baseline_summary_schema_sha256": "608dc73da2571108ea571aacc7651e07eded230ff0e3d73c77755c3fcb74e4bb",
+  "stack_receipt_schema_sha256": "b780c8628272c9dbe2b6f74a0c16bbc2a7c10a9298bb092d1a76acd603393606",
+  "stack_metadata": {
+    "cli": "claude-code",
+    "framework": "claude-code-print",
+    "model": "glm-5.3[1m]",
+    "provider": "z.ai",
+    "version": "2.1.235",
+    "executable_sha256": "10998477b123e72b5f6222147a519f448bfc6880bb838fa10de057f207fb368b"
+  },
+  "supports": {
+    "seed": "unsupported",
+    "decoding": "unsupported",
+    "usage_report": {
+      "turns": "supported",
+      "tools": "supported",
+      "tokens": "supported",
+      "elapsed_seconds": "supported",
+      "cost": "unsupported"
+    },
+    "enforcement": {
+      "turns": "reported",
+      "tools": "reported",
+      "tokens": "reported",
+      "elapsed_seconds": "hard",
+      "cost": "unsupported"
+    }
+  }
+}

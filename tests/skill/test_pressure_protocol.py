@@ -790,7 +790,7 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         runner.PressureProtocolError, match="pressure_summary_private_receipt_invalid"
     ):
         runner.sanitize_projection(bad_summary)
-    allowed = {
+    tracked_allowed = {
         "tests/skill/test_pressure_protocol.py",
         "tools/pressure_skill_runner.py",
         "skills/semantic-reheating/references/pressure-scenarios.json",
@@ -801,13 +801,22 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         "skills/semantic-reheating/references/baseline-summary.schema.json",
     }
     tracked = subprocess.run(
-        ["git", "ls-files", "--cached", "--", *sorted(allowed)],
+        ["git", "ls-files", "--cached", "--", *sorted(tracked_allowed)],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
         check=True,
     ).stdout.splitlines()
-    assert set(tracked) == allowed
+    assert set(tracked) == tracked_allowed
+    allowed = tracked_allowed | {
+        "tests/skill/test_skill_package.py",
+        "tests/skill/test_sanitized_rubric.py",
+        "skills/semantic-reheating/SKILL.md",
+        "skills/semantic-reheating/references/stack-receipt.json",
+        "skills/semantic-reheating/references/baseline-summary.json",
+        "skills/semantic-reheating/references/results.json",
+        "skills/semantic-reheating/references/results.schema.json",
+    }
     untracked = subprocess.run(
         ["git", "ls-files", "--others", "--exclude-standard"],
         cwd=PROJECT_ROOT,
@@ -832,6 +841,29 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         check=True,
     ).stdout.splitlines()
     assert set(unstaged) <= allowed
+
+
+def test_run_with_skill_binds_exact_skill_bytes_and_preserves_baseline_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_cli.py"
+    _write_fake_cli(fake)
+    config = _install_config(tmp_path, fake, mode="postskill", skill_absent=False)
+    config.rename(config.with_name("pressure-postskill.local.json"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+
+    summary = runner.run_with_skill(PROJECT_ROOT)
+
+    assert summary["mode"] == "postskill"
+    assert (
+        summary["skill_sha256"]
+        == hashlib.sha256(
+            (PROJECT_ROOT / "skills" / "semantic-reheating" / "SKILL.md").read_bytes()
+        ).hexdigest()
+    )
+    assert [item["scenario_id"] for item in summary["outcomes"]] == SCENARIO_IDS
+    with pytest.raises(runner.PressureProtocolError, match="pressure_stack_missing"):
+        runner.run_baseline(PROJECT_ROOT)
 
 
 def test_sanitize_projection_validates_fixed_closed_schema_and_detaches() -> None:
@@ -1145,7 +1177,7 @@ def test_usage_support_is_per_dimension_and_never_fabricated(
     assert summary["budget_consumption"]["cost"] == "unsupported"
 
 
-def test_selected_stack_rejects_all_pass_but_records_observed_single_class_baseline(
+def test_baseline_all_pass_rejects_but_postskill_all_pass_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = tmp_path / "fake_cli.py"
@@ -1159,6 +1191,20 @@ def test_selected_stack_rejects_all_pass_but_records_observed_single_class_basel
         runner.PressureProtocolError, match="pressure_failure_classes_insufficient"
     ):
         runner.run_baseline(PROJECT_ROOT)
+
+    postskill_state = tmp_path / "postskill-all-pass-state"
+    postskill_config = _install_config(
+        postskill_state,
+        fake,
+        mode="postskill",
+        skill_absent=False,
+        environment_allowlist=["PRESSURE_FAKE_MODE"],
+    )
+    postskill_config.rename(postskill_config.with_name("pressure-postskill.local.json"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(postskill_state))
+    postskill = runner.run_with_skill(PROJECT_ROOT)
+    assert postskill["mode"] == "postskill"
+    assert [entry["outcome_code"] for entry in postskill["outcomes"]] == ["pass"] * 6
 
     one_failure_state = tmp_path / "one-failure-state"
     _install_config(

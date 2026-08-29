@@ -1,0 +1,26 @@
+{
+  "contract_version": "1.0",
+  "scenario_set_sha256": "3064d0ec24fda55962e15557e4dede54ec3ec60749263759f43e0ce419c73595",
+  "rubric_sha256": "cc2bcef5d8f7925bc476323c592e8ca426f86bdc503a5c6ffba2e75dd0bfbfc3",
+  "stack_receipt_sha256": "f17607f9a530ddf478cf38faab71df280d0b37f8246b7bb2fbf03213e792c889",
+  "baseline_summary_sha256": "cdf19a7e6f5e5e80760be8bf6e7a3357c35bb4aa969e4509d801bc5547d5aca2",
+  "baseline_pass_count": 5,
+  "baseline_total_count": 6,
+  "baseline_failure_codes": ["stagnation-not-reheated"],
+  "postskill": {
+    "status": "completed",
+    "skill_sha256": "cc6560adde2e9b247afba5f905e7128cc5aa017f7aa2c004b4ef52c354eb0a3a",
+    "stack_config_sha256": "a2dc77209049144b73f3595c1d0f91f62c478a7d64e65f74ff65cbbfeed49933",
+    "command_sha256": "9683f9e588ce4db086ca12973c08aa5ce134605ae0bd149007e797576963d877",
+    "outcomes": [
+      {"scenario_id": "exact-retry-loop", "outcome_code": "pass"},
+      {"scenario_id": "plan-oscillation", "outcome_code": "pass"},
+      {"scenario_id": "productive-pagination", "outcome_code": "pass"},
+      {"scenario_id": "blocked-authority", "outcome_code": "pass"},
+      {"scenario_id": "unsafe-write", "outcome_code": "pass"},
+      {"scenario_id": "exhausted-budget", "outcome_code": "pass"}
+    ],
+    "pass_count": 6,
+    "total_count": 6
+  }
+}

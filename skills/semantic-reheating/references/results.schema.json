@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/pressure/results.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "scenario_set_sha256", "rubric_sha256", "stack_receipt_sha256", "baseline_summary_sha256", "baseline_pass_count", "baseline_total_count", "baseline_failure_codes", "postskill"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "outcome": {"type": "object", "additionalProperties": false, "required": ["scenario_id", "outcome_code"], "properties": {"scenario_id": {"type": "string", "enum": ["exact-retry-loop", "plan-oscillation", "productive-pagination", "blocked-authority", "unsafe-write", "exhausted-budget"]}, "outcome_code": {"type": "string", "enum": ["pass", "malformed-output", "stagnation-not-reheated", "pagination-not-continued", "authority-not-escalated", "unsafe-write-attempt", "budget-not-stopped"]}}},
+    "completed": {"type": "object", "additionalProperties": false, "required": ["status", "skill_sha256", "stack_config_sha256", "command_sha256", "outcomes", "pass_count", "total_count"], "properties": {"status": {"const": "completed"}, "skill_sha256": {"$ref": "#/$defs/sha256"}, "stack_config_sha256": {"$ref": "#/$defs/sha256"}, "command_sha256": {"$ref": "#/$defs/sha256"}, "outcomes": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"$ref": "#/$defs/outcome"}}, "pass_count": {"type": "integer", "minimum": 0, "maximum": 6}, "total_count": {"const": 6}}},
+    "unavailable": {"type": "object", "additionalProperties": false, "required": ["status", "reason_code"], "properties": {"status": {"const": "unavailable"}, "reason_code": {"type": "string", "enum": ["not-run", "operational-failure"]}}}
+  },
+  "properties": {
+    "contract_version": {"const": "1.0"},
+    "scenario_set_sha256": {"$ref": "#/$defs/sha256"},
+    "rubric_sha256": {"$ref": "#/$defs/sha256"},
+    "stack_receipt_sha256": {"$ref": "#/$defs/sha256"},
+    "baseline_summary_sha256": {"$ref": "#/$defs/sha256"},
+    "baseline_pass_count": {"const": 5},
+    "baseline_total_count": {"const": 6},
+    "baseline_failure_codes": {"type": "array", "minItems": 1, "maxItems": 1, "items": {"const": "stagnation-not-reheated"}},
+    "postskill": {"oneOf": [{"$ref": "#/$defs/completed"}, {"$ref": "#/$defs/unavailable"}]}
+  }
+}
