@@ -17,11 +17,12 @@ __pycache__/
 coverage.xml
 htmlcov/
 
-# Local environments
+# Local environments and dependency installs
 .venv/
 venv/
 env/
 ENV/
+node_modules/
 
 # External reproducibility evidence and generic clean-check workspaces
 release-receipts/

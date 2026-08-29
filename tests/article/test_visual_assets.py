@@ -81,6 +81,21 @@ def test_ci_uses_locked_renderer_without_system_imagemagick() -> None:
     assert "npm ci --prefix tools/assets" in workflow
 
 
+def test_repository_ignores_local_asset_dependencies() -> None:
+    result = subprocess.run(
+        [
+            "git",
+            "check-ignore",
+            "--no-index",
+            "--quiet",
+            "tools/assets/node_modules/package.json",
+        ],
+        cwd=ROOT,
+        check=False,
+    )
+    assert result.returncode == 0
+
+
 def test_renderer_is_byte_stable_for_packaged_cover() -> None:
     if not (ROOT / "tools/assets/node_modules/.bin/mmdc").exists():
         pytest.skip("requires npm ci --prefix tools/assets")
