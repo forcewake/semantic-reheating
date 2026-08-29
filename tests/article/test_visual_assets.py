@@ -81,6 +81,14 @@ def test_ci_uses_locked_renderer_without_system_imagemagick() -> None:
     assert "npm ci --prefix tools/assets" in workflow
 
 
+def test_ci_reports_tree_drift_before_clean_checkout() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    status_index = workflow.index("git status --short --untracked-files=all")
+    diff_index = workflow.index("git diff --exit-code")
+    verify_index = workflow.index("tools/clean_checkout_verify.py --local")
+    assert status_index < diff_index < verify_index
+
+
 def test_repository_ignores_local_asset_dependencies() -> None:
     result = subprocess.run(
         [

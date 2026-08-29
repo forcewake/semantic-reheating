@@ -61,5 +61,6 @@ jobs:
         run: |
           uv run python tools/public_hygiene.py --tracked-only
           uv run python tools/public_hygiene.py --history
-          uv run python tools/clean_checkout_verify.py --local
+          git status --short --untracked-files=all
           git diff --exit-code
+          uv run python tools/clean_checkout_verify.py --local
