@@ -836,6 +836,9 @@ def test_fake_selected_stack_runs_all_six_and_sanitizes_projection(
         "tests/live/test_selected_campaign_artifacts.py",
         "tests/skill/test_pressure_protocol.py",
         "tests/tools/test_release_receipt.py",
+        "docs/reviews/2026-08-27-spec-compliance.md",
+        "docs/reviews/2026-08-27-quality-security.md",
+        "docs/reviews/2026-08-27-publication-readiness.md",
         "tools/release_receipt.py",
     }
     allowed = (
