@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://semantic-reheating.dev/examples/typescript-middleware/python-v1-artifacts.schema.json",
+  "title": "PythonV1Artifacts",
+  "description": "Closed, versioned aggregate fixture emitted by the public Python API.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "fixture_version": { "const": "1.0" },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "trace_event": { "$ref": "https://semantic-reheating.dev/contracts/v1/trace-event.schema.json" },
+        "run_policy": { "$ref": "https://semantic-reheating.dev/contracts/v1/run-policy.schema.json" },
+        "detector_finding": { "$ref": "https://semantic-reheating.dev/contracts/v1/detector-finding.schema.json" },
+        "decision_envelope": { "$ref": "https://semantic-reheating.dev/contracts/v1/decision-envelope.schema.json" },
+        "recovery_instruction": { "$ref": "https://semantic-reheating.dev/contracts/v1/recovery-instruction.schema.json" },
+        "recovery_outcome": { "$ref": "https://semantic-reheating.dev/contracts/v1/recovery-outcome.schema.json" },
+        "evidence_record": { "$ref": "https://semantic-reheating.dev/contracts/v1/evidence-record.schema.json" }
+      },
+      "required": [
+        "trace_event",
+        "run_policy",
+        "detector_finding",
+        "decision_envelope",
+        "recovery_instruction",
+        "recovery_outcome",
+        "evidence_record"
+      ]
+    },
+    "canonical_i_json": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "value": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "nested": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "a": { "type": "string" },
+                "b": { "type": "boolean" }
+              },
+              "required": ["a", "b"]
+            },
+            "text": { "type": "string" },
+            "z": { "type": "integer" }
+          },
+          "required": ["nested", "text", "z"]
+        },
+        "utf8": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "required": ["value", "utf8", "sha256"]
+    }
+  },
+  "required": ["fixture_version", "artifacts", "canonical_i_json"]
+}
