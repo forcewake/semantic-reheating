@@ -1,0 +1,65 @@
+name: deterministic-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: py${{ matrix.python }}-node${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Python dependencies
+        run: uv sync --dev
+      - name: Validate explicit JSON registry
+        run: uv run python tools/domain_json_registry.py
+      - name: Run deterministic Python suite (no pressure-live tests)
+        run: uv run pytest tests -q -m 'not pressure_live'
+      - name: Validate Agent Skill package
+        run: uv run agentskills validate skills/semantic-reheating
+      - name: Validate article data and article package
+        run: |
+          uv run python tools/generate_article_data.py --check
+          uv run python tools/validate_article.py article/semantic-reheating
+      - name: Render checked-in visual assets locally
+        run: |
+          npm ci --prefix tools/assets
+          uv run python tools/render_assets.py
+      - name: Run Python example and static checks
+        run: |
+          uv run python examples/python-generic-agent/main.py
+          uv run ruff check src tests benchmark tools
+          uv run ruff format --check tools/clean_checkout_verify.py tools/domain_json_registry.py tools/public_hygiene.py tools/release_receipt.py tests/tools
+          uv run mypy src
+          python -m compileall -q src benchmark tools
+      - name: Validate TypeScript wrapper
+        working-directory: examples/typescript-middleware
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+      - name: Verify public hygiene and clean checkout
+        run: |
+          uv run python tools/public_hygiene.py --tracked-only
+          uv run python tools/public_hygiene.py --history
+          uv run python tools/clean_checkout_verify.py --local
+          git diff --exit-code

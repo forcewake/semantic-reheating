@@ -22,3 +22,7 @@ htmlcov/
 venv/
 env/
 ENV/
+
+# External reproducibility evidence and generic clean-check workspaces
+release-receipts/
+semantic-reheating-clean-*/
